@@ -10,7 +10,8 @@
     "exactOptionalPropertyTypes": true,
     "declaration": true,
     "skipLibCheck": true,
-    "lib": ["ES2022", "DOM"],
+    "lib": ["ES2022"],
+    "types": ["node"],
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src/**/*.ts"]

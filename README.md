@@ -9,11 +9,12 @@ A TypeScript **offline-only** evaluation harness for future multi-network advert
 - Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, permanent storage, UI, or commercially licensed ad dataset**.
 - An `ALLOWED` flag is an internal gate, **not legal authorization**. Real permissions require independently documented source agreements.
 - Synthetic fixture links use `example.org` and are never fetched.
-- No external npm runtime packages or network setup is needed; requires Node 22+ and TypeScript (`tsc`) on PATH.
+- No runtime dependencies. Dev dependencies (`typescript`, `@types/node`) are pinned in `package.json` and locked in `package-lock.json`; requires Node 22+.
 
 ## Run
 
 ```bash
+npm ci
 npm run typecheck
 npm test
 npm run demo
@@ -28,6 +29,8 @@ source offline fixture → source adapter → strict normalization → run valid
 ```
 
 No data is published or persisted. If any record is invalid, the entire run is FAILED and the harness returns no trusted rows.
+
+CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 and 24 for pushes and pull requests.
 
 ## Next gates
 

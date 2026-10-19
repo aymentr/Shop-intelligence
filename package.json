@@ -5,10 +5,15 @@
   "type": "module",
   "description": "Offline, permission-aware advertising source feasibility harness",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "demo": "npm run build && node demo.mjs"
   },
-  "engines": {"node": ">=22"}
+  "engines": { "node": ">=22" },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "6.0.3"
+  }
 }

@@ -3,10 +3,12 @@
 ## Responsibility boundaries
 
 - `types.ts`: explicit ad, rights and run models.
-- `validation.ts`: checks required fields, timestamps, country codes, network enum, and URI syntax. URI safety validation only checks syntax, **not DNS/SSRF**; no fetching exists in B-001.
-- `rights.ts`: deny unknown/unlicensed usage at each action. Does **not** verify external agreement validity.
-- `adapters.ts`: offline adapter contract. No platform specific code.
-- `ingest.ts`: batches all fixture rows, rejects entire run if any row fails, normalizes one ad per `(network,nativeAdId)` and returns diagnostics.
+- `time.ts`: strict instant parsing. Timestamps must carry `Z` or `±HH:MM`; offset-less values are rejected because their meaning depends on the host time zone, and impossible dates (Feb 30, 24:00) are rejected rather than rolled over.
+- `validation.ts`: checks required fields, timestamps, country-code *shape* (two upper-case letters; not checked against the ISO 3166-1 list), network enum, native ID hygiene (no control characters, ≤256 chars), first-seen ≤ last-seen, and URI syntax. URI safety validation only checks syntax, **not DNS/SSRF**; no fetching exists in B-001.
+- `rights.ts`: deny unknown/unlicensed usage at each action. Expiry is compared as instants; an unparseable expiry or clock denies. Does **not** verify external agreement validity.
+- `adapters.ts`: offline adapter contract. Each adapter declares its `evidenceKind`; only `SYNTHETIC` exists and ingestion refuses anything else. No platform specific code.
+- `ingest.ts`: batches all fixture rows, rejects entire run if any row fails, normalizes one ad per `(network,nativeAdId)` (first record kept), counts duplicates and *conflicting* duplicates (same identity, different content ignoring `seenAt`), stamps each record with `sourceId` and `runId`, sets `finishedAt` on every started run, and returns diagnostics. Pre-flight failures (invalid rights, source/rights mismatch, blocked evaluation, invalid run metadata) throw and start no run.
+- `tests/offline-guard.test.mjs`: static check that `src/` contains no network or process-spawning APIs.
 
 ## Temporal semantics
 

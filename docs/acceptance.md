@@ -9,9 +9,12 @@
 - Source failure sets FAILED.
 - UNKNOWN or expired evaluation permission rejects collection.
 - Subscriber display, bulk export, and media mirroring denied on synthetic rights.
-- Data validation handles bogus countries, invalid URL schemes and timestamps.
+- Data validation rejects malformed country codes (shape only), invalid URL schemes, offset-less or impossible timestamps, and inverted first/last-seen dates.
+- Rights expiry fails closed on unparseable or offset-shifted values.
+- Every started run records `finishedAt`; records carry `runId`; conflicting duplicates are counted.
+- `src/` contains no network APIs (static guard test).
 - Tests run with `npm test`; demo produces JSON diagnostics.
 
 ## Explicit non-goals
 
-No PostgreSQL, no UI, no API collection, no platform credentials, no production ingestion, no legal review, no actual ad coverage, no live rights verification, no CI execution claims.
+No PostgreSQL, no UI, no API collection, no platform credentials, no production ingestion, no legal review, no actual ad coverage, no live rights verification.
