@@ -1,0 +1,14 @@
+{
+  "name": "shop-intelligence-b001",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Offline, permission-aware advertising source feasibility harness",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "demo": "npm run build && node demo.mjs"
+  },
+  "engines": {"node": ">=22"}
+}

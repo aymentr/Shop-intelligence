@@ -1,1 +1,39 @@
-# Shop-intelligence
+# Shop Intelligence — B-001 Source Feasibility Harness
+
+A TypeScript **offline-only** evaluation harness for future multi-network advertising data adapters.
+
+## Scope and limits
+
+- Strict parsing, network-scoped identities, deduplication, collection runs and basic diagnostic ratios.
+- Fail-closed rights for evaluation, retention, subscriber display, media mirroring and exports.
+- Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, permanent storage, UI, or commercially licensed ad dataset**.
+- An `ALLOWED` flag is an internal gate, **not legal authorization**. Real permissions require independently documented source agreements.
+- Synthetic fixture links use `example.org` and are never fetched.
+- No external npm runtime packages or network setup is needed; requires Node 22+ and TypeScript (`tsc`) on PATH.
+
+## Run
+
+```bash
+npm run typecheck
+npm test
+npm run demo
+```
+
+## Current model
+
+```
+source offline fixture → source adapter → strict normalization → run validation
+                                                 ↓
+                                        rights gate + diagnostics
+```
+
+No data is published or persisted. If any record is invalid, the entire run is FAILED and the harness returns no trusted rows.
+
+## Next gates
+
+1. Test rights semantics against actual platform/source agreements before enabling any live adapter.
+2. Add real PostgreSQL transactions, provenance persistence, and deletion enforcement.
+3. Obtain explicitly permitted API credentials and source-specific integration tests.
+4. Measure real record quality by country/network without claiming completeness.
+
+See `docs/architecture.md` and `docs/acceptance.md`.
