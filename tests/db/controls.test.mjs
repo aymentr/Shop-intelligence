@@ -584,6 +584,26 @@ test('CK2: commit visibility — an older snapshot keeps the old answer (documen
 // Final-review additions
 // ---------------------------------------------------------------------------------------
 
+test('CK3 (kills the formerly "equivalent" mutant): no later version supersedes a termination, even after a backward clock step', async () => {
+  // Counterexample history: TERMINATE_RETENTION is recorded, then the server clock steps back
+  // (simulated as in CK1: occurred_at one hour ahead), then a new rights version is recorded
+  // through the normal, permitted path. That version is newer (version > through_version) but
+  // its effective_from is EARLIER than the termination's occurred_at. A took-effect test on the
+  // termination term would treat the termination as superseded and revive covered data.
+  await createSources(c.admin, ['ck3']);
+  const ra = c.si_rights_admin;
+  await recordRights(ra, 'ck3');
+  await insertSkewed('ck3', [{ seq: 1, kind: 'TERMINATE_RETENTION', through: 1 }]);
+  const at = await occ('ck3', 1);
+  assert.equal(await retEnd('ck3', 1), at);
+  await recordRights(ra, 'ck3');                                                      // v2, after the termination
+  assert.equal((await one(c.admin, `SELECT ${effOf('ck3', 2)} < (SELECT occurred_at FROM si.source_controls WHERE source_id = 'ck3') AS earlier`)).earlier, true,
+    'precondition: the newer version starts before the termination instant');
+  assert.equal(await retEnd('ck3', 1), at, 'retention end of covered data is unchanged');
+  assert.equal(await terminated('ck3', 1), true);
+  assert.equal(await terminated('ck3', 2), false);
+});
+
 test('IT1: a lock holder terminated by idle_in_transaction_session_timeout is detected, not mistaken for serialization', async t => {
   const h = (await roles(t, db, ['si_rights_admin'])).si_rights_admin;
   const w = (await roles(t, db, ['si_rights_admin'])).si_rights_admin;
