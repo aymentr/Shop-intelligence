@@ -12,8 +12,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
-  asOwner, control, controlView, createSources, expectOrderRejection, freshDatabase, lift, pid,
-  recordRights, rejects, roles, waitUntilBlocked
+  asOwner, control, controlView, createSources, expectOrderRejection, expectWaiterError, expectWaiterOk,
+  freshDatabase, holderCommit, lift, pid, recordRights, rejects, roles, settle, waitUntilBlocked, waiter
 } from './helpers.mjs';
 
 const CHECK = '23514', DENIED = '42501', BADARG = '22023', ISO = '25000', FK = '23503';
@@ -323,20 +323,20 @@ test('LC3: concurrent SUSPEND vs a stale LIFT, both orders — the source ends s
   const stale = await controlView(b, 'lc3a');
   await a.query('BEGIN');
   await control(a, 'lc3a', 'SUSPEND');
-  const p1 = control(b, 'lc3a', 'LIFT', { expectedMaxVersion: stale.maxVersion, expectedControlSeq: stale.lastSeq });
+  const p1 = waiter(control(b, 'lc3a', 'LIFT', { expectedMaxVersion: stale.maxVersion, expectedControlSeq: stale.lastSeq }));
   await waitUntilBlocked(c.admin, pb, pa);
-  await a.query('COMMIT');
-  await rejects(assert, p1, { code: CHECK, message: /SI_STALE_VIEW/ });
+  await holderCommit(assert, a, pa);
+  await expectWaiterError(assert, p1, { code: CHECK, message: /SI_STALE_VIEW/ });
   assert.deepEqual(await kinds('lc3a'), ['SUSPEND', 'SUSPEND']);
   assert.equal(await suspended('lc3a'), true);
 
   // Order 2: B's LIFT holds the lock; A's SUSPEND waits, then lands after it.
   await b.query('BEGIN');
   await lift(b, 'lc3b');
-  const p2 = control(a, 'lc3b', 'SUSPEND');
+  const p2 = waiter(control(a, 'lc3b', 'SUSPEND'));
   await waitUntilBlocked(c.admin, pa, pb);
-  await b.query('COMMIT');
-  assert.equal((await p2).control_seq, 3);
+  await holderCommit(assert, b, pb);
+  assert.equal((await expectWaiterOk(assert, p2)).control_seq, 3);
   assert.deepEqual(await kinds('lc3b'), ['SUSPEND', 'LIFT', 'SUSPEND']);
   assert.equal(await suspended('lc3b'), true);
 });
@@ -351,10 +351,10 @@ test('LC4: two LIFTs racing with the same view — exactly one succeeds', async 
   const exp = { expectedMaxVersion: view.maxVersion, expectedControlSeq: view.lastSeq };
   await a.query('BEGIN');
   await control(a, 'lc4', 'LIFT', exp);
-  const p = control(b, 'lc4', 'LIFT', exp);
+  const p = waiter(control(b, 'lc4', 'LIFT', exp));
   await waitUntilBlocked(c.admin, pb, pa);
-  await a.query('COMMIT');
-  await rejects(assert, p, { code: CHECK, message: /SI_STALE_VIEW/ });
+  await holderCommit(assert, a, pa);
+  await expectWaiterError(assert, p, { code: CHECK, message: /SI_STALE_VIEW/ });
   assert.deepEqual(await kinds('lc4'), ['SUSPEND', 'LIFT']);
 });
 
@@ -379,10 +379,10 @@ for (const mode of ['immediate', 'pending']) {
     const f = await fixture(src, mode);
     await a.query('BEGIN');
     await recordRights(a, src, f.regrantOpts);
-    const p = control(b, src, 'SUSPEND');
+    const p = waiter(control(b, src, 'SUSPEND'));
     await waitUntilBlocked(c.admin, pb, pa);
-    await a.query('COMMIT');
-    await p;
+    await holderCommit(assert, a, pa);
+    await expectWaiterOk(assert, p);
     assert.equal(await suspended(src), true);
     assert.equal(await valid(src, f.rg, f.atOf(f.rg)), false);
     await lift(b, src);
@@ -394,10 +394,10 @@ for (const mode of ['immediate', 'pending']) {
     const f = await fixture(src, mode);
     await a.query('BEGIN');
     await control(a, src, 'SUSPEND');
-    const p = recordRights(b, src, f.regrantOpts);
+    const p = waiter(recordRights(b, src, f.regrantOpts));
     await waitUntilBlocked(c.admin, pb, pa);
-    await a.query('COMMIT');
-    assert.equal((await p).version, f.rg);
+    await holderCommit(assert, a, pa);
+    assert.equal((await expectWaiterOk(assert, p)).version, f.rg);
     assert.equal(await suspended(src), true);
     assert.equal(await valid(src, f.rg, f.atOf(f.rg)), false);
     await lift(a, src);
@@ -409,10 +409,10 @@ for (const mode of ['immediate', 'pending']) {
     const f = await fixture(src, mode);
     await a.query('BEGIN');
     await recordRights(a, src, f.regrantOpts);
-    const p = control(b, src, 'TERMINATE_RETENTION');
+    const p = waiter(control(b, src, 'TERMINATE_RETENTION'));
     await waitUntilBlocked(c.admin, pb, pa);
-    await a.query('COMMIT');
-    const term = await p;
+    await holderCommit(assert, a, pa);
+    const term = await expectWaiterOk(assert, p);
     assert.equal(term.through_version, f.rg, 'the waiter saw the committed re-grant (READ COMMITTED, read after the lock)');
     assert.equal(await terminated(src, f.rg), true);
     await recordRights(a, src, f.nextOpts(f.rg));                                         // new authorization
@@ -426,10 +426,10 @@ for (const mode of ['immediate', 'pending']) {
     const f = await fixture(src, mode);
     await a.query('BEGIN');
     const term = await control(a, src, 'TERMINATE_RETENTION');
-    const p = recordRights(b, src, f.regrantOpts);
+    const p = waiter(recordRights(b, src, f.regrantOpts));
     await waitUntilBlocked(c.admin, pb, pa);
-    await a.query('COMMIT');
-    assert.equal((await p).version, f.rg);
+    await holderCommit(assert, a, pa);
+    assert.equal((await expectWaiterOk(assert, p)).version, f.rg);
     assert.equal(term.through_version, f.rg - 1);
     assert.equal(await terminated(src, f.rg), false);
     const end1 = await retEnd(src, 1);
@@ -448,10 +448,10 @@ for (const mode of ['immediate', 'pending']) {
     const view = await controlView(b, s1);
     await a.query('BEGIN');
     await recordRights(a, s1, f1.regrantOpts);
-    const p1 = control(b, s1, 'LIFT', { expectedMaxVersion: view.maxVersion, expectedControlSeq: view.lastSeq });
+    const p1 = waiter(control(b, s1, 'LIFT', { expectedMaxVersion: view.maxVersion, expectedControlSeq: view.lastSeq }));
     await waitUntilBlocked(c.admin, pb, pa);
-    await a.query('COMMIT');
-    await rejects(assert, p1, { code: CHECK, message: /SI_STALE_VIEW/ });
+    await holderCommit(assert, a, pa);
+    await expectWaiterError(assert, p1, { code: CHECK, message: /SI_STALE_VIEW/ });
     assert.equal(await suspended(s1), true);
     assert.equal(await valid(s1, f1.rg, f1.atOf(f1.rg)), false);
     // Order 2: LIFT first.
@@ -459,10 +459,10 @@ for (const mode of ['immediate', 'pending']) {
     await control(a, s2, 'SUSPEND');
     await a.query('BEGIN');
     await lift(a, s2);
-    const p2 = recordRights(b, s2, f2.regrantOpts);
+    const p2 = waiter(recordRights(b, s2, f2.regrantOpts));
     await waitUntilBlocked(c.admin, pb, pa);
-    await a.query('COMMIT');
-    assert.equal((await p2).version, f2.rg);
+    await holderCommit(assert, a, pa);
+    assert.equal((await expectWaiterOk(assert, p2)).version, f2.rg);
     assert.equal(await suspended(s2), false);
     assert.equal(await valid(s2, f2.rg, f2.atOf(f2.rg)), true, 'a re-grant after the LIFT is a later, deliberate decision');
   });
@@ -474,10 +474,10 @@ test('CC6: two concurrent controls on one source serialize; sequence dense, occu
   await recordRights(a, 'cc6');
   await a.query('BEGIN');
   await control(a, 'cc6', 'SUSPEND');
-  const p = control(b, 'cc6', 'TERMINATE_RETENTION');
+  const p = waiter(control(b, 'cc6', 'TERMINATE_RETENTION'));
   await waitUntilBlocked(c.admin, pb, pa);
-  await a.query('COMMIT');
-  assert.equal((await p).control_seq, 2);
+  await holderCommit(assert, a, pa);
+  assert.equal((await expectWaiterOk(assert, p)).control_seq, 2);
   const r = await one(c.admin, `SELECT array_agg(control_seq ORDER BY control_seq) AS seqs,
                                        bool_and(occurred_at >= coalesce(prev, occurred_at)) AS monotone
                                 FROM (SELECT control_seq, occurred_at, lag(occurred_at) OVER (ORDER BY control_seq) AS prev
@@ -578,4 +578,32 @@ test('CK2: commit visibility — an older snapshot keeps the old answer (documen
   assert.equal(await q(fresh), false, 'V1: a statement whose snapshot starts after the commit denies');
   await reader.query('COMMIT');
   assert.equal(await q(reader), false);
+});
+
+// ---------------------------------------------------------------------------------------
+// Final-review additions
+// ---------------------------------------------------------------------------------------
+
+test('IT1: a lock holder terminated by idle_in_transaction_session_timeout is detected, not mistaken for serialization', async t => {
+  const h = (await roles(t, db, ['si_rights_admin'])).si_rights_admin;
+  const w = (await roles(t, db, ['si_rights_admin'])).si_rights_admin;
+  const [ph, pw] = [await pid(h), await pid(w)];
+  await createSources(c.admin, ['it1']);
+  await recordRights(c.si_rights_admin, 'it1');
+  await control(c.si_rights_admin, 'it1', 'SUSPEND');                                    // seq 1
+  const view = await controlView(w, 'it1');
+  // Shorter than the 10 s role default only to keep the test fast; the mechanism is the same.
+  await h.query(`SET idle_in_transaction_session_timeout = '1s'`);
+  await h.query('BEGIN');
+  await control(h, 'it1', 'SUSPEND');                                                   // seq 2, uncommitted, holds the lock
+  const p = waiter(control(w, 'it1', 'LIFT', { expectedMaxVersion: view.maxVersion, expectedControlSeq: view.lastSeq }));
+  await waitUntilBlocked(c.admin, pw, ph);
+  // The holder stays idle: the server terminates it and rolls its SUSPEND back, so the waiter's
+  // (stale) LIFT now succeeds. A test that ignored the holder's fate would misread this outcome.
+  const lifted = await expectWaiterOk(assert, p);
+  assert.equal(lifted.control_seq, 2);
+  await assert.rejects(holderCommit(assert, h, ph), /lock holder lost before COMMIT \(terminated/);
+  assert.deepEqual(await kinds('it1'), ['SUSPEND', 'LIFT'], "the terminated holder's SUSPEND never committed");
+  const s = await settle(h.query('SELECT 1'));
+  assert.equal(s.status, 'terminated');
 });

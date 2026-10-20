@@ -129,6 +129,64 @@ export async function waitUntilBlocked(observer, waiterPid, holderPid, timeoutMs
 
 export const pid = async c => (await c.query('SELECT pg_catalog.pg_backend_pid() AS p')).rows[0].p;
 
+/**
+ * Classifies how a concurrent statement ended, so a concurrency test can tell expected lock
+ * contention and serialization apart from a terminated connection, a timeout or an
+ * unexpected database error.
+ */
+export function classifyError(err) {
+  if (['57P01', '57P02', '57P03', '25P03'].includes(err.code) || /Connection terminated|not queryable|terminating connection/i.test(err.message)) return 'terminated';
+  if (err.code === '55P03') return 'lock-timeout';
+  if (err.code === '57014') return 'statement-timeout';
+  return 'db-error';
+}
+export async function settle(promise) {
+  try { return { status: 'ok', value: await promise }; } catch (err) { return { status: classifyError(err), code: err.code, message: err.message }; }
+}
+
+/**
+ * Starts tracking a statement that is expected to block. The outcome handler is attached
+ * immediately, so a rejection that arrives while the test is still committing the holder is
+ * captured instead of surfacing as an unhandled rejection. Pass the result to
+ * expectWaiterOk / expectWaiterError.
+ */
+export function waiter(promise) {
+  const s = settle(promise);
+  s.isWaiter = true;
+  return s;
+}
+const outcome = p => (p.isWaiter ? p : settle(p));
+
+/** A blocked waiter must complete normally. Returns its result. */
+export async function expectWaiterOk(assert, promise) {
+  const r = await outcome(promise);
+  assert.equal(r.status, 'ok', `waiter ended with ${r.status}${r.code ? ` (${r.code})` : ''}: ${r.message ?? ''}`);
+  return r.value;
+}
+
+/** A blocked waiter must fail with exactly this database error — not a timeout or a lost connection. */
+export async function expectWaiterError(assert, promise, { code, message }) {
+  const r = await outcome(promise);
+  assert.equal(r.status, 'db-error', `waiter ended with ${r.status}${r.code ? ` (${r.code})` : ''}: ${r.message ?? ''}`);
+  assert.equal(r.code, code, `SQLSTATE: ${r.message}`);
+  if (message) assert.match(r.message, message);
+}
+
+/**
+ * Commits a lock holder and proves the commit really happened on the same, live backend:
+ * COMMIT on an aborted transaction reports ROLLBACK, and a backend terminated by
+ * idle_in_transaction_session_timeout (or anything else) throws here instead of letting a
+ * waiter "succeed" against a rolled-back holder.
+ */
+export async function holderCommit(assert, client, expectedPid) {
+  let r;
+  try { r = await client.query('COMMIT'); } catch (err) {
+    assert.fail(`lock holder lost before COMMIT (${classifyError(err)}${err.code ? `, ${err.code}` : ''}): ${err.message}`);
+  }
+  assert.equal(r.command, 'COMMIT', 'holder transaction committed (an aborted transaction would report ROLLBACK)');
+  assert.equal(await pid(client), expectedPid, 'holder backend is the same, live session');
+}
+
 /** Evidence arguments for si_record_rights_version: one synthetic declaration. */
 export const SYNTH_EVIDENCE = [['SYNTHETIC_DECLARATION'], ['test:synthetic'], null, ['test fixture']];
 

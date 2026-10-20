@@ -5,8 +5,10 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mayUse } from '../../dist/index.js';
 import {
-  asOwner, createSources, expectOrderRejection, freshDatabase, pid, recordRights, rejects, roles, waitUntilBlocked
+  asOwner, createSources, expectOrderRejection, expectWaiterOk, freshDatabase, holderCommit, pid, recordRights, rejects, roles,
+  waitUntilBlocked, waiter
 } from './helpers.mjs';
+const forensic = {};
 
 const one = async (c, sql, params = []) => (await c.query(sql, params)).rows[0];
 const CHECK = '23514';
@@ -217,6 +219,12 @@ test('attribution comes from session_user and cannot be forged', async t => {
 });
 
 test('concurrency: two rights admins on one source serialize on the source row; versions stay dense', async t => {
+  // Evidence of transaction order comes from locks and outcomes, not clocks:
+  // (1) B is proven blocked by A (pg_blocking_pids + wait_event_type Lock) before A commits;
+  // (2) A really committed on a live backend (holderCommit);
+  // (3) B completed normally and was assigned version 2, which it can only compute if its
+  //     post-lock read saw A's committed version 1 (a stale read would collide on
+  //     UNIQUE (source_id, version) or fail SI_VERSION_SEQUENCE).
   await createSources(c.admin, ['conc-src']);
   const extra = await roles(t, db, ['si_rights_admin']);
   const a = c.si_rights_admin, b = extra.si_rights_admin;
@@ -224,18 +232,29 @@ test('concurrency: two rights admins on one source serialize on the source row; 
   assert.notEqual(pa, pb);
   await a.query('BEGIN');
   const va = await recordRights(a, 'conc-src');                       // holds sources FOR UPDATE until COMMIT
-  const pending = recordRights(b, 'conc-src');
+  const pending = waiter(recordRights(b, 'conc-src'));
   await waitUntilBlocked(c.admin, pb, pa);
-  await a.query('COMMIT');
-  const vb = await pending;
+  await holderCommit(assert, a, pa);
+  const vb = await expectWaiterOk(assert, pending);
   assert.equal(va.version, 1);
-  assert.equal(vb.version, 2);
-  const r = await one(c.admin, `SELECT pg_xact_commit_timestamp(a.xmin) IS NOT NULL AS tracked,
-                                       b.effective_from > pg_xact_commit_timestamp(a.xmin) AS after_commit
+  assert.equal(vb.version, 2, 'B observed A\'s committed row after acquiring the lock');
+  const r = await one(c.admin, `SELECT b.effective_from >= a.effective_from AS ordered
                                 FROM si.rights_versions a, si.rights_versions b
                                 WHERE a.rights_version_id = $1 AND b.rights_version_id = $2`, [va.rights_version_id, vb.rights_version_id]);
-  assert.equal(r.tracked, true, 'track_commit_timestamp must be on');
-  assert.equal(r.after_commit, true, 'B read the clock after A committed (2.1 section A, point 4)');
+  assert.equal(r.ordered, true, 'ordering rule holds across the serialized pair');
+  forensic.conc = { a: va.rights_version_id, b: vb.rights_version_id };
+});
+
+test('forensic (clock-dependent expectation, not a correctness assertion): B read the clock after A committed', async t => {
+  // Requires track_commit_timestamp=on and a monotonic server clock. Kept separate so a clock
+  // step or a server without commit timestamps can never be mistaken for a serialization failure.
+  if (!forensic.conc) return t.skip('depends on the concurrency test above');
+  const on = (await one(c.admin, `SELECT current_setting('track_commit_timestamp') = 'on' AS on`)).on;
+  if (!on) return t.skip('track_commit_timestamp is off');
+  const r = await one(c.admin, `SELECT b.effective_from > pg_xact_commit_timestamp(a.xmin) AS after_commit
+                                FROM si.rights_versions a, si.rights_versions b
+                                WHERE a.rights_version_id = $1 AND b.rights_version_id = $2`, [forensic.conc.a, forensic.conc.b]);
+  assert.equal(r.after_commit, true);
 });
 
 test('RR8: retirement is final once passed; a future retirement may move or be cleared', async t => {
