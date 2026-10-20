@@ -12,7 +12,7 @@
 - Data validation rejects malformed country codes (shape only), invalid URL schemes, offset-less or impossible timestamps, and inverted first/last-seen dates.
 - Rights expiry fails closed on unparseable or offset-shifted values.
 - Every started run records `finishedAt`; records carry `runId`; conflicting duplicates are counted.
-- `src/` contains no network APIs (static guard test).
+- Static offline guard passes: no common network or process-spawning API patterns in any source file under `src/`, including nested directories. This is a regression check against accidental network code, not a security sandbox; it cannot detect obfuscated or indirect access.
 - Tests run with `npm test`; demo produces JSON diagnostics.
 
 ## Explicit non-goals
