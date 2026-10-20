@@ -26,6 +26,9 @@ ALTER ROLE si_collector    SET statement_timeout = '30s';
 ALTER ROLE si_collector    SET idle_in_transaction_session_timeout = '10s';
 ALTER ROLE si_collector    SET lock_timeout = '30s';
 ALTER ROLE si_rights_admin SET lock_timeout = '30s';
+-- Amendment C rev1 R5: bounds how long a control can sit between its decision instant
+-- (occurred_at) and its commit while holding the source-row lock.
+ALTER ROLE si_rights_admin SET idle_in_transaction_session_timeout = '10s';
 ALTER ROLE si_retention    SET lock_timeout = '30s';
 ALTER ROLE si_retention    SET statement_timeout = '120s';
 ALTER ROLE si_monitor      SET statement_timeout = '30s';
