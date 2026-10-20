@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { mayUse } from '../../dist/index.js';
 import {
-  asOwner, createSources, freshDatabase, pid, recordRights, rejects, roles, waitUntilBlocked
+  asOwner, createSources, expectOrderRejection, freshDatabase, pid, recordRights, rejects, roles, waitUntilBlocked
 } from './helpers.mjs';
 
 const one = async (c, sql, params = []) => (await c.query(sql, params)).rows[0];
@@ -160,23 +160,21 @@ test('R6: versions are dense; an out-of-sequence version number is refused', asy
      VALUES (999999, 'r6-src', 'DENIED', 'DENIED', 'DENIED', 'DENIED', 'DENIED', 'x', 'x')`)), { code: '428C9' });
 });
 
-test('effective_from is non-decreasing across versions', async t => {
+test('effective_from is non-decreasing across versions (NEG)', async t => {
   await createSources(c.admin, ['ord-src']);
   await recordRights(c.si_rights_admin, 'ord-src', { effective_from_sql: `clock_timestamp() + interval '1 hour'` });
-  await rejects(assert, recordRights(c.si_rights_admin, 'ord-src', { effective_from_sql: `clock_timestamp() + interval '30 minutes'` }),
-    { code: CHECK, message: /SI_EFFECTIVE_FROM_ORDER/ });
+  await expectOrderRejection(assert, c.si_rights_admin, 'ord-src', { effective_from_sql: `clock_timestamp() + interval '30 minutes'` });
   assert.equal((await recordRights(c.si_rights_admin, 'ord-src', { effective_from_sql: `clock_timestamp() + interval '2 hours'` })).version, 2);
 });
 
-test('FINDING: while a future-dated version is pending, an immediate revocation is refused (frozen 2.1 rule)', async t => {
-  // Recorded deviation candidate, not a weakened rule: 2.1 requires effective_from >= the previous
-  // version's. So once a version is scheduled for later, nothing can take effect before it.
-  // Retirement (immediate, final) remains available. Reported to the founder for a decision.
+test('FINDING (NEG): while a future-dated version is pending, an immediate revocation is refused (frozen 2.1 rule, unchanged)', async t => {
+  // The frozen 2.1 rule is kept: once a version is scheduled for later, no version can take
+  // effect before it. Amendment C resolves the operational need with source controls
+  // (tests/db/controls.test.mjs, C2); retirement (immediate, final) also remains available.
   await createSources(c.admin, ['find-src']);
   await recordRights(c.si_rights_admin, 'find-src');
   await recordRights(c.si_rights_admin, 'find-src', { effective_from_sql: `clock_timestamp() + interval '7 days'` });
-  await rejects(assert, recordRights(c.si_rights_admin, 'find-src', { evaluation: 'DENIED', retain: 'DENIED', retention_days: null }),
-    { code: CHECK, message: /SI_EFFECTIVE_FROM_ORDER/ });
+  await expectOrderRejection(assert, c.si_rights_admin, 'find-src', { evaluation: 'DENIED', retain: 'DENIED', retention_days: null });
   await c.si_rights_admin.query(`UPDATE si.sources SET retired_at = clock_timestamp() WHERE source_id = 'find-src'`);
   const v1 = (await one(c.admin, `SELECT rights_version_id FROM si.rights_versions WHERE source_id = 'find-src' AND version = 1`)).rights_version_id;
   assert.equal((await one(c.si_collector, `SELECT si.rights_valid_for_publish($1, clock_timestamp()) AS ok`, [v1])).ok, false);

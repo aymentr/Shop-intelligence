@@ -140,8 +140,27 @@ export async function recordRights(client, source, o = {}) {
   const v = {
     evaluation: 'ALLOWED', retain: 'ALLOWED', subscriber_display: 'DENIED', media_mirror: 'DENIED', export: 'DENIED',
     retention_days: 30, cleanup_within: '1 hour', basis: 'synthetic test fixture', change_reason: 'test',
-    effective_from_sql: 'NULL', expires_at_sql: 'NULL', evidence: SYNTH_EVIDENCE, ...o
+    effective_from_sql: 'NULL', expires_at_sql: 'NULL', evidence: SYNTH_EVIDENCE, expectOrderViolation: false, ...o
   };
+  // Amendment C rev1 R2 meta-check: every test history must satisfy SI_EFFECTIVE_FROM_ORDER
+  // unless the test explicitly expects the rejection (expectOrderRejection). A mis-specified
+  // history fails here as a test bug, before the database is asked.
+  // Callers without SELECT on rights_versions (privilege tests) skip the check: their call
+  // is refused for lack of EXECUTE anyway, before any history could be written.
+  let violates = null;
+  try {
+    violates = (await client.query(
+      `SELECT EXISTS (SELECT 1 FROM si.rights_versions WHERE source_id = $1
+                      AND effective_from > coalesce(${v.effective_from_sql}, clock_timestamp())) AS violates`, [source])).rows[0].violates;
+  } catch (err) {
+    if (err.code !== '42501') throw err;
+  }
+  if (violates === true && !v.expectOrderViolation) {
+    throw new Error(`TEST BUG: history for ${source} violates SI_EFFECTIVE_FROM_ORDER (effective_from ${v.effective_from_sql}); use expectOrderRejection()`);
+  }
+  if (violates === false && v.expectOrderViolation) {
+    throw new Error(`TEST BUG: expected an ordering violation for ${source}, but the history is ordered`);
+  }
   const [kinds, refs, shas, descs] = v.evidence;
   const r = await client.query(
     `SELECT * FROM si.si_record_rights_version($1, $2, $3, $4, $5, $6, $7, $8::interval, $9, $10,
@@ -149,6 +168,41 @@ export async function recordRights(client, source, o = {}) {
     [source, v.evaluation, v.retain, v.subscriber_display, v.media_mirror, v.export, v.retention_days,
      v.cleanup_within, v.basis, v.change_reason, kinds, refs, shas, descs]);
   return r.rows[0];
+}
+
+/**
+ * NEG tests: asserts the history really violates the ordering rule, that the database
+ * rejects it with SI_EFFECTIVE_FROM_ORDER, and that no version was added.
+ */
+export async function expectOrderRejection(assert, client, source, o = {}) {
+  const count = async () => (await client.query('SELECT count(*)::int AS n FROM si.rights_versions WHERE source_id = $1', [source])).rows[0].n;
+  const before = await count();
+  await rejects(assert, recordRights(client, source, { ...o, expectOrderViolation: true }), { code: '23514', message: /SI_EFFECTIVE_FROM_ORDER/ });
+  assert.equal(await count(), before, 'a rejected version changes nothing');
+}
+
+/** Calls si.si_record_source_control (Amendment C). LIFT-only fields are ignored for other kinds. */
+export async function control(client, source, kind, o = {}) {
+  const r = await client.query('SELECT * FROM si.si_record_source_control($1, $2, $3, $4, $5, $6, $7, $8)',
+    [source, kind, o.reason ?? `test ${kind}`, o.reference ?? null, o.expectedMaxVersion ?? null,
+     o.expectedControlSeq ?? null, o.ackTerminationSeq ?? null, o.authorizationVersion ?? null]);
+  return r.rows[0];
+}
+
+/** What an operator sees before a LIFT: latest version, latest control sequence, open termination. */
+export async function controlView(client, source) {
+  return (await client.query(`
+    SELECT (SELECT coalesce(max(version), 0) FROM si.rights_versions WHERE source_id = $1) AS "maxVersion",
+           (SELECT coalesce(max(control_seq), 0) FROM si.source_controls WHERE source_id = $1) AS "lastSeq",
+           (SELECT max(control_seq) FROM si.source_controls WHERE source_id = $1 AND kind = 'TERMINATE_RETENTION'
+              AND control_seq > (SELECT coalesce(max(control_seq), 0) FROM si.source_controls WHERE source_id = $1 AND kind = 'LIFT')) AS "openTermination"`,
+    [source])).rows[0];
+}
+
+/** LIFT with a fresh view; `o` may override expectations or add acknowledgement/authorization. */
+export async function lift(client, source, o = {}) {
+  const v = await controlView(client, source);
+  return control(client, source, 'LIFT', { expectedMaxVersion: v.maxVersion, expectedControlSeq: v.lastSeq, ...o });
 }
 
 /** Inserts synthetic test sources as si_owner. */

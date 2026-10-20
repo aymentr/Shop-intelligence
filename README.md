@@ -35,7 +35,8 @@ CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 an
 ## B-002 persistence (Milestone 1, in progress)
 
 PostgreSQL 16 foundation: roles, bootstrap, migration runner, migration 0001 (sources,
-versioned rights, evidence) and integration tests against a real database.
+versioned rights, evidence, and Amendment C source controls: suspension, irreversible
+retention termination, LIFT) and integration tests against a real database.
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1

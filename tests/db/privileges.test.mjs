@@ -4,31 +4,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { asOwner, cfg, connect, freshDatabase, recordRights, rejects, roles } from './helpers.mjs';
+import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, roles } from './helpers.mjs';
 
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
-const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.schema_migrations'];
+const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
+const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
 
 // Expected table-level privileges per role (everything not listed must be false).
 const EXPECTED_TABLE = {
-  si_collector:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
-  si_rights_admin: { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
-  si_retention:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
+  si_collector:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
+  si_rights_admin: { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
+  si_retention:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
   si_monitor:      { 'si.schema_migrations': ['SELECT'] }
 };
 // Expected EXECUTE grantees per function (owner excluded). Anything else in schema si: none.
 const EXPECTED_EXECUTE = {
   si_record_rights_version: ['si_rights_admin'],
+  si_record_source_control: ['si_rights_admin'],
   rights_valid_for_publish: ['si_collector'],
+  si_source_suspended: ['si_collector'],
+  si_retention_terminated: ['si_collector'],
   si_window_end: ['si_collector'],
   si_publish_margin: ['si_collector']
 };
-const EXPECTED_DEFINER = ['si_record_rights_version'];
+const EXPECTED_DEFINER = ['si_record_rights_version', 'si_record_source_control'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
-  trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v'
+  trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
+  // Amendment C
+  si_record_source_control: 'v', si_source_suspended: 's', si_retention_terminated: 's', si_source_suspended_at: 's',
+  trg_source_controls_insert: 'v'
 };
 
 let db, c;
@@ -112,7 +119,7 @@ test('SD2/G3: role attributes and per-role session settings', async () => {
   }
   const settings = n => (r[n].rolconfig ?? []).slice().sort();
   assert.deepEqual(settings('si_collector'), ['idle_in_transaction_session_timeout=10s', 'lock_timeout=30s', 'statement_timeout=30s']);
-  assert.deepEqual(settings('si_rights_admin'), ['lock_timeout=30s']);
+  assert.deepEqual(settings('si_rights_admin'), ['idle_in_transaction_session_timeout=10s', 'lock_timeout=30s']);
   assert.deepEqual(settings('si_retention'), ['lock_timeout=30s', 'statement_timeout=120s']);
   assert.deepEqual(settings('si_monitor'), ['statement_timeout=30s']);
   assert.equal((await c.si_collector.query('SHOW statement_timeout')).rows[0].statement_timeout, '30s', 'settings apply on login');
@@ -154,6 +161,32 @@ test('SD3: the authorized caller succeeds even with a hostile search_path', asyn
   await c.si_rights_admin.query('RESET search_path');
 });
 
+test('SD3 (Amendment C): only si_rights_admin may record source controls; audit predicate is owner-only', async t => {
+  const call = client => control(client, 'synthetic-fixture', 'SUSPEND');
+  for (const role of ['si_collector', 'si_retention', 'si_monitor']) {
+    await rejects(assert, call(c[role]), { code: '42501', message: /permission denied for function si_record_source_control/ });
+    await rejects(assert, c[role].query(`INSERT INTO si.source_controls (source_id, control_seq, kind, reason) VALUES ('synthetic-fixture', 1, 'SUSPEND', 'x')`), { code: '42501' });
+  }
+  await rejects(assert, c.si_rights_admin.query(`INSERT INTO si.source_controls (source_id, control_seq, kind, reason) VALUES ('synthetic-fixture', 1, 'SUSPEND', 'x')`), { code: '42501' });
+  for (const role of APP_ROLES) {
+    await rejects(assert, c[role].query(`SELECT si.si_source_suspended_at('synthetic-fixture', now())`), { code: '42501' });
+  }
+  for (const role of ['si_rights_admin', 'si_retention', 'si_monitor']) {
+    await rejects(assert, c[role].query(`SELECT si.si_source_suspended('synthetic-fixture')`), { code: '42501' });
+  }
+  assert.equal((await c.si_collector.query(`SELECT si.si_source_suspended('synthetic-fixture') AS s`)).rows[0].s, false);
+  assert.equal((await c.admin.query(`SELECT has_function_privilege('si_rights_admin', $1, 'EXECUTE') AS h`, [CONTROL_SIG])).rows[0].h, true);
+});
+
+test('SD3 (Amendment C): the control function works with a hostile search_path and records session_user', async () => {
+  await c.si_rights_admin.query(`SET search_path = "$user", public, pg_temp`);
+  await c.admin.query(`SET ROLE si_owner; INSERT INTO si.sources (source_id, display_name, evidence_kind, supported_networks) VALUES ('sd3-ctl', 'x', 'SYNTHETIC', '{META}'); RESET ROLE`);
+  const r = await control(c.si_rights_admin, 'sd3-ctl', 'SUSPEND');
+  assert.equal(r.control_seq, 1);
+  await c.si_rights_admin.query('RESET search_path');
+  assert.equal((await c.admin.query(`SELECT recorded_by FROM si.source_controls WHERE source_id = 'sd3-ctl'`)).rows[0].recorded_by, 'si_rights_admin');
+});
+
 test('SD5: functions created later in schema si start without PUBLIC EXECUTE (default privileges)', async () => {
   await c.admin.query('BEGIN');
   await c.admin.query('SET LOCAL ROLE si_owner');
@@ -167,7 +200,8 @@ test('SD5: functions created later in schema si start without PUBLIC EXECUTE (de
 });
 
 test('SD7: trigger functions cannot be called directly', async () => {
-  for (const fn of ['trg_append_only', 'trg_rights_insert', 'trg_rights_evidence_required', 'trg_sources_retire_final', 'trg_evidence_attribution']) {
+  for (const fn of ['trg_append_only', 'trg_rights_insert', 'trg_rights_evidence_required', 'trg_sources_retire_final', 'trg_evidence_attribution',
+                    'trg_source_controls_insert']) {
     await rejects(assert, asOwner(c.admin, x => x.query(`SELECT si.${fn}()`)), { code: '0A000' });
   }
 });
