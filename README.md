@@ -32,6 +32,18 @@ No data is published or persisted. If any record is invalid, the entire run is F
 
 CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 and 24 for pushes and pull requests.
 
+## B-002 persistence (Milestone 1, in progress)
+
+PostgreSQL 16 foundation: roles, bootstrap, migration runner, migration 0001 (sources,
+versioned rights, evidence) and integration tests against a real database.
+
+```bash
+docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
+npm run test:db
+```
+
+See `docs/b002-persistence.md` for the architecture, deviations and limitations.
+
 ## Next gates
 
 1. Test rights semantics against actual platform/source agreements before enabling any live adapter.
