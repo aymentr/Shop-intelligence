@@ -188,7 +188,21 @@ that was scheduled earlier.
   they end (G-R2). `occurred_at` and `si_source_suspended_at` depend on the server clock and
   are audit-only.
 - `si_rights_admin` now has `idle_in_transaction_session_timeout = 10s`: a session left idle
-  inside a transaction (for example while holding a control's source-row lock) is terminated.
+  inside a transaction (for example while holding a control's source-row lock) is terminated
+  and its uncommitted control rolls back. This is a role **default**: the session itself can
+  `SET idle_in_transaction_session_timeout = 0`, so it bounds well-behaved callers only.
+  Concurrency tests verify that every lock holder really committed on a live backend
+  (`holderCommit`), so a terminated holder can never pass for a serialized one (test IT1).
+- `SI_CLOCK_REGRESSION` refuses **every** control, including an emergency SUSPEND or
+  TERMINATE_RETENTION, while the server clock is behind the source's last control
+  `occurred_at` (test CK1). Enforcement does not use `occurred_at`; the guard only keeps the
+  audit timestamps monotonic. Raised for a founder decision in the final review.
+- A single transaction may record TERMINATE_RETENTION, a new authorization and an
+  acknowledged LIFT together; other sessions then never observe the suspension. Covered data
+  stays terminated. The 0004 cleanup gate will prevent this (cleanup cannot complete first).
+- A rights version recorded after a backward clock step can have an `effective_from` earlier
+  than a preceding termination's `occurred_at`. The termination term has no supersession
+  test, so covered data stays terminated (test CK3).
 
 - A PostgreSQL superuser or the table owner can disable triggers, set
   `session_replication_role = replica`, or drop constraints. That access is reserved for migrations.
