@@ -1,0 +1,14 @@
+[
+  {
+    "network": "META", "nativeAdId": "SYN-0001", "advertiserName": "Demo Pet Shop",
+    "countries": ["DE", "US"], "seenAt": "2026-10-18T12:00:00Z",
+    "sourceUrl": "https://example.org/ad/SYN-0001", "title": "Synthetic pet bottle creative",
+    "destinationUrl": "https://example.org/products/pet-bottle", "creativeUrl": "https://example.org/media/creative-1.jpg",
+    "sourceReportedFirstSeen": "2026-10-17T10:00:00Z"
+  },
+  {
+    "network": "TIKTOK", "nativeAdId": "SYN-0002", "advertiserName": "Demo Home Shop",
+    "countries": ["GB", "CA"], "seenAt": "2026-10-18T12:01:00Z",
+    "sourceUrl": "https://example.org/ad/SYN-0002", "title": "Synthetic kitchen creative"
+  }
+]

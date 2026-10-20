@@ -1,0 +1,20 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {FixtureAdapter, ingestOffline, mayUse, assertPermitted, parseAd, diagnostics} from '../dist/index.js';
+const right={sourceId:'synthetic',basis:'author-created synthetic data',evaluation:'ALLOWED',retain:'UNKNOWN',subscriber_display:'DENIED',media_mirror:'DENIED',export:'DENIED'};
+const row={network:'META',nativeAdId:'test1',advertiserName:'Demo',countries:['DE'],seenAt:'2026-10-18T00:00:00Z',sourceUrl:'https://example.org/ad/1'};
+const run=(rows, r=right)=>ingestOffline(new FixtureAdapter('synthetic',['META'],rows),r,'run-1','2026-10-19T00:00:00Z');
+test('valid synthetic ads ingest and normalize with scoped identity', async()=>{
+ const r=await run([row]); assert.equal(r.run.status,'COMPLETED'); assert.equal(r.ads[0].identityKey,'META:test1'); assert.equal(r.ads[0].evidenceKind,'SYNTHETIC');
+});
+test('deduplicates identical network and native ID', async()=>{ const r=await run([row,row]);assert.equal(r.run.received,2);assert.equal(r.run.unique,1);assert.equal(r.run.duplicate,1);});
+test('same native ID on distinct networks not collapsed', async()=>{const r=await ingestOffline(new FixtureAdapter('synthetic',['META','TIKTOK'],[row,{...row,network:'TIKTOK'}]),right,'run1','2026-10-19T00:00:00Z');assert.equal(r.run.unique,2);});
+test('bad row fails entire run and returns no trusted ads', async()=>{const r=await run([row,{...row,countries:['Germany']}]);assert.equal(r.run.status,'FAILED');assert.equal(r.ads.length,0);assert.equal(r.run.unique,0);assert.equal(r.run.errors.length,1);});
+test('source failure fails closed',async()=>{const r=await ingestOffline({id:'synthetic',supportedNetworks:['META'],evidenceKind:'SYNTHETIC',async readOffline(){throw new Error('timeout')}},right,'r','2026-10-19T00:00:00Z');assert.equal(r.run.status,'FAILED');assert.equal(r.ads.length,0);});
+test('unknown rights block evaluation',async()=>{await assert.rejects(()=>run([row],{...right,evaluation:'UNKNOWN'}),/RIGHTS_BLOCKED/);});
+test('rights never allow subscriber display by default',()=>{assert.equal(mayUse(right,'subscriber_display'),false);assert.throws(()=>assertPermitted(right,'export'),/RIGHTS_BLOCKED/);});
+test('expired rights are denied',()=>{assert.equal(mayUse({...right,expiresAt:'2020-01-01T00:00:00Z'},'evaluation'),false);});
+test('identity mismatch blocks cross-source rights leakage',async()=>{await assert.rejects(()=>run([row],{...right,sourceId:'another'}),/mismatch/);});
+test('URLs restricted to http(s), no embedded credentials',()=>{assert.throws(()=>parseAd({...row,sourceUrl:'file:///tmp/x'}),/Unsafe URL/);assert.throws(()=>parseAd({...row,sourceUrl:'https://x:y@example.org'}),/Unsafe URL/);});
+test('metrics report null for empty sample',async()=>{const r=await run([]);assert.equal(diagnostics(r).destinationCoverage,null);});
+test('adapter refuses records from undeclared network',async()=>{const r=await run([{...row,network:'TIKTOK'}]);assert.equal(r.run.status,'FAILED');});
