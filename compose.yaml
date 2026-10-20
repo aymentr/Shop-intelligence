@@ -1,0 +1,21 @@
+# Local / CI test database for B-002. NOT a production deployment.
+# - Bound to 127.0.0.1 only; data lives in tmpfs and disappears with the container.
+# - fsync=off is for test speed only; it does not change locking, snapshot or
+#   commit-timestamp semantics.
+# - The password is a dev-only placeholder, overridable via SI_TEST_DB_PASSWORD.
+#   Never reuse it anywhere real.
+services:
+  db:
+    image: postgres:16.15@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+    command: ["postgres", "-c", "track_commit_timestamp=on", "-c", "fsync=off"]
+    environment:
+      POSTGRES_DB: si_test
+      POSTGRES_USER: si_bootstrap
+      POSTGRES_PASSWORD: ${SI_TEST_DB_PASSWORD:-local-test-only}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256 -E UTF8"
+    ports: ["127.0.0.1:54329:5432"]
+    tmpfs: ["/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "si_bootstrap", "-d", "si_test"]
+      interval: 2s
+      retries: 30

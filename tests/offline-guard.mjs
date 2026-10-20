@@ -24,6 +24,15 @@ export const FORBIDDEN = [
 ];
 
 /**
+ * Patterns allowed only under one directory of the scanned root. The PostgreSQL
+ * driver opens network connections (to the database only), so it is confined to
+ * persistence/ — adapters and the ingest core must never import it.
+ */
+export const CONFINED = [
+  { pattern: /(from\s+['"]pg['"]|import\s*\(\s*['"]pg['"]|require\s*\(\s*['"]pg['"])/, allowedUnder: 'persistence/' }
+];
+
+/**
  * Recursively scans `rootDir` (a filesystem path, not a URL).
  * Returns the source files scanned, the pattern matches found, and any entries
  * it refused to follow (symbolic links and other non-regular entries), so that
@@ -44,6 +53,9 @@ export function scanForNetworkCode(rootDir) {
       const text = readFileSync(full, 'utf8');
       for (const pattern of FORBIDDEN) {
         if (pattern.test(text)) violations.push({ file: rel, pattern: String(pattern) });
+      }
+      for (const { pattern, allowedUnder } of CONFINED) {
+        if (!rel.startsWith(allowedUnder) && pattern.test(text)) violations.push({ file: rel, pattern: String(pattern) });
       }
     }
   };
