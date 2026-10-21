@@ -31,17 +31,38 @@ const relExists = async (c, rel) => (await c.query('SELECT pg_catalog.to_regclas
 test('M1: up -> down -> up yields an identical schema (catalog fingerprint incl. owners and ACLs)', async t => {
   const db = await freshDatabase(t, 'm1', { migrate: false });
   const { admin } = await roles(t, db, ['admin']);
-  assert.deepEqual(await migrateUp(admin), [1]);
+  assert.deepEqual(await migrateUp(admin), [1, 2]);
   const afterUp = await schemaFingerprint(admin);
-  assert.deepEqual(await migrateDown(admin, { to: 0, allowDestructive: true }), [1]);
+  assert.deepEqual(await migrateDown(admin, { to: 0, allowDestructive: true }), [2, 1]);
   const afterDown = await schemaFingerprint(admin);
   assert.notEqual(afterDown, afterUp);
   const left = (await admin.query(`SELECT relname FROM pg_class WHERE relnamespace = 'si'::regnamespace AND relkind = 'r'`)).rows;
-  assert.deepEqual(left.map(r => r.relname), ['schema_migrations'], 'down 0001 leaves only the runner table');
+  assert.deepEqual(left.map(r => r.relname), ['schema_migrations'], 'down 0002 then 0001 leaves only the runner table');
   assert.equal((await admin.query(`SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'si'::regnamespace`)).rows[0].n, 0);
-  assert.deepEqual(await migrateUp(admin), [1]);
+  assert.deepEqual(await migrateUp(admin), [1, 2]);
   assert.equal(await schemaFingerprint(admin), afterUp);
   assert.equal((await admin.query('SELECT count(*)::int AS n FROM si.rights_versions')).rows[0].n, 1, 'seed re-applied');
+});
+
+test('M1b: up 0002 -> down 0002 leaves the 0001 schema identical; 0002 re-applies identically', async t => {
+  const db = await freshDatabase(t, 'm1b', { migrate: false });
+  const { admin } = await roles(t, db, ['admin']);
+  assert.deepEqual(await migrateUp(admin, { to: 1 }), [1]);
+  const only0001 = await schemaFingerprint(admin);
+  assert.deepEqual(await migrateUp(admin), [2]);
+  const with0002 = await schemaFingerprint(admin);
+  assert.notEqual(with0002, only0001);
+  assert.deepEqual(await migrateDown(admin, { to: 1, allowDestructive: true }), [2]);
+  assert.equal(await schemaFingerprint(admin), only0001, 'down 0002 restores the exact 0001 catalog');
+  assert.deepEqual(await migrateUp(admin), [2]);
+  assert.equal(await schemaFingerprint(admin), with0002);
+});
+
+test('0001 is frozen: its files match the checksums merged in PR #2 (main 4418b69)', () => {
+  // Applied migrations are immutable. A change to 0001 must be a new migration instead.
+  const sha = f => createHash('sha256').update(readFileSync(join(DEFAULT_MIGRATIONS_DIR, f))).digest('hex');
+  assert.equal(sha('0001_sources_rights.up.sql'), 'a538faad41b54489f77195f99a5ca155df4b15072fd7e181d04db8d1035ba77f');
+  assert.equal(sha('0001_sources_rights.down.sql'), 'b12f6f743cba76f9b91de2f02298e76f5f79130c9c72b6f7f53245f09bc671ce');
 });
 
 test('M2: an edited applied migration (up or down file) is refused by checksum', async t => {
@@ -58,7 +79,7 @@ test('M2: an edited applied migration (up or down file) is refused by checksum',
   cpSync(DEFAULT_MIGRATIONS_DIR, dir, { recursive: true });       // restore up, now edit down
   appendFileSync(join(dir, '0001_sources_rights.down.sql'), '\n-- edited\n');
   await rejects(assert, migrateUp(admin, { dir }), { message: /^CHECKSUM_MISMATCH/ });
-  assert.deepEqual(await appliedVersions(admin), [1], 'nothing changed');
+  assert.deepEqual(await appliedVersions(admin), [1, 2], 'nothing changed');
 });
 
 test('M3: concurrent runners serialize on the advisory lock; exactly one applies', async t => {
@@ -94,7 +115,8 @@ test('M4: down is refused without the destructive flag, and with non-synthetic d
   await migrateUp(admin);
   await rejects(assert, migrateDown(admin, { to: 0, allowDestructive: false }), { message: /^DESTRUCTIVE_NOT_ALLOWED/ });
   await rejects(assert, migrateDown(admin, { to: 0 }), { message: /^DESTRUCTIVE_NOT_ALLOWED/ });
-  assert.deepEqual(await appliedVersions(admin), [1]);
+  await rejects(assert, migrateDown(admin, { to: 1 }), { message: /^DESTRUCTIVE_NOT_ALLOWED/ });
+  assert.deepEqual(await appliedVersions(admin), [1, 2]);
 
   // Non-synthetic guard: a throwaway schema without the 0001 CHECK lets us plant a non-synthetic row.
   const dir = tempMigrations(t, {
@@ -189,13 +211,14 @@ test('runner: invalid migration sets are rejected before touching the database',
 test('runner: history records exact checksums, applying login, and objects owned by si_owner', async t => {
   const db = await freshDatabase(t, 'history');
   const { admin } = await roles(t, db, ['admin']);
-  const row = (await admin.query('SELECT * FROM si.schema_migrations')).rows[0];
+  const rows = (await admin.query('SELECT * FROM si.schema_migrations ORDER BY version')).rows;
   const sha = f => createHash('sha256').update(readFileSync(join(DEFAULT_MIGRATIONS_DIR, f))).digest('hex');
-  assert.equal(row.version, 1);
-  assert.equal(row.name, 'sources_rights');
-  assert.equal(row.up_sha256, sha('0001_sources_rights.up.sql'));
-  assert.equal(row.down_sha256, sha('0001_sources_rights.down.sql'));
-  assert.equal(row.applied_by, cfg.adminUser);
+  assert.deepEqual(rows.map(r => [r.version, r.name]), [[1, 'sources_rights'], [2, 'runs']]);
+  for (const [row, base] of [[rows[0], '0001_sources_rights'], [rows[1], '0002_runs']]) {
+    assert.equal(row.up_sha256, sha(`${base}.up.sql`));
+    assert.equal(row.down_sha256, sha(`${base}.down.sql`));
+    assert.equal(row.applied_by, cfg.adminUser);
+  }
   const owners = (await admin.query(`
     SELECT DISTINCT pg_get_userbyid(relowner) AS o FROM pg_class WHERE relnamespace = 'si'::regnamespace
     UNION SELECT DISTINCT pg_get_userbyid(proowner) FROM pg_proc WHERE pronamespace = 'si'::regnamespace`)).rows;
@@ -205,11 +228,11 @@ test('runner: history records exact checksums, applying login, and objects owned
 test('assertSchemaVersion: the application refuses a database at the wrong version', async t => {
   const db = await freshDatabase(t, 'version');
   const { si_collector } = await roles(t, db, ['si_collector']);
-  assert.equal(codeSchemaVersion(), 1);
+  assert.equal(codeSchemaVersion(), 2);
   await assertSchemaVersion(si_collector);                            // as an application role
-  await rejects(assert, assertSchemaVersion(si_collector, 2), { message: /^SCHEMA_VERSION_MISMATCH: database is at version 1/ });
+  await rejects(assert, assertSchemaVersion(si_collector, 1), { message: /^SCHEMA_VERSION_MISMATCH: database is at version 2/ });
   const empty = await freshDatabase(t, 'version0', { migrate: false });
   const c = await connect({ database: empty });
   t.after(() => c.end());
-  await rejects(assert, assertSchemaVersion(c), { message: /database is at version 0, code expects 1/ });
+  await rejects(assert, assertSchemaVersion(c), { message: /database is at version 0, code expects 2/ });
 });

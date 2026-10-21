@@ -187,6 +187,30 @@ through source controls, which are outside the version sequence (test `C2`). Rem
 liveness limit: after a termination, a new authorization cannot take effect before a version
 that was scheduled earlier.
 
+## Milestone 2, step 1 — migration 0002 schema (in progress)
+
+Plan: `docs/b002-m2-plan.md` (authoritative, revision 2). Step 1 adds only the tables
+`collection_runs`, `publication_receipts` and `run_errors`, their CHECK constraints (2.1 shapes,
+Amendment A2 EMPTY rules, D4 consistency rules, outcome codes per status, control-sequence
+columns), the IA-1 composite foreign keys (runs and receipts), indexes, and **read-only** grants.
+
+Not yet enforced (steps 2–4): attempt numbering and the request-key lock, computed columns,
+allowed transitions, the publication path (`si_complete_run`), receipts only for COMPLETED runs,
+errors only for FAILED runs. Until then **no application role can write to these tables**.
+
+`cli.js preflight` checks the operational preconditions (D7): PostgreSQL 16,
+`max_prepared_transactions = 0`, `track_commit_timestamp = on`, no synchronous standby,
+`default_transaction_isolation = read committed`.
+
+**Publication timing (M2 plan §4).** Control events (G1) and rights-version/source-row
+serialization (G2) are enforced by row locks held to the end of the publishing transaction.
+Clock-based validity (G3) holds only at the last check instant: at that check the rights version
+was valid with at least 60 s to spare; PostgreSQL does not bound the time from that check to the
+durable commit.
+
+> **Release invariant:** no production content-serving path may launch until the D8 timing gap
+> (G3) is resolved and independently tested (planned for 0004).
+
 ## Limitations (Milestone 1)
 
 - Amendment C: no physical deletion exists yet. After `TERMINATE_RETENTION` covered data is

@@ -45,6 +45,10 @@ npm run test:db
 
 See `docs/b002-persistence.md` for the architecture, deviations and limitations.
 
+Milestone 2 (migration 0002, collection runs) is in progress: plan in `docs/b002-m2-plan.md`.
+**Release invariant:** no production content-serving path may launch until the publication
+timing gap D8 is resolved and independently tested.
+
 ## Next gates
 
 1. Test rights semantics against actual platform/source agreements before enabling any live adapter.

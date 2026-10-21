@@ -6,6 +6,7 @@
  *   node dist/persistence/cli.js up [--to N]
  *   node dist/persistence/cli.js down --to N --allow-destructive
  *   node dist/persistence/cli.js status
+ *   node dist/persistence/cli.js preflight            operational preconditions (deployment check, D7)
  *
  * bootstrap sets login passwords only if SI_ROLE_PASSWORD_<ROLE> (e.g.
  * SI_ROLE_PASSWORD_SI_COLLECTOR) or SI_ROLE_PASSWORD is set. Passwords never
@@ -14,6 +15,7 @@
 import pg from 'pg';
 import { bootstrapCluster, bootstrapDatabase, LOGIN_ROLES, type LoginRole } from './bootstrap.js';
 import { migrateDown, migrateUp, migrationStatus } from './migrate.js';
+import { checkOperationalPreconditions } from './preconditions.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -48,8 +50,12 @@ async function main(): Promise<void> {
     } else if (command === 'status') {
       const s = await migrationStatus(client);
       console.log(JSON.stringify({ applied: s.applied.map(a => a.version), pending: s.pending, problem: s.problem }));
+    } else if (command === 'preflight') {
+      const results = await checkOperationalPreconditions(client);
+      for (const p of results) console.log(`${p.ok ? 'ok  ' : 'FAIL'} ${p.name}: ${p.actual} (expected ${p.expected})`);
+      if (results.some(p => !p.ok)) process.exitCode = 1;
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight');
     }
   } finally {
     await client.end();

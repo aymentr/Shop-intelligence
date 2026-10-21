@@ -7,16 +7,21 @@ import { randomBytes } from 'node:crypto';
 import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, roles } from './helpers.mjs';
 
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
-const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations'];
+const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
+                'si.collection_runs', 'si.publication_receipts', 'si.run_errors'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
 
 // Expected table-level privileges per role (everything not listed must be false).
 const EXPECTED_TABLE = {
-  si_collector:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
-  si_rights_admin: { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
-  si_retention:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'] },
+  si_collector:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
+                     // 0002 step 1: read only; write grants arrive with their enforcing triggers (steps 2-4)
+                     'si.collection_runs': ['SELECT'], 'si.publication_receipts': ['SELECT'] },
+  si_rights_admin: { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
+                     'si.collection_runs': ['SELECT'] },
+  si_retention:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
+                     'si.collection_runs': ['SELECT'], 'si.publication_receipts': ['SELECT'], 'si.run_errors': ['SELECT'] },
   si_monitor:      { 'si.schema_migrations': ['SELECT'] }
 };
 // Expected EXECUTE grantees per function (owner excluded). Anything else in schema si: none.
@@ -59,6 +64,23 @@ test('G1: table privileges match the grant matrix exactly (every role x table x 
     SELECT c.relname FROM pg_class c, aclexplode(c.relacl) a
     WHERE c.relnamespace = 'si'::regnamespace AND a.grantee = 0`)).rows;
   assert.deepEqual(pub, [], 'nothing in si is granted to PUBLIC');
+});
+
+test('G1 (0002 step 1): no application role holds any column-level write privilege on the run tables', async () => {
+  const r = (await c.admin.query(`
+    SELECT c.relname, a.attname, x.grantee::regrole::text AS grantee, x.privilege_type
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid, aclexplode(a.attacl) x
+    WHERE c.relname IN ('collection_runs','publication_receipts','run_errors') AND c.relnamespace = 'si'::regnamespace
+      AND a.attacl IS NOT NULL`)).rows;
+  assert.deepEqual(r, []);
+  for (const role of APP_ROLES) for (const t of ['si.collection_runs', 'si.publication_receipts', 'si.run_errors']) {
+    for (const p of ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']) {
+      assert.equal((await c.admin.query('SELECT has_table_privilege($1, $2, $3) AS h', [role, t, p])).rows[0].h, false, `${role} ${p} ${t}`);
+    }
+  }
+  await rejects(assert, c.si_collector.query(`DELETE FROM si.collection_runs`), { code: '42501' });
+  await rejects(assert, c.si_collector.query(`UPDATE si.collection_runs SET status = 'COMPLETED'`), { code: '42501' });
+  await rejects(assert, c.si_collector.query(`INSERT INTO si.publication_receipts (run_id, source_id, rights_version_id) VALUES (gen_random_uuid(), 'synthetic-fixture', 1)`), { code: '42501' });
 });
 
 test('G1: column privileges — only si_rights_admin may UPDATE, and only sources.retired_at / conflict_policy', async () => {
