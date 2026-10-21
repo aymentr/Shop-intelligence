@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import type { Client } from 'pg';
 
 export const BOOTSTRAP_DIR = fileURLToPath(new URL('../../db/bootstrap/', import.meta.url));
-export const LOGIN_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'] as const;
+export const LOGIN_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor', 'si_migrator'] as const;
 export type LoginRole = (typeof LOGIN_ROLES)[number];
 
 /** Creates or normalizes the five roles and their session settings; optionally sets login passwords. */

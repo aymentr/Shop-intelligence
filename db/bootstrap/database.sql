@@ -9,7 +9,7 @@
 DO $$
 BEGIN
   EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', current_database());
-  EXECUTE format('GRANT CONNECT ON DATABASE %I TO si_collector, si_rights_admin, si_retention, si_monitor',
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO si_collector, si_rights_admin, si_retention, si_monitor, si_migrator',
                  current_database());
 END $$;
 
@@ -20,7 +20,7 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 CREATE SCHEMA IF NOT EXISTS si AUTHORIZATION si_owner;
 ALTER SCHEMA si OWNER TO si_owner;
 REVOKE ALL ON SCHEMA si FROM PUBLIC;
-GRANT USAGE ON SCHEMA si TO si_collector, si_rights_admin, si_retention, si_monitor;
+GRANT USAGE ON SCHEMA si TO si_collector, si_rights_admin, si_retention, si_monitor, si_migrator;
 
 -- Functions start closed: PostgreSQL grants EXECUTE to PUBLIC by default.
 -- DEVIATION from the frozen text of Amendment A4, which says

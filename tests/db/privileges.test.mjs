@@ -28,19 +28,23 @@ const EXPECTED_TABLE = {
 const EXPECTED_EXECUTE = {
   si_record_rights_version: ['si_rights_admin'],
   si_record_source_control: ['si_rights_admin'],
+  si_begin_run: ['si_collector'],                      // 0002 step 2 (T1)
   rights_valid_for_publish: ['si_collector'],
   si_source_suspended: ['si_collector'],
   si_retention_terminated: ['si_collector'],
   si_window_end: ['si_collector'],
   si_publish_margin: ['si_collector']
 };
-const EXPECTED_DEFINER = ['si_record_rights_version', 'si_record_source_control'];
+const EXPECTED_DEFINER = ['si_begin_run', 'si_record_rights_version', 'si_record_source_control'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
   trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
   // Amendment C
   si_record_source_control: 'v', si_source_suspended: 's', si_retention_terminated: 's', si_source_suspended_at: 's',
-  trg_source_controls_insert: 'v'
+  trg_source_controls_insert: 'v',
+  // 0002 step 2
+  si_request_lock_namespace: 'i', si_request_lock_key: 'i', si_lock_request_key: 'v', si_run_lease: 'i',
+  si_t1_rights_decision: 's', trg_runs_insert: 'v', si_begin_run: 'v'
 };
 
 let db, c;
@@ -223,7 +227,7 @@ test('SD5: functions created later in schema si start without PUBLIC EXECUTE (de
 
 test('SD7: trigger functions cannot be called directly', async () => {
   for (const fn of ['trg_append_only', 'trg_rights_insert', 'trg_rights_evidence_required', 'trg_sources_retire_final', 'trg_evidence_attribution',
-                    'trg_source_controls_insert']) {
+                    'trg_source_controls_insert', 'trg_runs_insert']) {
     await rejects(assert, asOwner(c.admin, x => x.query(`SELECT si.${fn}()`)), { code: '0A000' });
   }
 });

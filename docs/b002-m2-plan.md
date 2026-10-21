@@ -16,7 +16,7 @@
 | D3 | Receipt monitor stays in 0004 | Approved |
 | D4 | Consistency constraints (§5) | Approved |
 | D5 | T1 foreign-key lock exception, with adversarial tests | Approved |
-| D5b | Revoke advisory-lock EXECUTE from PUBLIC | Conditional: only after the audit in §7. **Not applied yet.** |
+| D5b | Revoke advisory-lock EXECUTE from PUBLIC | Conditional. Step 2: dedicated migrator implemented; hardening script written and tested but **not applied** — founder decision needed (§7). |
 | D6 | T2 failure codes and their order (§3.3) | Approved |
 | D7 | Operational preconditions asserted in tests and deployment checks | Approved |
 | D8 | Verified commit timestamps plus a fail-closed content-read gate | Deferred to 0004 design. **Production-release dependency** (§4). |
@@ -61,7 +61,7 @@ Milestone 2 serves no content. Any later PR that adds a content-reading path for
 
 | Transaction | Order | Cycle analysis |
 | --- | --- | --- |
-| T1 | 1 → (4 if reaping) → 3 (FK KEY SHARE on the INSERT) | **Documented exception (D5).** KEY SHARE conflicts only with FOR UPDATE, and the only FOR UPDATE holders on `sources` (rights-version and control writers) never request rank 1 or rank 4. |
+| T1 `si_begin_run` (step 2) | 1 (advisory) → 3 (`sources` FOR KEY SHARE, taken explicitly first) → 4 (reap the expired attempt; insert) | **No exception any more.** Step 2 takes the source lock before any run lock, so the D5 exception (rank 3 after rank 4) no longer occurs (test LO4). The KEY SHARE also serializes T1 with in-flight rights-version and control writers (FOR UPDATE), so T1 decides under committed rights, and `start_control_seq` is exact. |
 | T2 `si_complete_run` | 3 (FOR SHARE) → 4 (FOR UPDATE) → receipt INSERT (FK, own rows) → COMPLETED UPDATE → COMMIT (deferred check re-locks `sources`, already held) | No inversion |
 | T3, heartbeat, reaper | 4 only | — |
 | Rights / controls (0001) | 3 (FOR UPDATE) | Never touch runs |
@@ -79,8 +79,11 @@ Milestone 2 serves no content. Any later PR that adds a content-reading path for
 - Tables, CHECK constraints, indexes, IA-1 composite foreign keys, and read-only grants.
 - Receipts carry a composite FK `(run_id, source_id, rights_version_id)` → `collection_runs`, so a receipt names exactly its own run's source and version. They also carry the IA-1-equivalent FK to `rights_versions`.
 
-**Step 2:**
+**Step 2 (implemented):**
 - **`si_request_lock_key(source, key)`:** the two-key advisory form, namespace `0x5349`, plus a SHA-256-derived int4. IMMUTABLE.
+- **Advisory locks are taken only as `si_owner`.** `si_lock_request_key` (which refuses NULLs, because the lock function is STRICT) is called inside `si_begin_run` and `trg_runs_insert`. No application role calls an advisory function.
+- **T1 is the SECURITY DEFINER `si_begin_run`** (refinement of §3.2). It applies the whole decision table under the request-key lock, including the row-4 expiry. The collector holds **only EXECUTE on it**: no INSERT or UPDATE on run tables. The rights decision lives in `si_t1_rights_decision` (codes in §3.3 order).
+- **Limitation:** evidence-kind and network-scope checks run only in `si_begin_run`. The request's scope is not stored, so the trigger cannot re-check them on a direct owner INSERT.
 - **`trg_runs_insert`:**
   - refuse unless READ COMMITTED;
   - re-take the advisory lock;
@@ -120,7 +123,10 @@ Milestone 2 serves no content. Any later PR that adds a content-reading path for
 
 ### 3.2 Transactions (all READ COMMITTED)
 
-- **T1:** advisory lock → decision-table rows 1–5 (row 4 may reap) → if suspended, throw `SourceSuspended` (the whole T1 rolls back; no attempt is consumed) → rights decision → INSERT → COMMIT.
+- **T1:** `BEGIN` → `SELECT * FROM si.si_begin_run(source, key, sha256, evidence_kind, networks)` → `COMMIT` (library `t1Preflight`).
+  - Inside: advisory lock → `sources` FOR KEY SHARE → decision-table rows 1–5 (row 4 may reap) → if suspended, throw `SI_SOURCE_SUSPENDED` (the whole T1 rolls back, including the reap; no attempt is consumed) → rights decision → INSERT.
+  - Thrown outcomes map to `T1Refused` codes: `IDEMPOTENCY_KEY_REUSED`, `RUN_IN_PROGRESS`, `ATTEMPT_LIMIT_EXCEEDED`, `SOURCE_SUSPENDED`.
+  - The request hash comes from `src/persistence/request-hash.ts` (canonical JSON; test C7).
 - **T2 (controlled protocol, D2′):**
   - The library sends exactly `BEGIN`, `SELECT si.si_complete_run(...)`, `COMMIT`.
   - A static check forbids `SET CONSTRAINTS` and `PREPARE TRANSACTION` under `src/`.
@@ -194,7 +200,7 @@ A REJECTED `SOURCE_SUSPENDED` row is impossible (Q3).
 | Group | Tests |
 | --- | --- |
 | Lock order | LO1 (adversarial two-session test; mutant LO1-M must deadlock); LO1-ref; LO2; LO3; LO4; **LO4b** (real-object version of Y6: T1 reaping, T2, R); **LO4c** (deliberate advisory cycle gives `40P01` with no partial state); LO5–LO7 |
-| Boundary | **BD1** (catalog allowlist of definer routines × grantees: collector = {`si_complete_run`}; rights admin = {`si_record_rights_version`, `si_record_source_control`}); **BD2** (`trg_runs_transition` not definer; `trg_runs_publish_check` contains no DML); **BD3** (hostile `search_path`); **BD4** (rights and control routines leave runs untouched); **BD5** (`SET ROLE si_owner` refused; `si_owner` has no members) |
+| Boundary | **BD1** (catalog allowlist of definer routines × grantees: collector = {`si_begin_run`, `si_complete_run`}; rights admin = {`si_record_rights_version`, `si_record_source_control`}); **BD2** (`trg_runs_transition` not definer; `trg_runs_publish_check` contains no DML); **BD3** (hostile `search_path`); **BD4** (rights and control routines leave runs untouched); **BD5** (`SET ROLE si_owner` refused for application roles; the only member of `si_owner` is `si_migrator`, with SET and without INHERIT or ADMIN) |
 | Protocol | **CR-IMM** (`SET CONSTRAINTS ALL IMMEDIATE`, then a SUSPEND attempted before COMMIT waits until T2 ends; COMPLETED, and `publish_control_seq < suspend.control_seq`: G1 without deferral); **PB1** (library sends exactly BEGIN / function / COMMIT); **PB2** (static: no `SET CONSTRAINTS` or `PREPARE TRANSACTION` in `src/`); **PB3** (forensic: IMMEDIATE plus a pause records `commit_ts − rights_checked_at`; documents G3); **PB4** (receipt queued before the publication check) |
 | Frozen and amendment tests | C1–C10, L1/L2/L4/L6–L8, LS1/LS2, IA1/IA1b/IA1c (behavioural), A2–A7/A10/A11, E1/E3/E6/E7, CR1–CR7, CR4b, CK-R, LI-R, EC1–EC5, I4′ teardown, H2 forensic |
 
@@ -230,7 +236,28 @@ The previous plan's mutants (control interval, rights at publication, idempotenc
 4. **Dump/restore.** Expected to preserve ACL changes on system functions via `pg_init_privs` comparison. **Not yet verified here**; this belongs in the D5b test.
 5. **Scope of benefit.** D5b removes the deliberate-cycle path for `si_rights_admin`, `si_retention` and `si_monitor`. The collector keeps exactly the two-key transaction form, and it cannot hold `sources` FOR UPDATE, so it cannot form the cycle.
 
-**Proposal:** apply D5b in Step 2, together with T1's grant, as a `bootstrap/database.sql` change.
+**Step 2 results** (`tests/db/migrator.test.mjs`, MG0–MG8):
+
+- **Dedicated migrator `si_migrator` (implemented in bootstrap):**
+  - LOGIN; NOSUPERUSER, NOCREATEROLE, NOCREATEDB, NOREPLICATION, NOBYPASSRLS, NOINHERIT; `lock_timeout = 30s`.
+  - Its only membership is `si_owner`, `WITH INHERIT FALSE, SET TRUE, ADMIN FALSE`.
+  - Database CONNECT, USAGE on `si`, SELECT on `si.schema_migrations`.
+  - Verified: it applies, reports and rolls back 0001 and 0002, with a catalog identical to an administrator-migrated database (MG2). It cannot bootstrap, create roles or grant `si_owner` onward (MG3). Outside `SET ROLE` it has no data access and no application paths (MG4). It takes the migration lock as itself (MG5).
+  - Bootstrap remains an administrator task.
+- **Hardening script `db/bootstrap/optional/advisory-lock-hardening.sql`** (written and tested; **not run by bootstrap**):
+  - Revokes all 21 functions from PUBLIC and grants `pg_advisory_xact_lock(bigint)` to `si_migrator` and `pg_advisory_xact_lock(integer, integer)` to `si_owner`; then verifies.
+  - Applied by the `pg_catalog` owner: migrations and T1 still work, and every other role gets `42501` on all 21 functions (MG6).
+- **Compatibility findings requiring a founder decision:**
+  1. **A non-owner administrator cannot apply it, and PostgreSQL does not fail.** `REVOKE` on a `pg_catalog` function by a non-owner only warns ("no privileges could be revoked") and reports success. On managed hosts where the administrator does not own `pg_catalog`, D5b would silently do nothing. The script therefore verifies and raises `SI_HARDENING_INCOMPLETE` (MG7).
+  2. **Per database.** Clones of a hardened database keep it; databases created from `template0` do not. `pg_dump --schema-only` records the REVOKE/GRANT (MG8, PostgreSQL 16.15 client).
+- **Options:**
+  - (a) Run the hardening script from `bootstrapDatabase`, failing bootstrap where it cannot apply (blocks deployment on such hosts).
+  - (b) Run it where possible and record the result in the deployment preflight.
+  - (c) Leave it optional.
+
+  Today no application role needs advisory functions, so the residual risk without D5b is only the deliberate-deadlock path (detected, `40P01`).
+
+**Original proposal** (superseded by the step 2 results above): apply D5b in Step 2, together with T1's grant, as a `bootstrap/database.sql` change.
 - REVOKE all 21 from PUBLIC.
 - GRANT `pg_advisory_xact_lock(integer, integer)` to `si_collector`.
 - Migrator: a founder decision (keep a superuser migrator, or create one and grant it `pg_advisory_xact_lock(bigint)`).
@@ -239,7 +266,7 @@ The previous plan's mutants (control interval, rights at publication, idempotenc
 ## 8. Implementation sequence (branch `claude/b002-m2-runs`)
 
 1. **Done:** schema, CHECKs, IA-1 FKs, down migration, privilege, fingerprint and precondition tests, and the `cli.js preflight` deployment check.
-2. `si_request_lock_key`, `trg_runs_insert`, the T1 path; D5b if approved with the migrator decision; C tests, LO4/LO4b/LO4c, EC5.
+2. **Done:** `si_request_lock_key`, `trg_runs_insert`, `si_begin_run` (T1, including the row-4 expiry), library `t1Preflight`, request hash, `si_migrator`, and the hardening script (not applied). Tests: T1-1 to T1-6, C5/C6, C7, C8–C10, EC5, DS1–DS7, CC-R, CC-C, LO4 (revised), LK, LI-T1, MG0–MG8.
 3. `trg_runs_transition` (INVOKER), heartbeat, T3, reaper, `run_errors` checks; L, LS, EC3 and BD2 tests.
 4. `si_complete_run`, `trg_runs_publish_check`, receipt checks, the library T2 protocol and the PB2 static check; A, E, CR, CR-IMM, LO, BD and PB tests; I4′.
 5. Parity extension, all mutation sets, docs.

@@ -113,7 +113,7 @@ async function beginLocked(client: ClientBase): Promise<void> {
       applied_at  timestamptz NOT NULL DEFAULT clock_timestamp()
     )`);
   await client.query('REVOKE ALL ON si.schema_migrations FROM PUBLIC');
-  await client.query('GRANT SELECT ON si.schema_migrations TO si_collector, si_rights_admin, si_retention, si_monitor');
+  await client.query('GRANT SELECT ON si.schema_migrations TO si_collector, si_rights_admin, si_retention, si_monitor, si_migrator');
 }
 
 async function readApplied(client: ClientBase): Promise<AppliedMigration[]> {

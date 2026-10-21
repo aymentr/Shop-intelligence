@@ -187,6 +187,22 @@ through source controls, which are outside the version sequence (test `C2`). Rem
 liveness limit: after a termination, a new authorization cannot take effect before a version
 that was scheduled earlier.
 
+## Milestone 2, step 2 — T1 preflight and the migrator (in progress)
+
+- **T1** is `si.si_begin_run(source, key, request_sha256, evidence_kind, networks)`, SECURITY DEFINER, executable by `si_collector` only. Library: `t1Preflight` in `src/persistence/runs.ts`.
+  - It takes the request-key advisory lock (two-int form, namespace 21321) and then `sources` FOR KEY SHARE.
+  - It applies the 2.1 decision table: different hash, ALREADY_COMPLETED, live attempt, expired attempt, 20-attempt cap.
+  - It throws while the source is suspended (no row).
+  - Otherwise it inserts REJECTED (with a code) or RUNNING under the current rights.
+- **`trg_runs_insert`** enforces the same per-key rules on every insert (owner included) and computes:
+  - `start_control_seq`;
+  - the lease;
+  - the conflict-policy snapshot;
+  - timestamps and counts.
+- **No application role can INSERT or UPDATE run tables directly.**
+- **Migrations** are run by the dedicated non-superuser `si_migrator`: `SI_DATABASE_URL` as `si_migrator` for `up`, `down` and `status`. `bootstrap` needs an administrator. Every bootstrap run also revokes any other membership in `si_owner` (any member, any grantor, with CASCADE), so a stray grant such as an application role's cannot survive a bootstrap (test MG1b).
+- **`db/bootstrap/optional/advisory-lock-hardening.sql`** (D5b) is **not** applied by bootstrap; see `docs/b002-m2-plan.md` §7.
+
 ## Milestone 2, step 1 — migration 0002 schema (in progress)
 
 Plan: `docs/b002-m2-plan.md` (authoritative, revision 2). Step 1 adds only the tables

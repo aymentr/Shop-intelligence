@@ -1,8 +1,9 @@
 // Migration 0002, step 1: schema, CHECK constraints, IA-1 composite foreign keys, uniqueness.
-// Step 1 has no write path for application roles and no triggers yet, so fixture rows are
-// written as si_owner. Each negative case starts from a valid row and changes one thing.
-// The lifecycle rules that need triggers (transitions, computed fields, receipts only for
-// COMPLETED runs, errors only for FAILED runs) are steps 2-4 and are NOT asserted here.
+// These are pure constraint tests: fixture rows are written as si_owner with the step-2
+// insert trigger disabled inside the same transaction, so every case exercises the CHECKs
+// and foreign keys alone. Each negative case starts from a valid row and changes one thing.
+// Trigger behaviour (T1, computed fields) is tested in t1.test.mjs; transitions, receipts
+// only for COMPLETED runs and errors only for FAILED runs are steps 3-4.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
@@ -47,9 +48,14 @@ function row(shape, o = {}) {
 }
 async function insertRun(r) {
   const cols = Object.keys(r);
-  return asOwner(c.admin, x => x.query(
-    `INSERT INTO si.collection_runs (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING run_id`,
-    cols.map(k => r[k]))).then(res => res.rows[0].run_id);
+  return asOwner(c.admin, async x => {
+    await x.query('ALTER TABLE si.collection_runs DISABLE TRIGGER trg_runs_insert');
+    const res = await x.query(
+      `INSERT INTO si.collection_runs (${cols.join(', ')}) VALUES (${cols.map((_, i) => `$${i + 1}`).join(', ')}) RETURNING run_id`,
+      cols.map(k => r[k]));
+    await x.query('ALTER TABLE si.collection_runs ENABLE TRIGGER trg_runs_insert');
+    return res;
+  }).then(res => res.rows[0].run_id);
 }
 async function insertAs(table, r) {
   const cols = Object.keys(r);
@@ -204,12 +210,11 @@ test('S10: run_errors hold codes, indices and field names only', async () => {
   assert.deepEqual(cols, ['run_id', 'seq', 'code', 'row_index', 'field', 'correlation_id'], 'no free-text column exists');
 });
 
-test('step-1 scope: 0002 adds no functions and no user triggers yet', async () => {
+test('step-2 scope: no step-3/4 objects exist yet; the only user trigger is trg_runs_insert', async () => {
   const fns = (await c.admin.query(`SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'si'::regnamespace
-                                      AND proname IN ('si_request_lock_key','si_complete_run','trg_runs_insert','trg_runs_transition',
-                                                      'trg_runs_publish_check','trg_runs_no_delete')`)).rows[0].n;
+                                      AND proname IN ('si_complete_run','trg_runs_transition','trg_runs_publish_check','trg_runs_no_delete')`)).rows[0].n;
   assert.equal(fns, 0);
-  const trg = (await c.admin.query(`SELECT count(*)::int AS n FROM pg_trigger WHERE NOT tgisinternal
-                                      AND tgrelid IN ('si.collection_runs'::regclass, 'si.publication_receipts'::regclass, 'si.run_errors'::regclass)`)).rows[0].n;
-  assert.equal(trg, 0);
+  const trg = (await c.admin.query(`SELECT array_agg(tgname::text) AS t FROM pg_trigger WHERE NOT tgisinternal
+                                      AND tgrelid IN ('si.collection_runs'::regclass, 'si.publication_receipts'::regclass, 'si.run_errors'::regclass)`)).rows[0].t;
+  assert.deepEqual(trg, ['trg_runs_insert']);
 });
