@@ -46,3 +46,42 @@ export async function assertOperationalPreconditions(client: ClientBase): Promis
     throw new Error(`PRECONDITIONS_FAILED: ${failed.map(p => `${p.name}=${p.actual} (expected ${p.expected})`).join('; ')}`);
   }
 }
+
+/**
+ * D5b production gate: PUBLIC and application-role effective privileges must be
+ * absent for every advisory-lock overload. A managed service unable to revoke
+ * these privileges cannot pass this gate.
+ */
+export async function checkProductionAdvisoryPermissions(client: ClientBase): Promise<PreconditionResult[]> {
+  const r = await client.query<{ public_count: string; application_count: string; owner_lock: boolean; migrator_lock: boolean }>(`
+    WITH funcs AS (
+      SELECT oid, proname FROM pg_catalog.pg_proc
+      WHERE pronamespace = 'pg_catalog'::regnamespace
+        AND proname ~ '^pg_(try_)?advisory'
+    ),
+    roles AS (
+      SELECT oid FROM pg_catalog.pg_roles
+      WHERE rolname IN ('si_collector', 'si_rights_admin', 'si_retention', 'si_monitor')
+    )
+    SELECT
+      (SELECT count(*)::text FROM funcs f
+       WHERE EXISTS (
+         SELECT 1 FROM pg_catalog.aclexplode(
+           coalesce((SELECT proacl FROM pg_catalog.pg_proc WHERE oid=f.oid),
+                    pg_catalog.acldefault('f', (SELECT proowner FROM pg_catalog.pg_proc WHERE oid=f.oid)))
+         ) a WHERE a.grantee=0 AND a.privilege_type='EXECUTE'
+       )) AS public_count,
+      (SELECT count(*)::text FROM funcs f CROSS JOIN roles r
+       WHERE pg_catalog.has_function_privilege(r.oid, f.oid, 'EXECUTE')) AS application_count,
+      pg_catalog.has_function_privilege('si_owner', 'pg_catalog.pg_advisory_xact_lock(integer,integer)', 'EXECUTE') AS owner_lock,
+      pg_catalog.has_function_privilege('si_migrator', 'pg_catalog.pg_advisory_xact_lock(bigint)', 'EXECUTE') AS migrator_lock
+  `);
+  const s = r.rows[0];
+  if (!s) throw new Error('D5B_PREFLIGHT_FAILED: no privilege results');
+  return [
+    { name: 'advisory_public_exposures', ok: s.public_count === '0', actual: s.public_count, expected: '0' },
+    { name: 'advisory_application_exposures', ok: s.application_count === '0', actual: s.application_count, expected: '0' },
+    { name: 'advisory_owner_lock', ok: s.owner_lock, actual: String(s.owner_lock), expected: 'true' },
+    { name: 'advisory_migrator_lock', ok: s.migrator_lock, actual: String(s.migrator_lock), expected: 'true' }
+  ];
+}
