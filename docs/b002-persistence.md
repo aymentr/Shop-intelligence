@@ -260,3 +260,26 @@ durable commit.
 - The server clock is trusted (NTP with slewing is an operational requirement).
 - Nothing here collects, reads or deletes ad content yet; those paths and their guarantees
   arrive in Milestones 2–4.
+
+## D5b production advisory-lock hardening (operator-controlled)
+
+Founder decision: separate privileged operator operation, not part of routine bootstrap.
+After database bootstrap and before any production deployment, an operator with
+ownership privileges over the PostgreSQL built-in advisory-lock functions must
+apply `db/bootstrap/optional/advisory-lock-hardening.sql` **to each database**.
+The script runs in a transaction and rejects residual PUBLIC or effective
+application-role access; failure rolls back its changes. It preserves the
+migrator's bigint transaction lock and the owner's two-integer transaction lock.
+
+Then run `node dist/persistence/cli.js preflight --production` using
+`SI_DATABASE_URL`. Unlike ordinary development `preflight`, this requires
+zero PUBLIC and application-role advisory-lock exposures and verifies both
+required privileged lock capabilities. A nonzero exit blocks production
+deployment. Re-run after database creation, restore or privilege changes.
+Managed services unable to perform the operator step are **not approved**
+for production under this design.
+
+This check is not a substitute for validating cluster-level role membership,
+backup/restore behavior, the D8 commit-time read gate, or independent security
+review. No production content-serving release is authorized before D8 is
+resolved and independently tested.
