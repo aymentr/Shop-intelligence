@@ -27,7 +27,7 @@ FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(bigint) TO si_migrator;
 GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_xact_lock(integer, integer) TO si_owner;
 
-DO $
+DO $$
 DECLARE still text;
 DECLARE exposed text;
 BEGIN
