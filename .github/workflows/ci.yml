@@ -26,3 +26,25 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run demo
+
+  integration:
+    # PostgreSQL 16 integration tests against the same compose.yaml developers use.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start PostgreSQL 16 (localhost only)
+        run: docker compose up -d --wait db
+      - run: npm ci
+      - name: Bootstrap, migrate template, run integration tests
+        run: npm run test:db
+      - name: Database logs on failure
+        if: failure()
+        run: docker compose logs db
+      - name: Stop database
+        if: always()
+        run: docker compose down -v

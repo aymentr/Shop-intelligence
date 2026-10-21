@@ -66,6 +66,16 @@ test('allowed offline source files continue to pass', t => {
   assert.deepEqual(unscanned, []);
 });
 
+test('the PostgreSQL driver is confined to persistence/', t => {
+  const root = tempTree(t);
+  put(root, 'persistence/db.ts', "import pg from 'pg';\nexport const P = pg;\n");
+  put(root, 'adapters/sneaky.ts', "import pg from 'pg';\nexport const P = pg;\n");
+  put(root, 'ingest.ts', "export const load = () => import('pg');\n");
+  put(root, 'nested/persistence/fake.ts', "const pg = require('pg');\n");
+  const files = scanForNetworkCode(root).violations.map(v => v.file).sort();
+  assert.deepEqual(files, ['adapters/sneaky.ts', 'ingest.ts', 'nested/persistence/fake.ts']);
+});
+
 test('symbolic links are reported, never silently skipped', t => {
   const root = tempTree(t);
   put(root, 'a.ts', "export const a = 1;\n");
