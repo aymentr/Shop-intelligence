@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { assertOperationalPreconditions, checkOperationalPreconditions } from '../../dist/persistence/preconditions.js';
+import { assertOperationalPreconditions, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from '../../dist/persistence/preconditions.js';
 import { cfg, connect, freshDatabase } from './helpers.mjs';
 
 const cleanups = [];
@@ -42,4 +42,24 @@ test('D7: `cli.js preflight` is the deployment check (exit 0 here)', () => {
   const r = spawnSync(process.execPath, [cli, 'preflight'], { encoding: 'utf8', env: { ...process.env, SI_DATABASE_URL: url } });
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.equal((r.stdout.match(/^ok /gm) ?? []).length, 5, r.stdout);
+});
+
+test('D5b: production gate fails closed on PUBLIC and effective application grants', async () => {
+  const fake = { query: async () => ({ rows: [{
+    public_count: '21', application_count: '3', owner_lock: true, migrator_lock: true
+  }] }) };
+  const results = await checkProductionAdvisoryPermissions(fake);
+  assert.deepEqual(results.map(r => r.ok), [false, false, true, true]);
+  assert.deepEqual(results.map(r => r.name), [
+    'advisory_public_exposures', 'advisory_application_exposures',
+    'advisory_owner_lock', 'advisory_migrator_lock'
+  ]);
+});
+
+test('D5b: production gate requires both privileged lock capabilities', async () => {
+  const fake = { query: async () => ({ rows: [{
+    public_count: '0', application_count: '0', owner_lock: false, migrator_lock: false
+  }] }) };
+  const results = await checkProductionAdvisoryPermissions(fake);
+  assert.deepEqual(results.map(r => r.ok), [true, true, false, false]);
 });
