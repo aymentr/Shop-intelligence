@@ -87,11 +87,12 @@ test('CP3: computed fields are overwritten on direct owner INSERT; the write fun
   await recordRights(c.si_rights_admin, 'cp3');
   await recordRights(c.si_rights_admin, 'cp3', { effective_from_sql: `clock_timestamp() + interval '1 hour'` });   // pending
   await asOwner(c.admin, x => x.query(
-    `INSERT INTO si.source_controls (source_id, control_seq, kind, through_version, reason, occurred_at, recorded_by)
-     VALUES ('cp3', 99, 'TERMINATE_RETENTION', 99, 'forged', '2000-01-01', 'someone-else')`));
-  const r = await one(c.admin, `SELECT control_seq, through_version, recorded_by, occurred_at > now() - interval '1 minute' AS fresh
+    `INSERT INTO si.source_controls (source_id, control_seq, kind, through_version, reason, occurred_at, wall_clock_at, recorded_by)
+     VALUES ('cp3', 99, 'TERMINATE_RETENTION', 99, 'forged', '2000-01-01', '1999-01-01', 'someone-else')`));
+  const r = await one(c.admin, `SELECT control_seq, through_version, recorded_by, occurred_at > now() - interval '1 minute' AS fresh,
+                                       occurred_at = wall_clock_at AS same_clock
                                 FROM si.source_controls WHERE source_id = 'cp3'`);
-  assert.deepEqual(r, { control_seq: 1, through_version: 2, recorded_by: 'si_bootstrap', fresh: true },
+  assert.deepEqual(r, { control_seq: 1, through_version: 2, recorded_by: 'si_bootstrap', fresh: true, same_clock: true },
     'seq, through_version (pending version included), attribution and time come from the database');
   const args = (await one(c.admin, `SELECT pg_get_function_arguments('si.si_record_source_control(text,text,text,text,int,int,int,int)'::regprocedure) AS a`)).a;
   assert.doesNotMatch(args, /timestamp|interval|date/, 'immediate-only by construction');
@@ -522,22 +523,22 @@ test('LI1: controls refuse REPEATABLE READ and SERIALIZABLE (function and direct
 
 // Simulates rows recorded just before a backward clock step: occurred_at lies in the future.
 // Superuser-only, inside one transaction, in a disposable test database.
-async function insertSkewed(src, rows) {
+async function insertSkewed(src, rows, skew = '1 hour') {
   await c.admin.query('BEGIN');
   try {
     await c.admin.query('ALTER TABLE si.source_controls DISABLE TRIGGER trg_source_controls_insert');
     for (const r of rows) {
       await c.admin.query(`INSERT INTO si.source_controls (source_id, control_seq, kind, through_version, reason, occurred_at,
                              expected_max_version, expected_control_seq, ack_termination_seq, authorization_version)
-                           VALUES ($1, $2, $3, $4, 'clock-skew simulation', clock_timestamp() + interval '1 hour', $5, $6, $7, $8)`,
-        [src, r.seq, r.kind, r.through ?? null, r.emv ?? null, r.ecs ?? null, r.ack ?? null, r.auth ?? null]);
+                           VALUES ($1, $2, $3, $4, 'clock-skew simulation', clock_timestamp() + $9::interval, $5, $6, $7, $8)`,
+        [src, r.seq, r.kind, r.through ?? null, r.emv ?? null, r.ecs ?? null, r.ack ?? null, r.auth ?? null, skew]);
     }
     await c.admin.query('ALTER TABLE si.source_controls ENABLE TRIGGER trg_source_controls_insert');
     await c.admin.query('COMMIT');
   } catch (e) { await c.admin.query('ROLLBACK'); throw e; }
 }
 
-test('CK1: enforcement ignores occurred_at — controls stamped in the future still deny now; the clock guard fires', async () => {
+test('CK1: enforcement ignores occurred_at; after a backward clock step restrictions are still recorded (monotonic audit time), LIFT is refused', async () => {
   await createSources(c.admin, ['ck1', 'ck1b']);
   const ra = c.si_rights_admin;
   await recordRights(ra, 'ck1');
@@ -546,7 +547,18 @@ test('CK1: enforcement ignores occurred_at — controls stamped in the future st
   assert.equal(await valid('ck1', 1), false);
   assert.equal((await one(c.admin, `SELECT si.si_source_suspended_at('ck1', clock_timestamp()) AS s`)).s, false,
     'the audit view (by occurred_at) disagrees: that is a reporting discrepancy, not an enforcement input');
-  await rejects(assert, control(ra, 'ck1', 'SUSPEND'), { code: CHECK, message: /SI_CLOCK_REGRESSION/ });
+  // H1: an emergency restriction must not fail because the clock moved backward.
+  for (const kind of ['SUSPEND', 'TERMINATE_RETENTION']) {
+    const r = await control(ra, 'ck1', kind);
+    const a = await one(c.admin, `SELECT occurred_at = (SELECT occurred_at FROM si.source_controls WHERE source_id = 'ck1' AND control_seq = 1) AS clamped,
+                                         wall_clock_at < occurred_at AS wall_behind, wall_clock_at <= clock_timestamp() AS wall_real
+                                  FROM si.source_controls WHERE control_event_id = $1`, [r.control_event_id]);
+    assert.deepEqual(a, { clamped: true, wall_behind: true, wall_real: true },
+      `${kind}: recorded audit time is held at the previous event's; the real clock reading is kept in wall_clock_at`);
+  }
+  assert.equal(await terminated('ck1', 1), true, 'the termination recorded during the regression is enforced');
+  await rejects(assert, lift(ra, 'ck1', { ackTerminationSeq: 3, authorizationVersion: 1 }), { code: CHECK, message: /SI_CLOCK_REGRESSION/ });
+  assert.deepEqual(await kinds('ck1'), ['SUSPEND', 'SUSPEND', 'TERMINATE_RETENTION'], 'LIFT fail-closed: nothing recorded');
 
   // Termination stamped in the future, then a (skewed) LIFT: the covered version stays denied
   // even though its window end (reporting) lies an hour ahead.
@@ -626,4 +638,51 @@ test('IT1: a lock holder terminated by idle_in_transaction_session_timeout is de
   assert.deepEqual(await kinds('it1'), ['SUSPEND', 'LIFT'], "the terminated holder's SUSPEND never committed");
   const s = await settle(h.query('SELECT 1'));
   assert.equal(s.status, 'terminated');
+});
+
+test('CK4: clock regression cannot weaken termination, LIFT authorization or rights-version ordering; LIFT resumes when the clock catches up', async () => {
+  await createSources(c.admin, ['ck4']);
+  const ra = c.si_rights_admin;
+  await recordRights(ra, 'ck4');                                                       // v1
+  // A termination recorded just before the clock stepped back by ~3 s.
+  await insertSkewed('ck4', [{ seq: 1, kind: 'TERMINATE_RETENTION', through: 1 }], '3 seconds');
+  const end1 = await retEnd('ck4', 1);
+  // Emergency SUSPEND during the regression succeeds (H1).
+  const s2 = await control(ra, 'ck4', 'SUSPEND');
+  assert.equal(await occ('ck4', 2), await occ('ck4', 1), 'audit time held monotonic');
+  // Rights-version ordering is unaffected: versions keep their own clock and ordering rule.
+  await recordRights(ra, 'ck4', { effective_from_sql: `clock_timestamp() + interval '1 hour'` });   // v2, scheduled
+  await expectOrderRejection(assert, ra, 'ck4', { effective_from_sql: `clock_timestamp() + interval '30 minutes'` });   // NEG
+  // While the clock is behind, every LIFT is refused, even a fully authorized one.
+  await rejects(assert, lift(ra, 'ck4', { ackTerminationSeq: 1, authorizationVersion: 2 }), { code: CHECK, message: /SI_CLOCK_REGRESSION/ });
+  assert.equal(await terminated('ck4', 1), true);
+  assert.equal(await valid('ck4', 1), false);
+  const at2 = `${effOf('ck4', 2)} + interval '1 second'`;
+  assert.equal(await valid('ck4', 2, at2), false, 'still suspended');
+  await waitDb(`clock_timestamp() > (SELECT max(occurred_at) FROM si.source_controls WHERE source_id = 'ck4')`);
+  // Once caught up, the normal LIFT rules apply unchanged.
+  await rejects(assert, lift(ra, 'ck4', { ackTerminationSeq: s2.control_seq, authorizationVersion: 2 }), { code: CHECK, message: /SI_TERMINATION_ACK_REQUIRED/ });
+  await rejects(assert, lift(ra, 'ck4', { ackTerminationSeq: 1, authorizationVersion: 1 }), { code: CHECK, message: /SI_AUTHORIZATION_REQUIRED/ });
+  const l = await lift(ra, 'ck4', { ackTerminationSeq: 1, authorizationVersion: 2 });
+  assert.equal(l.control_seq, 3);
+  assert.equal((await one(c.admin, `SELECT occurred_at = wall_clock_at AS eq FROM si.source_controls WHERE control_event_id = $1`, [l.control_event_id])).eq, true);
+  assert.equal(await valid('ck4', 2, at2), true);
+  assert.equal(await valid('ck4', 1), false, 'covered version stays terminated');
+  assert.equal(await retEnd('ck4', 1), end1, 'retention end of covered data unchanged');
+});
+
+test('CK5: during a clock regression, restrictions still take the source-row lock and see committed versions', async t => {
+  const { b, pa, pb } = await extraAdmin(t), a = c.si_rights_admin;
+  await createSources(c.admin, ['ck5']);
+  await recordRights(a, 'ck5');
+  await insertSkewed('ck5', [{ seq: 1, kind: 'SUSPEND' }]);                              // clock now behind the last event
+  await a.query('BEGIN');
+  await recordRights(a, 'ck5');                                                         // v2, holds sources FOR UPDATE
+  const p = waiter(control(b, 'ck5', 'TERMINATE_RETENTION'));
+  await waitUntilBlocked(c.admin, pb, pa);
+  await holderCommit(assert, a, pa);
+  const term = await expectWaiterOk(assert, p);
+  assert.equal(term.through_version, 2, 'the clamped restriction still serialized after, and saw, the committed version');
+  assert.equal(term.control_seq, 2);
+  assert.equal(await terminated('ck5', 2), true);
 });

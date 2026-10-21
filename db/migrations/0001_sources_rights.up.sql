@@ -190,7 +190,8 @@ CREATE TABLE si.source_controls (
   through_version       int  CHECK (through_version >= 0),                 -- TERMINATE only; computed
   reason                text NOT NULL CHECK (length(btrim(reason)) BETWEEN 1 AND 2000),
   reference             text CHECK (length(reference) BETWEEN 1 AND 500),  -- incident/ticket id
-  occurred_at           timestamptz NOT NULL DEFAULT clock_timestamp(),    -- overwritten by the trigger
+  occurred_at           timestamptz NOT NULL DEFAULT clock_timestamp(),    -- recorded audit time: monotonic per source; set by the trigger
+  wall_clock_at         timestamptz NOT NULL DEFAULT clock_timestamp(),    -- actual server clock when recorded; set by the trigger
   recorded_by           text NOT NULL DEFAULT session_user,                -- overwritten by the trigger
   expected_max_version  int,                                               -- LIFT compare-and-set (C-rev1 R1)
   expected_control_seq  int,
@@ -202,7 +203,8 @@ CREATE TABLE si.source_controls (
   CHECK (kind <> 'LIFT' OR (expected_max_version IS NOT NULL AND expected_control_seq IS NOT NULL)),
   CHECK (kind = 'LIFT' OR (expected_max_version IS NULL AND expected_control_seq IS NULL)),
   CHECK (kind = 'LIFT' OR (ack_termination_seq IS NULL AND authorization_version IS NULL)),
-  CHECK ((ack_termination_seq IS NULL) = (authorization_version IS NULL))
+  CHECK ((ack_termination_seq IS NULL) = (authorization_version IS NULL)),
+  CHECK (occurred_at >= wall_clock_at)                                     -- differs only after a backward clock step
 );
 
 -- Applies to every inserter, including the owner (RQ3). Lock first; every dependent read is
@@ -237,14 +239,19 @@ BEGIN
   SELECT coalesce(max(v.version), 0) INTO max_version FROM si.rights_versions v WHERE v.source_id = NEW.source_id;
   SELECT s.retired_at INTO retired FROM si.sources s WHERE s.source_id = NEW.source_id;
   now_ts := clock_timestamp();                          -- read AFTER acquiring the source lock
-  IF prev_at IS NOT NULL AND now_ts < prev_at THEN
-    RAISE EXCEPTION 'SI_CLOCK_REGRESSION: clock % is before the previous control event of % (%)', now_ts, NEW.source_id, prev_at
-      USING ERRCODE = 'check_violation';
+  -- Final-review H1: enforcement never reads occurred_at, so a backward clock step must not
+  -- block an emergency restriction. SUSPEND / TERMINATE_RETENTION record a monotonic audit
+  -- time (never earlier than the previous event's) and keep the real reading in
+  -- wall_clock_at. LIFT, which relaxes, stays fail-closed until the clock catches up.
+  IF prev_at IS NOT NULL AND now_ts < prev_at AND NEW.kind = 'LIFT' THEN
+    RAISE EXCEPTION 'SI_CLOCK_REGRESSION: clock % is before the previous control event of % (%); LIFT refused until the clock catches up',
+      now_ts, NEW.source_id, prev_at USING ERRCODE = 'check_violation';
   END IF;
 
   -- Computed fields: never taken from the caller.
   NEW.control_seq := coalesce(prev_seq, 0) + 1;
-  NEW.occurred_at := now_ts;
+  NEW.wall_clock_at := now_ts;
+  NEW.occurred_at := greatest(now_ts, prev_at);         -- greatest() ignores NULL (first event)
   NEW.recorded_by := session_user;
   NEW.through_version := CASE WHEN NEW.kind = 'TERMINATE_RETENTION' THEN max_version END;
 

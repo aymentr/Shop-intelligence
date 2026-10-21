@@ -69,7 +69,7 @@ user. Bootstrap is idempotent: running it twice changes nothing (test M5).
 | LIFT after a termination needs acknowledgement + a valid new authorization | `SI_TERMINATION_ACK_REQUIRED`, `SI_AUTHORIZATION_REQUIRED` | C6, LR1, LR2, LC2 |
 | Termination is irreversible for covered versions (pending ones included) | `through_version = max(version)`; `si_retention_end` and `si_window_end` gain an unconditional termination term | C4, LR2, CC3′, parity |
 | Controls only under READ COMMITTED | `SI_ISOLATION` in the function and the trigger | LI1 |
-| Clock stepping backwards cannot reorder controls | `SI_CLOCK_REGRESSION` | CK1 |
+| A backward clock step never blocks a restriction and never relaxes anything | SUSPEND / TERMINATE_RETENTION record `occurred_at = greatest(clock, previous occurred_at)` and the real reading in `wall_clock_at`; LIFT is refused (`SI_CLOCK_REGRESSION`) until the clock catches up | CK1, CK4, CK5 |
 
 ### Functions
 
@@ -113,8 +113,16 @@ at `T.occurred_at`; no version or LIFT can change that.
 
 **Timing semantics.** Enforcement uses the latest *committed* control state, never
 timestamps. A control takes effect for every statement whose snapshot starts after it
-commits. `occurred_at` is the clock reading taken after the source-row lock — the stored
-decision instant, for audit only. A statement whose snapshot is older (for example a
+commits. Each control row stores two times, both taken after the source-row lock and
+neither used for enforcement:
+
+| Column | Meaning |
+| --- | --- |
+| `wall_clock_at` | the actual server clock reading when the row was recorded |
+| `occurred_at` | the recorded audit time: equal to `wall_clock_at`, except after a backward clock step, when a restriction is stamped with the previous event's `occurred_at` so audit times never decrease per source |
+
+`occurred_at > wall_clock_at` therefore marks a row recorded while the clock was behind.
+Ordering is always `control_seq` (lock order); timestamps are evidence, not order. A statement whose snapshot is older (for example a
 long REPEATABLE READ reader) keeps the old answer until it ends (test CK2). Durable commit
 timestamps are not relied on anywhere.
 
@@ -193,10 +201,11 @@ that was scheduled earlier.
   `SET idle_in_transaction_session_timeout = 0`, so it bounds well-behaved callers only.
   Concurrency tests verify that every lock holder really committed on a live backend
   (`holderCommit`), so a terminated holder can never pass for a serialized one (test IT1).
-- `SI_CLOCK_REGRESSION` refuses **every** control, including an emergency SUSPEND or
-  TERMINATE_RETENTION, while the server clock is behind the source's last control
-  `occurred_at` (test CK1). Enforcement does not use `occurred_at`; the guard only keeps the
-  audit timestamps monotonic. Raised for a founder decision in the final review.
+- After a backward clock step, restrictions are recorded at once (final-review H1) but
+  their `occurred_at` is held at the previous event's, so it overstates when they were
+  recorded; `wall_clock_at` keeps the real reading. LIFT stays refused until the clock
+  passes the source's latest `occurred_at`, which can delay re-enabling by the size of
+  the step (tests CK1, CK4).
 - A single transaction may record TERMINATE_RETENTION, a new authorization and an
   acknowledged LIFT together; other sessions then never observe the suspension. Covered data
   stays terminated. The 0004 cleanup gate will prevent this (cleanup cannot complete first).
