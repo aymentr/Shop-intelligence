@@ -15,7 +15,7 @@
 import pg from 'pg';
 import { bootstrapCluster, bootstrapDatabase, LOGIN_ROLES, type LoginRole } from './bootstrap.js';
 import { migrateDown, migrateUp, migrationStatus } from './migrate.js';
-import { checkOperationalPreconditions } from './preconditions.js';
+import { checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -52,10 +52,11 @@ async function main(): Promise<void> {
       console.log(JSON.stringify({ applied: s.applied.map(a => a.version), pending: s.pending, problem: s.problem }));
     } else if (command === 'preflight') {
       const results = await checkOperationalPreconditions(client);
+      if (process.argv.includes('--production')) results.push(...await checkProductionAdvisoryPermissions(client));
       for (const p of results) console.log(`${p.ok ? 'ok  ' : 'FAIL'} ${p.name}: ${p.actual} (expected ${p.expected})`);
       if (results.some(p => !p.ok)) process.exitCode = 1;
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight [--production]');
     }
   } finally {
     await client.end();
