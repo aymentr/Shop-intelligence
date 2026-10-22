@@ -240,3 +240,35 @@ test('MG9 (D5b restore): hardened PostgreSQL dump restores effective privileges 
     assert.equal((await restored.query('SELECT count(*)::int AS n FROM si.schema_migrations')).rows[0].n, 2);
   } finally { await restored.end(); }
 });
+
+test('MG1c: repeated bootstrap normalizes owner membership options after delegated grants', async t => {
+  const db = await freshDatabase(t, 'mg1c');
+  const adm = await connect({ database: db });
+  t.after(async () => {
+    const cleanup = await connect({ database: 'postgres' });
+    try { await cleanup.query(readFileSync(new URL('../../db/bootstrap/roles.sql', import.meta.url), 'utf8')); }
+    finally { await cleanup.end(); }
+    await adm.end();
+  });
+  const snapshot = async () => (await adm.query(`
+    SELECT pg_get_userbyid(roleid)::text AS role,
+           pg_get_userbyid(member)::text AS member,
+           pg_get_userbyid(grantor)::text AS grantor,
+           admin_option, inherit_option, set_option
+    FROM pg_auth_members WHERE roleid='si_owner'::regrole
+    ORDER BY member, grantor`)).rows;
+  const baseline = await snapshot();
+  assert.equal(baseline.length, 1);
+  assert.equal(baseline[0].member, 'si_migrator');
+  assert.deepEqual([baseline[0].admin_option, baseline[0].inherit_option, baseline[0].set_option],
+    [false, false, true]);
+
+  await adm.query('GRANT si_owner TO si_retention WITH ADMIN TRUE, SET TRUE');
+  await adm.query('SET ROLE si_retention');
+  await adm.query('GRANT si_owner TO si_monitor WITH SET TRUE');
+  await adm.query('RESET ROLE');
+  await bootstrapCluster(adm);
+  assert.deepEqual(await snapshot(), baseline, 'bootstrap removes delegated membership and preserves migrator options');
+  await bootstrapCluster(adm);
+  assert.deepEqual(await snapshot(), baseline, 'bootstrap is idempotent');
+});
