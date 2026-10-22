@@ -52,6 +52,8 @@ jobs:
         run: node tests/mutations/step2-roles.mjs
       - name: Targeted T1 idempotency mutant execution (expected regression failure)
         run: node tests/mutations/step2-idempotency.mjs
+      - name: M5 isolation mutant (must be killed)
+        run: node tests/mutations/step2-isolation.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
