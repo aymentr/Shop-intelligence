@@ -48,6 +48,8 @@ jobs:
           done
       - name: Targeted D5b mutant execution (expected regression failure)
         run: node tests/mutations/step2-d5b.mjs
+      - name: Targeted role-bootstrap mutant execution (expected regression failure)
+        run: node tests/mutations/step2-roles.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
