@@ -54,6 +54,8 @@ jobs:
         run: node tests/mutations/step2-idempotency.mjs
       - name: M5 isolation mutant (must be killed)
         run: node tests/mutations/step2-isolation.mjs
+      - name: M4 attempt-limit mutant (must be killed)
+        run: node tests/mutations/step2-attempt-cap.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
