@@ -63,3 +63,14 @@ test('D5b: production gate requires both privileged lock capabilities', async ()
   const results = await checkProductionAdvisoryPermissions(fake);
   assert.deepEqual(results.map(r => r.ok), [true, true, false, false]);
 });
+
+test('D5b production CLI status rejects a database without advisory hardening', () => {
+  const cli = fileURLToPath(new URL('../../dist/persistence/cli.js', import.meta.url));
+  const url = `postgres://${cfg.adminUser}:${encodeURIComponent(cfg.adminPassword)}@${cfg.host}:${cfg.port}/${db}`;
+  const r = spawnSync(process.execPath, [cli, 'status'], {
+    encoding: 'utf8', env: { ...process.env, SI_DATABASE_URL: url, SI_PRODUCTION: '1' }
+  });
+  assert.notEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stderr, /PRODUCTION_PREFLIGHT_FAILED/);
+  assert.match(r.stderr, /advisory_public_exposures/);
+});
