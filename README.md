@@ -6,10 +6,10 @@ A TypeScript **offline-only** evaluation harness for future multi-network advert
 
 - Strict parsing, network-scoped identities, deduplication, collection runs and basic diagnostic ratios.
 - Fail-closed rights for evaluation, retention, subscriber display, media mirroring and exports.
-- Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, permanent storage, UI, or commercially licensed ad dataset**.
+- Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, UI, or commercially licensed ad dataset**. The B-002 PostgreSQL foundation persists source/rights/run metadata, but the offline ingestion harness is not connected to it end-to-end.
 - An `ALLOWED` flag is an internal gate, **not legal authorization**. Real permissions require independently documented source agreements.
 - Synthetic fixture links use `example.org` and are never fetched.
-- No runtime dependencies. Dev dependencies (`typescript`, `@types/node`) are pinned in `package.json` and locked in `package-lock.json`; requires Node 22+.
+- Runtime dependency: `pg`. Development dependencies include `typescript`, `@types/node`, and `@types/pg`; versions are pinned in `package.json` and locked in `package-lock.json`. Requires Node 22+.
 
 ## Run
 
@@ -28,15 +28,15 @@ source offline fixture → source adapter → strict normalization → run valid
                                         rights gate + diagnostics
 ```
 
-No data is published or persisted. If any record is invalid, the entire run is FAILED and the harness returns no trusted rows.
+The offline adapter publishes or persists no data. B-002 separately persists rights, controls, and run metadata. If any record is invalid, the entire run is FAILED and the harness returns no trusted rows.
 
-CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 and 24 for pushes and pull requests.
+CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 and 24, plus three consecutive PostgreSQL integration suites. Push triggers include `main`, `claude/**`, and `codex/**`; pull requests also trigger CI.
 
-## B-002 persistence (Milestone 1, in progress)
+## B-002 persistence (Milestone 1 complete; Milestone 2 in progress)
 
 PostgreSQL 16 foundation: roles, bootstrap, migration runner, migration 0001 (sources,
 versioned rights, evidence, and Amendment C source controls: suspension, irreversible
-retention termination, LIFT) and integration tests against a real database.
+retention termination, LIFT) and integration tests against a real database. Migration 0002 includes collection runs, publication receipts and errors; T1 authorizes and starts attempts. Lifecycle transitions and T2 publication are not yet implemented.
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
