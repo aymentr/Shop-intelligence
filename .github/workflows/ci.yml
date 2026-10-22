@@ -46,6 +46,8 @@ jobs:
             echo "PostgreSQL acceptance pass ${pass}/3"
             npm run test:db || exit 1
           done
+      - name: Targeted D5b mutant execution (expected regression failure)
+        run: node tests/mutations/step2-d5b.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
