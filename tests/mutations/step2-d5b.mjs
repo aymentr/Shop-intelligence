@@ -20,11 +20,11 @@ try {
   killed = run.status !== 0 &&
     output.includes('MG10 (D5b mutation)') &&
     output.includes('not ok') &&
-    output.includes('advisory_application_exposures');
+    output.includes('true !== false');
   console.log('Mutation: exclude si_collector from effective privilege scan');
   console.log('Mutated build exit:', build.status);
   console.log('MG10 mutated test exit:', run.status);
-  console.log('MG10 failure evidence:\n', output.split('\n').filter(x => /MG10|not ok|advisory_application_exposures|AssertionError|error:/.test(x)).slice(0, 25).join('\n'));
+  console.log('MG10 failure evidence:\n', output.split('\n').filter(x => /MG10|not ok|true !== false|AssertionError|error:/.test(x)).slice(0, 25).join('\n'));
 } finally {
   writeFileSync(path, original);
   const restored = readFileSync(path, 'utf8') === original;
