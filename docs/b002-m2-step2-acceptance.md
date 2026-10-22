@@ -96,3 +96,30 @@ Additional operational concerns: other database clients/tools relying on advisor
 **NOT ACCEPTED.** The baseline T1 implementation has substantial PostgreSQL-backed, repeatable testing, including concurrency and real permission checks, but the requested executable mutation campaign, operational D5b decision, clean-cluster restore evidence, and final-commit verification are incomplete. This is a bounded acceptance conclusion, not a claim that an exploit has been demonstrated.
 
 **Step 3 must not begin. T2 remains unimplemented. D8 continues to block customer-facing serving.**
+
+## Blocker closure continuation (2026-10-22)
+
+**Decision remains NOT ACCEPTED.** This section records changes after the last accepted baseline `176e72ab3da6cf114abfccf84aa3aa80851637bc`, without revising the frozen plan.
+
+### Status of four blockers
+
+| Blocker | Status | Evidence / missing proof |
+|---|---|---|
+| Representative mutation campaign M1–M6 | **OPEN** | Prior CI killed three mutants (D5b scan, owner cleanup, T1 hash). No newly executed source-lock, rights, lease, cap, isolation or privilege-separation mutants in this continuation. |
+| D5b operator security | **FOUNDER DECISION REQUIRED** | Added production-mode CLI preflight before operator commands, with a negative DB integration test. `SI_PRODUCTION=1` must be set by trusted deployment configuration; there is no deployed runtime startup yet, so an unavoidable end-to-end production startup gate is **not** demonstrated. Managed-host ownership of `pg_catalog` remains unknown. |
+| Clean-cluster restore | **OPEN** | Existing MG9 is same-cluster database-local restore, not isolated fresh-cluster global-role/configuration restore. No independent clean-cluster restoration was executed here. |
+| Local acceptance runs | **OPEN** | Frozen plan §8 requires **three consecutive local PostgreSQL 16 runs and CI**. CI evidence does not substitute for local runs. The available local execution environment has Node.js but no `docker` or `psql` executable; no local PostgreSQL 16 test cluster was started. |
+
+### Production preflight change
+
+`src/persistence/cli.ts` now checks operational and effective advisory-lock privileges *before* any CLI operator command when `SI_PRODUCTION=1`. This prevents accidental migration/status/bootstrap operations in an unhardened database **when production mode is enabled**. Provisioning must first establish the hardening policy in a disposable/isolated phase. `tests/db/preconditions.test.mjs` adds a real-database negative check for production-mode `status` against an unhardened database. This test must pass on the latest CI commit before being treated as verified evidence.
+
+This is **not** authorization to apply `advisory-lock-hardening.sql` on any shared or production database. Production hosting capability, runtime entry points, trusted enforcement of `SI_PRODUCTION`, and the founder's explicit D5b approval remain unresolved.
+
+### Minimum next work
+
+1. Execute M1–M6 mutations with independent PostgreSQL connections, expected-failure checks and full restoration, and record each result.
+2. Provision a **new, disposable PostgreSQL 16 cluster**, restore global roles/configuration plus database-local objects, repeat bootstrap/migrations, and compare catalogs and ACLs.
+3. Run the frozen plan's three consecutive local PostgreSQL suites on a machine with Docker/PostgreSQL 16; do not relabel GitHub CI as local evidence.
+4. Obtain the founder's explicit D5b strategy decision and verify the selected hosting environment permits the required pg_catalog privilege changes; wire fail-closed production configuration across actual future runtime startup paths.
+5. Verify every new test on the final commit in GitHub Actions, then reconsider acceptance. Step 3 and D8 serving remain blocked.
