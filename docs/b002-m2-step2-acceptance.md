@@ -123,3 +123,20 @@ This is **not** authorization to apply `advisory-lock-hardening.sql` on any shar
 3. Run the frozen plan's three consecutive local PostgreSQL suites on a machine with Docker/PostgreSQL 16; do not relabel GitHub CI as local evidence.
 4. Obtain the founder's explicit D5b strategy decision and verify the selected hosting environment permits the required pg_catalog privilege changes; wire fail-closed production configuration across actual future runtime startup paths.
 5. Verify every new test on the final commit in GitHub Actions, then reconsider acceptance. Step 3 and D8 serving remain blocked.
+
+## Environment/evidence continuation (2026-10-22)
+
+**Status: NOT ACCEPTED.** The previous production preflight fix at `0c6e672e681ffd73c2a478e419e62a78083eacd5` was verified by GitHub Actions run [39746826448](https://github.com/aymentr/Shop-intelligence/actions/runs/39746826448): Node 22, Node 24 and integration all succeeded. The three previously killed mutants remain the accepted mutation baseline.
+
+**Environment inspection:** the available Linux execution container has Node.js v22.16.0 and git, but neither Docker/Podman nor `psql`, `postgres` or `initdb`. No local PostgreSQL 16 service exists here. GitHub Actions has an isolated PostgreSQL 16 compose environment, but remote CI is not the plan's local-run acceptance. The Windows execution protocol is in `docs/b002-m2-windows-local-acceptance.md`.
+
+**New M5 experiment:** `tests/mutations/step2-isolation.mjs` changes the second READ COMMITTED guard in migration `0002` to `IF false THEN`, executes `tests/db/run.mjs t1` against disposable PostgreSQL, expects LI-T1 to fail, and restores the original migration in `finally`. CI execution is required to classify this mutation as KILLED; until verified it is **NOT EXECUTED/INCONCLUSIVE** for acceptance. This is not a change to the accepted T1 implementation.
+
+| Blocker | Status | Current evidence |
+|---|---|---|
+| M1–M6 representative mutation campaign | **OPEN** | Three earlier kills verified; M5 newly wired into CI, outcome to be checked; M1–M4/M6 still not executed in this continuation |
+| D5b and production startup | **FOUNDER DECISION REQUIRED** | Production CLI preflight negative test verified in run 39746826448. `SI_PRODUCTION=1` can be omitted and no actual API/worker deployment exists; provider compatibility unknown |
+| Fresh PostgreSQL 16 cluster restoration | **OPEN** | MG9 is same-cluster database-local restoration only; no global-role/config/ACL restoration into independent cluster |
+| Three local PostgreSQL 16 runs | **OPEN** | No local PostgreSQL executable/container runtime; Windows founder execution guide provided; CI is not local evidence |
+
+No Step 3, T2, migrations 0003/0004, live collection, production serving or deployment was authorized or implemented. D8 restriction unchanged. Do not sign off until all mandatory evidence and explicit D5b authorization exist.
