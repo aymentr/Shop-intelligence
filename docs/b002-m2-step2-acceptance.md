@@ -4,7 +4,7 @@
 
 - Repository: `aymentr/Shop-intelligence`
 - Branch reviewed: `codex/b002-m2-acceptance` (no `main` merge or production deployment)
-- Reviewed implementation commit before report: `47fa258f0c6b96ce6e4366e2eae78810a503b110`
+- Reviewed implementation commit before report: `0382db7ac80156582a82a6f74b5ad9e72cef3b41`
 - Report's own commit: inspect the branch HEAD at the end of this audit (a commit cannot contain its own SHA).
 - Authoritative specification: `docs/b002-m2-plan.md`, revision 2.
 - Production serving is **blocked by D8**, independently of Step 2 acceptance. No publication path or live collector is authorized.
@@ -20,7 +20,7 @@ GitHub Actions [run 39742185071](https://github.com/aymentr/Shop-intelligence/ac
 - MG9 verifies real `pg_dump -Fc` / `pg_restore` of database ACLs against a database on the *same test cluster*. It does not restore cluster-global roles into a fresh cluster.
 - MG1b/MG1c test delegated role memberships and repeat bootstrap.
 
-**Later mutation CI evidence:** GitHub Actions [run 39744544185](https://github.com/aymentr/Shop-intelligence/actions/runs/39744544185) at `2a999aa` passed three successive 129/129 PostgreSQL suites, Node 22/24 jobs, and BOTH executable mutation checks. The logs show `MG10 mutated test exit: 1`, `MUTANT_KILLED: MG10 detected hidden explicit collector privilege`, `MG1b mutated test exit: 1`, and `MUTANT_KILLED: MG1b detects skipped owner membership cleanup`. The modified source files were restored. A later commit `47fa258` adds explicit normalization of cluster memberships after the role mutation; its own CI result must be checked. The first mutation CI attempt [run 39744113737](https://github.com/aymentr/Shop-intelligence/actions/runs/39744113737) failed in the mutation harness, *after* all 3 × 129 baseline database tests passed: the deliberately mutated MG10 test did fail, but the harness required an error-message substring absent from the TAP assertion output. It is incorrect to mark that first attempt as a successful automated kill. The harness was updated in `3d5243d`. A second owner-membership mutant was added, with explicit cluster membership restoration, in commits `b525945`, `2a999aa`, and `47fa258`. Their results must be established from the final GitHub Actions run; unverified commits are not acceptance evidence.
+**Later mutation CI evidence:** GitHub Actions [run 39744544185](https://github.com/aymentr/Shop-intelligence/actions/runs/39744544185) at `2a999aa` passed three successive 129/129 PostgreSQL suites, Node 22/24 jobs, and BOTH executable mutation checks. The logs show `MG10 mutated test exit: 1`, `MUTANT_KILLED: MG10 detected hidden explicit collector privilege`, `MG1b mutated test exit: 1`, and `MUTANT_KILLED: MG1b detects skipped owner membership cleanup`. The modified source files were restored. A later commit `47fa258` adds explicit normalization of cluster memberships after the role mutation; this passed CI. GitHub Actions [run 39745126213](https://github.com/aymentr/Shop-intelligence/actions/runs/39745126213) at `0382db7` passed three 129/129 PostgreSQL suites, Node.js 22/24, and all **three** executable mutation checks. Logs include `Cluster owner memberships normalized: true` and `MUTANT_KILLED: T1-4 rejects inverted request-hash guard`. The first mutation CI attempt [run 39744113737](https://github.com/aymentr/Shop-intelligence/actions/runs/39744113737) failed in the mutation harness, *after* all 3 × 129 baseline database tests passed: the deliberately mutated MG10 test did fail, but the harness required an error-message substring absent from the TAP assertion output. It is incorrect to mark that first attempt as a successful automated kill. The harness was updated in `3d5243d`. A second owner-membership mutant was added, with explicit cluster membership restoration, in commits `b525945`, `2a999aa`, and `47fa258`. Their results must be established from the final GitHub Actions run; unverified commits are not acceptance evidence.
 
 No independent three-pass **local** PostgreSQL execution was performed by this audit. No actual production cluster preflight or deployment was performed.
 
@@ -50,7 +50,7 @@ No independent three-pass **local** PostgreSQL execution was performed by this a
 
 ## 3. Mutation audit and outcome classification
 
-**Definition:** A mutant is `KILLED` only when modified implementation was executed and a relevant regression test failed for the expected reason. A normal regression test that *introduces unsafe database state* is not itself an implementation-mutation kill.
+**Definition:** A mutant is `KILLED` only when modified implementation was executed and a relevant regression test failed for the expected reason. A normal regression test that *introduces unsafe database state* is not itself an implementation-mutation kill. MG10's direct grant test and the separate mutation against its role scan are distinct forms of evidence.
 
 | Mutation | Invariant / predicted failure | Detector | Status |
 |---|---|---|---|
@@ -59,7 +59,7 @@ No independent three-pass **local** PostgreSQL execution was performed by this a
 | Change PUBLIC counting to ignore explicit application role grants | Would miss explicit EXECUTE grants | MG10 | **NOT RUN** (MG10 illustrates unsafe state, not direct source mutation) |
 | Add inherited `si_owner` membership to application role | Privilege-escalation path | MG1b/MG1c, MG3/4 | **NOT RUN** |
 | Remove request-key advisory lock in `si_begin_run` | Concurrent duplicates / serialization deviation | C5/C6/DS7 | **NOT RUN** |
-| Change same-key hash consistency check | Reuse key with different payload | T1-4, C6 | **NOT RUN** |
+| Invert `x.request_sha256 <> p_request_sha256` to `=` in migration 0002 | Reuse key with different payload or refuse equivalent replay | T1-4, C6 | **KILLED** in run 39745126213; mutated 0002 was executed, T1-4 failed, original 0002 restored |
 | Remove or change source `FOR KEY SHARE` lock | Rights/control races or changed lock order | CC-R/CC-C/LO4 | **NOT RUN** |
 | Bypass suspension/termination predicates | Forbidden T1 attempt created | T1-3, T1-2b, CC-C | **NOT RUN** |
 | Change `n >= 20` to `n > 20` | Permit attempt 21 | T1-5 | **NOT RUN** |
@@ -67,7 +67,7 @@ No independent three-pass **local** PostgreSQL execution was performed by this a
 | Remove isolation guard | Repeatable-read/serializable path accepted | LI-T1 | **NOT RUN** |
 | Grant data-write privilege to migrator or app role | Privilege separation violation | MG3/MG4, DS1, privileges tests | **NOT RUN** |
 
-The targeted campaign is **not comprehensive**, and the unexecuted mutations cannot be claimed killed merely because suitable tests exist. Mutated source is restored by `finally` in both mutation scripts; the owner-membership script also re-normalizes cluster roles after restoration. These scripts must run only with disposable test cluster credentials.
+The three executed mutant kills are meaningful but the targeted campaign is **not comprehensive**, and the unexecuted mutations cannot be claimed killed merely because suitable tests exist. Mutated source is restored by `finally` in both mutation scripts; the owner-membership script also re-normalizes cluster roles after restoration. These scripts must run only with disposable test cluster credentials.
 
 ## 4. D5b security and operational decision
 
@@ -85,7 +85,7 @@ Additional operational concerns: other database clients/tools relying on advisor
 
 ## 5. Remaining blockers and minimum closure
 
-1. **Executable mutation evidence:** confirm final commit's corrected role-state cleanup and extend the campaign to representative T1 lock/idempotency, source rights/suspension, attempt/lease and isolation mutations, and record the failure reason for each.
+1. **Executable mutation evidence:** three meaningful mutants are killed (collector scan, delegated role cleanup, T1 hash comparison). Extend the campaign to representative T1 lock/idempotency, source rights/suspension, attempt/lease and isolation mutations, and record the failure reason for each.
 2. **D5b founder decision:** explicitly approve production infrastructure compatibility and mandate how `preflight --production` is invoked fail-closed by deployment/startup; or change the proposed security architecture and re-test it. Do not infer permission from a test result.
 3. **Operational restore proof:** restore the database *and cluster-level roles/configuration* into a clean disposable PostgreSQL 16 cluster, re-run D5b preflight and security probes, and document operator prerequisites.
 4. **Final complete verification:** green GitHub Actions on the final report/code commit (Node 22/24, build/typecheck/unit/demo, 3× full DB suite, mutation jobs), plus explicit evidence for any still-required local triple-run acceptance wording or approved revision of that criterion.
