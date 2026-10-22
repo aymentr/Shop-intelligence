@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bootstrapCluster, bootstrapDatabase } from '../../dist/persistence/bootstrap.js';
 import { migrateDown, migrateUp, migrationStatus, MIGRATION_LOCK_KEY } from '../../dist/persistence/migrate.js';
+import { checkProductionAdvisoryPermissions } from '../../dist/persistence/preconditions.js';
 import { assertSafeTarget, cfg, connect, dropDatabase, freshDatabase, rejects, schemaFingerprint, uniqueDbName } from './helpers.mjs';
 
 const DENIED = '42501';
@@ -271,4 +272,24 @@ test('MG1c: repeated bootstrap normalizes owner membership options after delegat
   assert.deepEqual(await snapshot(), baseline, 'bootstrap removes delegated membership and preserves migrator options');
   await bootstrapCluster(adm);
   assert.deepEqual(await snapshot(), baseline, 'bootstrap is idempotent');
+});
+
+test('MG10 (D5b mutation): an explicit advisory grant bypasses PUBLIC-only checks but fails production preflight', async t => {
+  const db = await freshDatabase(t, 'mg10');
+  const adm = await connect({ database: db });
+  t.after(() => adm.end());
+  await adm.query(HARDENING);
+  const healthy = await checkProductionAdvisoryPermissions(adm);
+  assert.deepEqual(healthy.filter(x => !x.ok), [], 'hardened database is production-ready for D5b');
+
+  await adm.query('BEGIN');
+  try {
+    await adm.query('GRANT EXECUTE ON FUNCTION pg_catalog.pg_advisory_lock(bigint) TO si_collector');
+    assert.equal(await publicAdvisory(adm), 0, 'PUBLIC-only inspection misses explicit grants');
+    const checks = await checkProductionAdvisoryPermissions(adm);
+    assert.equal(checks.find(x => x.name === 'advisory_application_exposures')?.ok, false);
+    assert.equal(checks.find(x => x.name === 'advisory_public_exposures')?.ok, true);
+  } finally { await adm.query('ROLLBACK'); }
+  const restored = await checkProductionAdvisoryPermissions(adm);
+  assert.deepEqual(restored.filter(x => !x.ok), [], 'rollback restores hardening');
 });
