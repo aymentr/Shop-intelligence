@@ -11,3 +11,12 @@ DROP FUNCTION si.si_run_lease();
 DROP FUNCTION si.si_lock_request_key(text, text);
 DROP FUNCTION si.si_request_lock_key(text, text);
 DROP FUNCTION si.si_request_lock_namespace();
+
+-- Step 3 routines (table-owned triggers are removed with their tables).
+DROP FUNCTION si.si_reap_expired_runs(integer);
+DROP FUNCTION si.si_heartbeat_run(uuid,uuid);
+DROP FUNCTION si.si_fail_run(uuid,uuid,text,jsonb);
+DROP FUNCTION si.trg_run_errors_append_only();
+DROP FUNCTION si.trg_run_error_integrity();
+DROP FUNCTION si.trg_runs_no_delete();
+DROP FUNCTION si.trg_runs_transition();
