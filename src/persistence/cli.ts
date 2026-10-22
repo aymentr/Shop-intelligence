@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   const client = new pg.Client({ connectionString: url, application_name: 'si-migrate' });
   await client.connect();
   try {
-    if (command === 'bootstrap') {
+    // Production is opt-in and fail-closed: all operator entry points must pass D7 + D5b.\n    // First-time setup must be done in an isolated provisioning phase, before production mode.\n    if (process.env.SI_PRODUCTION === '1') {\n      const checks = [...await checkOperationalPreconditions(client), ...await checkProductionAdvisoryPermissions(client)];\n      const failed = checks.filter(p => !p.ok);\n      if (failed.length) throw new Error('PRODUCTION_PREFLIGHT_FAILED: ' + failed.map(p => p.name + '=' + p.actual).join('; '));\n    }\n    if (command === 'bootstrap') {
       const passwords: Partial<Record<LoginRole, string>> = {};
       for (const role of LOGIN_ROLES) {
         const pw = process.env[`SI_ROLE_PASSWORD_${role.toUpperCase()}`] ?? process.env.SI_ROLE_PASSWORD;
