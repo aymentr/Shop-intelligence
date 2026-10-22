@@ -9,8 +9,7 @@ const original = readFileSync(path, 'utf8');
 const guard = "IF current_setting('transaction_isolation') <> 'read committed' THEN";
 const positions = [...original.matchAll(/IF current_setting\('transaction_isolation'\) <> 'read committed' THEN/g)];
 if (positions.length !== 2) throw new Error('Expected two isolation guards (trigger, T1); refusing mutation');
-const second = positions[1].index;
-const mutant = original.slice(0, second) + "IF false THEN" + original.slice(second + guard.length);
+const mutant = original.replaceAll(guard, 'IF false THEN');
 let killed = false;
 try {
   writeFileSync(path, mutant);
@@ -19,7 +18,7 @@ try {
   });
   const output = (r.stdout ?? '') + '\n' + (r.stderr ?? '');
   const evidence = output.split('\n').filter(x => /LI-T1|not ok|AssertionError|SI_ISOLATION/.test(x));
-  console.log('M5 mutation: T1 isolation guard changed to IF false THEN');
+  console.log('M5 mutation: both T1 and insert-trigger isolation guards changed to IF false THEN');
   console.log('Mutated suite exit:', r.status);
   console.log(evidence.slice(0, 35).join('\n'));
   killed = r.status !== 0 && /not ok \d+ - LI-T1/.test(output) && /AssertionError|Missing expected rejection|SI_ISOLATION/.test(output);
@@ -28,5 +27,5 @@ try {
   if (readFileSync(path, 'utf8') !== original) throw new Error('M5 original migration not restored');
   console.log('M5 original migration restored: true');
 }
-if (!killed) throw new Error('M5 SURVIVED OR INCONCLUSIVE: no expected LI-T1 failure');
-console.log('M5 KILLED: LI-T1 caught missing T1 isolation guard');
+if (!killed) throw new Error('M5 SURVIVED OR INCONCLUSIVE: LI-T1 did not detect removal of both guards');
+console.log('M5 KILLED: LI-T1 caught removal of both isolation guards');
