@@ -3,7 +3,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { bootstrapCluster, bootstrapDatabase } from '../../dist/persistence/bootstrap.js';
 import { migrateDown, migrateUp, migrationStatus, MIGRATION_LOCK_KEY } from '../../dist/persistence/migrate.js';
@@ -194,4 +196,47 @@ test('MG8 (D5b compatibility): hardening is per database — clones keep it, tem
   if (dump.error || dump.status !== 0) { t.diagnostic(`pg_dump unavailable or incompatible: ${dump.error?.message ?? dump.stderr}`); return; }
   assert.match(dump.stdout, /REVOKE ALL ON FUNCTION pg_catalog\.pg_advisory_lock\(bigint\) FROM PUBLIC/);
   assert.match(dump.stdout, /GRANT ALL ON FUNCTION pg_catalog\.pg_advisory_xact_lock\(bigint\) TO si_migrator/);
+});
+
+test('MG9 (D5b restore): hardened PostgreSQL dump restores effective privileges and schema', async t => {
+  const source = await freshDatabase(t, 'mg9src');
+  const target = uniqueDbName('mg9restore');
+  assertSafeTarget(target);
+  t.after(() => dropDatabase(target));
+  const src = await connect({ database: source });
+  try { await src.query(HARDENING); } finally { await src.end(); }
+
+  const directory = mkdtempSync(join(tmpdir(), 'si-mg9-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const archive = join(directory, 'backup.dump');
+  const env = { ...process.env, PGPASSWORD: cfg.adminPassword };
+  const dump = spawnSync('pg_dump',
+    ['-Fc', '--no-owner', '-h', cfg.host, '-p', String(cfg.port), '-U', cfg.adminUser, '-f', archive, source],
+    { encoding: 'utf8', env });
+  assert.equal(dump.error, undefined, `pg_dump unavailable: ${dump.error?.message}`);
+  assert.equal(dump.status, 0, `pg_dump failed: ${dump.stderr}`);
+
+  const maintenance = await connect();
+  try { await maintenance.query(`CREATE DATABASE ${target} TEMPLATE template0`); }
+  finally { await maintenance.end(); }
+  const restore = spawnSync('pg_restore',
+    ['--exit-on-error', '--no-owner', '-h', cfg.host, '-p', String(cfg.port),
+      '-U', cfg.adminUser, '-d', target, archive],
+    { encoding: 'utf8', env });
+  assert.equal(restore.error, undefined, `pg_restore unavailable: ${restore.error?.message}`);
+  assert.equal(restore.status, 0, `pg_restore failed: ${restore.stderr}`);
+
+  const restored = await connect({ database: target });
+  try {
+    assert.equal(await publicAdvisory(restored), 0, 'PUBLIC advisory privileges survive restore');
+    const exposures = await restored.query(`
+      SELECT r.rolname, p.oid::regprocedure::text AS fn
+      FROM pg_roles r CROSS JOIN pg_proc p
+      WHERE r.rolname IN ('si_collector','si_rights_admin','si_retention','si_monitor')
+        AND p.pronamespace='pg_catalog'::regnamespace
+        AND p.proname ~ '^pg_(try_)?advisory'
+        AND has_function_privilege(r.oid, p.oid, 'EXECUTE')`);
+    assert.deepEqual(exposures.rows, [], 'no effective application-role advisory privilege');
+    assert.equal((await restored.query('SELECT count(*)::int AS n FROM si.schema_migrations')).rows[0].n, 2);
+  } finally { await restored.end(); }
 });
