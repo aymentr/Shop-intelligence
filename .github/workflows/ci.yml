@@ -40,8 +40,12 @@ jobs:
       - name: Start PostgreSQL 16 (localhost only)
         run: docker compose up -d --wait db
       - run: npm ci
-      - name: Bootstrap, migrate template, run integration tests
-        run: npm run test:db
+      - name: Bootstrap, migrate template, run integration tests (three independent passes)
+        run: |
+          for pass in 1 2 3; do
+            echo "PostgreSQL acceptance pass ${pass}/3"
+            npm run test:db || exit 1
+          done
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
