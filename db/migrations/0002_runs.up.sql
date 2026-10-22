@@ -4,9 +4,7 @@
 --
 -- STEP 1: tables, CHECK constraints, indexes, IA-1 composite foreign keys, read grants.
 -- STEP 2: si_request_lock_key, trg_runs_insert, si_begin_run (T1 preflight) - see below.
--- Not yet present (later steps of the M2 plan):
---   trg_runs_transition (SECURITY INVOKER), heartbeat,
---   trg_runs_no_delete, run_errors integrity checks      -> step 3 (T3, reaper)
+-- Step 3 lifecycle routines appear below; migration checksum changes require a controlled development rebuild.
 --   si_complete_run, trg_runs_publish_check, receipt checks -> step 4 (T2)
 -- Until those exist NO application role may write to these tables: write grants are
 -- added in the same step as the trigger that enforces them.
@@ -411,3 +409,205 @@ REVOKE ALL ON FUNCTION
   si.si_begin_run(text, text, text, text, text[])
 FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_collector;
+
+
+------------------------------------------------------------------------------------------
+-- STEP 3: deterministic lifecycle. Development-only expansion of checksum-pinned 0002.
+-- Existing installations must NOT have migration hashes edited in place.
+------------------------------------------------------------------------------------------
+CREATE FUNCTION si.trg_runs_transition() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path=pg_catalog,pg_temp AS $$
+DECLARE t timestamptz := clock_timestamp();
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: run transitions require READ COMMITTED' USING ERRCODE='invalid_transaction_state';
+  END IF;
+  IF ROW(NEW.run_id,NEW.source_id,NEW.request_key,NEW.request_sha256,NEW.attempt,
+         NEW.rights_version_id,NEW.conflict_policy,NEW.started_at,NEW.start_control_seq)
+     IS DISTINCT FROM
+     ROW(OLD.run_id,OLD.source_id,OLD.request_key,OLD.request_sha256,OLD.attempt,
+         OLD.rights_version_id,OLD.conflict_policy,OLD.started_at,OLD.start_control_seq) THEN
+    RAISE EXCEPTION 'SI_RUN_IMMUTABLE: run identity or rights decision changed' USING ERRCODE='check_violation';
+  END IF;
+  IF OLD.status <> 'RUNNING' THEN
+    RAISE EXCEPTION 'SI_RUN_TERMINAL: terminal attempt cannot be modified' USING ERRCODE='check_violation';
+  END IF;
+  IF NEW.status NOT IN ('RUNNING','FAILED') THEN
+    RAISE EXCEPTION 'SI_RUN_TRANSITION: publication unavailable until T2' USING ERRCODE='check_violation';
+  END IF;
+  IF OLD.status = 'RUNNING' AND NEW.status = 'RUNNING' THEN
+    IF ROW(NEW.outcome_code,NEW.finished_at,NEW.lease_token,NEW.received_count,
+           NEW.published_count,NEW.duplicate_count,NEW.conflict_count,NEW.suppressed_count,
+           NEW.error_count,NEW.retention_state,NEW.retain_until,NEW.first_purged_at,
+           NEW.purged_at,NEW.rights_checked_at,NEW.publish_control_seq)
+       IS DISTINCT FROM
+       ROW(OLD.outcome_code,OLD.finished_at,OLD.lease_token,OLD.received_count,
+           OLD.published_count,OLD.duplicate_count,OLD.conflict_count,OLD.suppressed_count,
+           OLD.error_count,OLD.retention_state,OLD.retain_until,OLD.first_purged_at,
+           OLD.purged_at,OLD.rights_checked_at,OLD.publish_control_seq) THEN
+      RAISE EXCEPTION 'SI_HEARTBEAT_FIELDS: heartbeat may only extend its lease' USING ERRCODE='check_violation';
+    END IF;
+    IF OLD.lease_expires_at <= t OR NEW.lease_expires_at <= t
+       OR NEW.lease_expires_at > t + si.si_run_lease()
+       OR NEW.lease_expires_at < OLD.lease_expires_at THEN
+      RAISE EXCEPTION 'SI_HEARTBEAT_BOUNDS: expired, shortened or overlong lease' USING ERRCODE='check_violation';
+    END IF;
+  ELSE
+    IF NEW.outcome_code NOT IN ('SOURCE_ERROR','VALIDATION_FAILED','DUPLICATE_CONFLICT',
+       'LEASE_EXPIRED','RIGHTS_TERMINATED','SOURCE_SUSPENDED','SOURCE_RETIRED',
+       'RIGHTS_CHANGED','RIGHTS_EXPIRING','LOCK_TIMEOUT','PERSISTENCE_ERROR','INTERNAL') THEN
+      RAISE EXCEPTION 'SI_FAILURE_CODE: invalid failure code' USING ERRCODE='invalid_parameter_value';
+    END IF;
+    IF NEW.finished_at IS NULL OR NEW.lease_token IS NOT NULL
+       OR NEW.published_count <> 0 OR NEW.retention_state <> 'NONE'
+       OR NEW.retain_until IS NOT NULL OR NEW.rights_checked_at IS NOT NULL
+       OR NEW.publish_control_seq IS NOT NULL OR NEW.first_purged_at IS NOT NULL
+       OR NEW.purged_at IS NOT NULL THEN
+      RAISE EXCEPTION 'SI_FAILURE_SHAPE: invalid FAILED transition' USING ERRCODE='check_violation';
+    END IF;
+    IF NEW.outcome_code <> 'LEASE_EXPIRED' AND OLD.lease_expires_at <= t THEN
+      RAISE EXCEPTION 'SI_LEASE_EXPIRED: use expiry path' USING ERRCODE='check_violation';
+    END IF;
+    IF NEW.outcome_code = 'LEASE_EXPIRED' AND OLD.lease_expires_at > t THEN
+      RAISE EXCEPTION 'SI_LEASE_LIVE: cannot reap live run' USING ERRCODE='check_violation';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER trg_runs_transition BEFORE UPDATE ON si.collection_runs
+ FOR EACH ROW EXECUTE FUNCTION si.trg_runs_transition();
+
+CREATE FUNCTION si.trg_runs_no_delete() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog,pg_temp AS $$
+BEGIN
+  RAISE EXCEPTION 'SI_RUN_DELETE: run history cannot be deleted' USING ERRCODE='check_violation';
+END $$;
+CREATE TRIGGER trg_runs_no_delete BEFORE DELETE ON si.collection_runs
+ FOR EACH ROW EXECUTE FUNCTION si.trg_runs_no_delete();
+
+-- A deferrable consistency guard checks the final transaction state of each run.
+CREATE FUNCTION si.trg_run_error_integrity() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog,pg_temp AS $$
+DECLARE id uuid := COALESCE(NEW.run_id,OLD.run_id);
+DECLARE r record;
+DECLARE n integer;
+BEGIN
+  SELECT status,error_count INTO r FROM si.collection_runs WHERE run_id=id;
+  SELECT count(*)::integer INTO n FROM si.run_errors WHERE run_id=id;
+  IF r.status IS NULL OR (r.status <> 'FAILED' AND n <> 0)
+     OR (r.status='FAILED' AND n <> least(r.error_count,100)) THEN
+    RAISE EXCEPTION 'SI_ERROR_INTEGRITY: error rows do not match FAILED count for %',id USING ERRCODE='check_violation';
+  END IF;
+  RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER run_errors_consistency
+ AFTER INSERT OR UPDATE OR DELETE ON si.run_errors
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION si.trg_run_error_integrity();
+CREATE CONSTRAINT TRIGGER run_failed_errors_consistency
+ AFTER UPDATE OF status,error_count ON si.collection_runs
+ DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION si.trg_run_error_integrity();
+
+CREATE FUNCTION si.trg_run_errors_append_only() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog,pg_temp AS $$
+BEGIN
+  RAISE EXCEPTION 'SI_ERRORS_APPEND_ONLY: errors cannot be modified or deleted' USING ERRCODE='check_violation';
+END $$;
+CREATE TRIGGER trg_run_errors_append_only BEFORE UPDATE OR DELETE ON si.run_errors
+ FOR EACH ROW EXECUTE FUNCTION si.trg_run_errors_append_only();
+
+CREATE FUNCTION si.si_fail_run(p_run_id uuid,p_lease_token uuid,p_code text,p_errors jsonb DEFAULT '[]'::jsonb)
+RETURNS TABLE(run_id uuid,status text,outcome_code text,error_count integer)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
+#variable_conflict use_column
+DECLARE r si.collection_runs%ROWTYPE;
+DECLARE e jsonb;
+DECLARE i integer := 0;
+DECLARE n integer;
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: T3 requires READ COMMITTED' USING ERRCODE='invalid_transaction_state';
+  END IF;
+  IF p_run_id IS NULL OR p_lease_token IS NULL OR p_code IS NULL
+     OR p_code NOT IN ('SOURCE_ERROR','VALIDATION_FAILED','DUPLICATE_CONFLICT',
+       'RIGHTS_TERMINATED','SOURCE_SUSPENDED','SOURCE_RETIRED','RIGHTS_CHANGED',
+       'RIGHTS_EXPIRING','LOCK_TIMEOUT','PERSISTENCE_ERROR','INTERNAL')
+     OR p_errors IS NULL OR jsonb_typeof(p_errors) <> 'array' THEN
+    RAISE EXCEPTION 'SI_BAD_ARGUMENT: invalid T3 parameters' USING ERRCODE='invalid_parameter_value';
+  END IF;
+  SELECT * INTO r FROM si.collection_runs x WHERE x.run_id=p_run_id FOR UPDATE;
+  IF NOT FOUND OR r.status <> 'RUNNING' OR r.lease_token IS DISTINCT FROM p_lease_token THEN
+    RAISE EXCEPTION 'SI_T3_REFUSED: absent, terminal or wrong lease' USING ERRCODE='check_violation';
+  END IF;
+  IF r.lease_expires_at <= clock_timestamp() THEN
+    RAISE EXCEPTION 'SI_LEASE_EXPIRED: reaper owns expired attempts' USING ERRCODE='check_violation';
+  END IF;
+  n := jsonb_array_length(p_errors);
+  IF n > 100 THEN
+    RAISE EXCEPTION 'SI_TOO_MANY_ERRORS: maximum 100 error records' USING ERRCODE='invalid_parameter_value';
+  END IF;
+  FOR e IN SELECT value FROM jsonb_array_elements(p_errors) LOOP
+    i := i + 1;
+    IF jsonb_typeof(e) <> 'object' OR e->>'code' IS NULL OR e->>'correlationId' IS NULL
+       OR (e - 'code' - 'correlationId' - 'rowIndex' - 'field') <> '{}'::jsonb THEN
+      RAISE EXCEPTION 'SI_BAD_ERROR: unsupported error fields' USING ERRCODE='invalid_parameter_value';
+    END IF;
+    INSERT INTO si.run_errors(run_id,seq,code,row_index,field,correlation_id)
+    VALUES (p_run_id,i,e->>'code',(e->>'rowIndex')::integer,e->>'field',(e->>'correlationId')::uuid);
+  END LOOP;
+  UPDATE si.collection_runs x SET status='FAILED', outcome_code=p_code,finished_at=clock_timestamp(),
+    lease_token=NULL,error_count=n
+  WHERE x.run_id=p_run_id;
+  RETURN QUERY SELECT p_run_id,'FAILED'::text,p_code,n;
+END $$;
+
+CREATE FUNCTION si.si_heartbeat_run(p_run_id uuid,p_lease_token uuid)
+RETURNS timestamptz
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
+DECLARE r si.collection_runs%ROWTYPE;
+DECLARE deadline timestamptz;
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: heartbeat requires READ COMMITTED' USING ERRCODE='invalid_transaction_state';
+  END IF;
+  IF p_run_id IS NULL OR p_lease_token IS NULL THEN
+    RAISE EXCEPTION 'SI_BAD_ARGUMENT: heartbeat token required' USING ERRCODE='invalid_parameter_value';
+  END IF;
+  SELECT * INTO r FROM si.collection_runs x WHERE x.run_id=p_run_id FOR UPDATE;
+  IF NOT FOUND OR r.status <> 'RUNNING' OR r.lease_token IS DISTINCT FROM p_lease_token
+     OR r.lease_expires_at <= clock_timestamp() THEN
+    RAISE EXCEPTION 'SI_HEARTBEAT_REFUSED: unknown, terminal, expired or wrong token' USING ERRCODE='check_violation';
+  END IF;
+  deadline := clock_timestamp()+si.si_run_lease();
+  UPDATE si.collection_runs x SET lease_expires_at=deadline WHERE x.run_id=p_run_id;
+  RETURN deadline;
+END $$;
+
+-- Retention role executes bounded reaping; no scheduler or external worker is introduced.
+CREATE FUNCTION si.si_reap_expired_runs(p_limit integer DEFAULT 100)
+RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
+DECLARE r record;
+DECLARE count_done integer := 0;
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: reaper requires READ COMMITTED' USING ERRCODE='invalid_transaction_state';
+  END IF;
+  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 1000 THEN
+    RAISE EXCEPTION 'SI_BAD_ARGUMENT: reaper bound must be 1..1000' USING ERRCODE='invalid_parameter_value';
+  END IF;
+  FOR r IN SELECT x.run_id FROM si.collection_runs x
+    WHERE x.status='RUNNING' AND x.lease_expires_at <= clock_timestamp()
+    ORDER BY x.lease_expires_at,x.run_id FOR UPDATE SKIP LOCKED LIMIT p_limit LOOP
+    UPDATE si.collection_runs x SET status='FAILED',outcome_code='LEASE_EXPIRED',
+      finished_at=clock_timestamp(),lease_token=NULL WHERE x.run_id=r.run_id;
+    count_done := count_done+1;
+  END LOOP;
+  RETURN count_done;
+END $$;
+
+REVOKE ALL ON FUNCTION si.trg_runs_transition(),si.trg_runs_no_delete(),
+ si.trg_run_error_integrity(),si.trg_run_errors_append_only(),
+ si.si_fail_run(uuid,uuid,text,jsonb),si.si_heartbeat_run(uuid,uuid),
+ si.si_reap_expired_runs(integer) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION si.si_fail_run(uuid,uuid,text,jsonb),si.si_heartbeat_run(uuid,uuid) TO si_collector;
+GRANT EXECUTE ON FUNCTION si.si_reap_expired_runs(integer) TO si_retention;
