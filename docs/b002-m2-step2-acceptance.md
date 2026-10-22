@@ -140,3 +140,13 @@ This is **not** authorization to apply `advisory-lock-hardening.sql` on any shar
 | Three local PostgreSQL 16 runs | **OPEN** | No local PostgreSQL executable/container runtime; Windows founder execution guide provided; CI is not local evidence |
 
 No Step 3, T2, migrations 0003/0004, live collection, production serving or deployment was authorized or implemented. D8 restriction unchanged. Do not sign off until all mandatory evidence and explicit D5b authorization exist.
+
+## Mutation follow-up — M5 survival and M4 experiment
+
+GitHub Actions run [39748349743](https://github.com/aymentr/Shop-intelligence/actions/runs/39748349743) at `e6ce3189` **failed** because the initial M5 isolation mutation **SURVIVED**: disabling only `si_begin_run`'s READ COMMITTED guard left the insert-trigger isolation guard active, and LI-T1 still passed. This is a meaningful *defense-in-depth* finding, **not** a killed mutation and not a proven vulnerability. The original migration was restored.
+
+The revised M5 script disables **both** guards in the disposable migration and requires LI-T1 to fail. M4 similarly changes both 20-attempt checks from `>= 20` to `> 20` and requires T1-5 to fail. Both scripts restore migration `0002` in a `finally` block. Their outcomes must be taken from their CI runs; unverified or unrelated failures are INCONCLUSIVE, not kills.
+
+The unchanged source has two independent isolation guards and two independent attempt-cap guards. This explains why a single-guard mutation may survive without demonstrating a violation. It does not replace the outstanding M1/M2/M3/M6 campaigns.
+
+Local execution was rechecked: Node.js v22.16.0 is present; Docker, Podman, `psql`, `postgres` and `initdb` are unavailable. Therefore local three-pass evidence and clean-cluster restoration remain OPEN.
