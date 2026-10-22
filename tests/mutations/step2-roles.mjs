@@ -23,6 +23,11 @@ try {
   writeFileSync(path, original);
   if (readFileSync(path, 'utf8') !== original) throw new Error('Role SQL restoration failed');
   console.log('Original roles.sql restored: true');
+  const restoreCluster = spawnSync(process.execPath, ['--input-type=module', '-e',
+    'import { connect } from "./tests/db/helpers.mjs"; import { bootstrapCluster } from "./dist/persistence/bootstrap.js"; const c = await connect(); try { await bootstrapCluster(c); } finally { await c.end(); }'],
+    { encoding: 'utf8', timeout: 30000 });
+  if (restoreCluster.status !== 0) throw new Error('Cluster role cleanup failed: ' + restoreCluster.stderr);
+  console.log('Cluster owner memberships normalized: true');
 }
 if (!killed) throw new Error('MUTANT_SURVIVED_OR_INCONCLUSIVE: MG1b did not detect skipped cleanup');
 console.log('MUTANT_KILLED: MG1b detects skipped owner membership cleanup');
