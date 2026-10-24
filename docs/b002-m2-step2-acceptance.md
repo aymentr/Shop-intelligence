@@ -173,3 +173,37 @@ The founder reported three consecutive local PostgreSQL 16 runs on 2026-10-23 wi
 Source inspection confirms the harness targets two `PERFORM 1 FROM si.sources ... FOR KEY SHARE` statements (T1 and `trg_runs_insert`), executes `node tests/db/run.mjs t1`, and restores migration 0002 bytes in `finally` with a byte comparison. These are code properties, not execution proof. CC-R checks both rights-commit orders, CC-C checks both suspension-commit orders and the pinned sequence, and LO4 checks that the waiter has not prematurely locked an expired attempt. Their baseline assertions exist; the mutated outcomes remain unknown. Implicit FK/row locking could protect some paths; survival would require controlled analysis before any changes to tests.
 
 **Next evidence action:** inspect GitHub Actions push-triggered runs on branch `codex/b002-m2-acceptance` and retrieve the integration job's full logs, step outcome, head SHA and run attempt. If no run exists, diagnose Actions settings/branch permissions and trigger only the existing CI (no production writes). If CI exists but step was skipped due an earlier failure, classify INCONCLUSIVE and fix only that prerequisite. After M1 logs exist, adjudicate KILLED/SURVIVED/INCONCLUSIVE and verify baseline restoration and green tests. No M2 or product work authorized.
+
+
+### M1 final adjudication — CI #57 evidence (2026-10-24)
+
+**M1 classification: KILLED (combined removal of both explicit source-row guards). Overall M2 Step 2: NOT ACCEPTED.** This supersedes the earlier M1 INCONCLUSIVE execution-status note above; that note records the evidence available *before* CI #57.
+
+**Execution identification:** GitHub Actions workflow `CI` (`.github/workflows/ci.yml`), push event on `codex/b002-m2-acceptance`, job `integration`, step `M1 source-row-lock mutant (must be killed)`, CI run displayed as **#57**. Executed commit `d6bdc0a7da9ff34463c60fa76dc9799e83814ff0` (`fix(ci): repair M1 workflow YAML newlines`). The founder supplied a GitHub Actions screenshot showing CI #57 succeeded with green Node 22, Node 24, and integration jobs, and pasted the M1 step's console output. **Numeric GitHub Actions run ID, run-attempt number, full workflow URL, and full integration log were not independently retrieved**; do not fabricate them. Workflow reference: https://github.com/aymentr/Shop-intelligence/actions/workflows/ci.yml . The workflow provisions PostgreSQL 16 via `docker compose up -d --wait db` and the mutation runner rebuilds the template using `node tests/db/run.mjs t1`. The provided M1 step excerpt does **not** contain a server-reported `SELECT version()` result, so the exact runtime PostgreSQL minor version is not established from this excerpt.
+
+**Mutant:** `tests/mutations/step2-source-lock.mjs` replaced exactly two source-lock statements in the working copy of `db/migrations/0002_runs.up.sql`: `PERFORM 1 FROM si.sources ... FOR KEY SHARE;` became the same source query without `FOR KEY SHARE`, once in `si_begin_run` and once in `trg_runs_insert`. The script validates both anchors, runs the T1 database suite, classifies by named regression failures, and restores the original raw bytes in `finally`.
+
+**Observed M1 step output (founder-provided excerpt):**
+```text
+Run node tests/mutations/step2-source-lock.mjs
+M1: removed explicit FOR KEY SHARE from both T1 and the insert trigger
+Baseline migration sha256: 3533c0776ee35976e04d8b206e3ca89e97d2c838b3ea70ffdc8549dd9eefeae4
+Mutated suite exit: 1 signal: null spawn error: none
+not ok 14 - CC-R: rights change vs T1, both orders — T1 decides under committed rights; a pinned run keeps its version
+  name: 'AssertionError'
+not ok 15 - CC-C: controls vs T1, both orders — exact start_control_seq; a SUSPEND committed first stops T1
+  name: 'AssertionError'
+not ok 16 - LO4 (revised): T1 takes the source lock before any run lock — no lock-order exception remains
+  actual: 'lock-timeout'
+  name: 'AssertionError'
+not ok 20 - LIB: t1Preflight wraps one transaction and maps refusals to typed errors
+  error: 'Client has encountered a connection error and is not queryable'
+M1 original migration restored byte-for-byte: true
+M1 CLASSIFICATION: KILLED
+```
+
+**Adjudication:** CC-R and CC-C are named assertions testing rights/control commit-order serialization; LO4 tests source-before-attempt lock ordering. Their observed `not ok` assertions and exit code 1 satisfy the harness's *combined-mutant* kill predicate. The LIB connection error is collateral and is **not** an independent kill. The specific CC-R and CC-C actual-versus-expected values and the full blocked-PID schedules are absent from the filtered log, so the precise unsafe outcome for each assertion is not independently established. The result demonstrates that existing tests **depend on the combined explicit source-lock protections** and detect their simultaneous removal. It does not establish whether either individual guard is indispensable, that all implicit PostgreSQL locks are insufficient in every schedule, or that all T1 concurrency cases are covered.
+
+**Restoration and baseline:** the M1 harness printed `M1 original migration restored byte-for-byte: true` and the original migration SHA-256 above. The CI #57 screenshot shows the overall integration job green; its workflow orders three full database-suite passes before the M1 step. This supports baseline green on that run but does not provide the individual TAP summaries in the supplied evidence. Because the mutation is made to the checked-out working copy and reverted in `finally`, the accepted migration remains unchanged in Git. No M2, Step 3, T2, production or deployment authorization follows from this kill.
+
+**Evidence gaps for full audit:** retrieve numeric run ID, attempt, complete M1 log with CC-R/CC-C assertion details, explicit PostgreSQL server version, and the full three-pass baseline summaries if stronger independent reproducibility is required. These gaps do not overturn the narrow observed combined-mutant KILLED classification, but must not be silently represented as independently checked.
