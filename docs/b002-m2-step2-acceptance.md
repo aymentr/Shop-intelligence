@@ -207,3 +207,20 @@ M1 CLASSIFICATION: KILLED
 **Restoration and baseline:** the M1 harness printed `M1 original migration restored byte-for-byte: true` and the original migration SHA-256 above. The CI #57 screenshot shows the overall integration job green; its workflow orders three full database-suite passes before the M1 step. This supports baseline green on that run but does not provide the individual TAP summaries in the supplied evidence. Because the mutation is made to the checked-out working copy and reverted in `finally`, the accepted migration remains unchanged in Git. No M2, Step 3, T2, production or deployment authorization follows from this kill.
 
 **Evidence gaps for full audit:** retrieve numeric run ID, attempt, complete M1 log with CC-R/CC-C assertion details, explicit PostgreSQL server version, and the full three-pass baseline summaries if stronger independent reproducibility is required. These gaps do not overturn the narrow observed combined-mutant KILLED classification, but must not be silently represented as independently checked.
+
+
+## M2 rights and source-controls mutation campaign — staged (2026-10-24)
+
+**Status: NOT EXECUTION-VERIFIED; Step 2 remains NOT ACCEPTED.** M2 uses disposable PostgreSQL 16 CI databases and modifies only the temporary working copy of `db/migrations/0002_runs.up.sql`. Frozen migration 0001 and accepted product semantics remain unchanged.
+
+**Inspected baseline and invariants:**
+- M2-R: T1 must return `REJECTED / EVALUATION_NOT_ALLOWED` for the current rights version with `evaluation = DENIED`, never `RUNNING`. The `si.si_t1_rights_decision` function enforces this; T1-2 asserts the code, and the insert trigger reuses the decision.
+- M2-C: T1 and the insert trigger must refuse new attempts under `SUSPEND` and `TERMINATE_RETENTION` (Q3), consume no attempt, and permit a later first attempt after `LIFT`. T1-3 asserts these. CC-C additionally exercises concurrent control commit orders. The two suspension guards are independent; disabling only one may leave the other effective.
+
+**Frozen mutants and detector predictions (before execution):**
+1. `M2-R`: change the single `ELSIF v.evaluation <> 'ALLOWED' THEN` in `si_t1_rights_decision` to `ELSIF false THEN`. Expected: T1-2 fails its explicit `EVALUATION_NOT_ALLOWED` assertion. This isolates the rights evaluation decision, not all rights fields.
+2. `M2-C`: change **both** `IF si.si_source_suspended(NEW.source_id) THEN` and `IF si.si_source_suspended(p_source_id) THEN` to `IF false THEN`. Expected: T1-3 fails its required `SI_SOURCE_SUSPENDED` refusal and/or zero-attempt assertion. Both guards are changed to avoid a redundant safeguard masking the defect.
+
+**Execution protocol:** `tests/mutations/step2-rights-controls.mjs` requires `CI=true`, rejects `SI_PRODUCTION=1` and non-loopback hosts, checks exact mutation anchors, runs `node tests/db/run.mjs t1` for each mutant, and restores and byte-verifies migration 0002 after each run and in `finally`. It then reruns the original T1 suite to check baseline green. A mutant is KILLED only if the expected named test fails with an assertion and the mutated suite exits nonzero; SURVIVED if the mutated suite exits zero; otherwise INCONCLUSIVE. Both must be KILLED and restored baseline green for the CI step to succeed. No artificial sleeps or changes to existing tests.
+
+**Evidence pending:** GitHub Actions run URL/ID/attempt, executed SHA, actual PostgreSQL version, mutation logs, exact T1-2/T1-3 assertion outcomes, process exit codes, restoration hash and baseline TAP result. A green workflow alone is not a substitute for these. M2's result cannot be declared before execution and adjudication. Other Step 2 blockers remain open.
