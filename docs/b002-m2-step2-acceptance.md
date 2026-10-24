@@ -150,3 +150,17 @@ The revised M5 script disables **both** guards in the disposable migration and r
 The unchanged source has two independent isolation guards and two independent attempt-cap guards. This explains why a single-guard mutation may survive without demonstrating a violation. It does not replace the outstanding M1/M2/M3/M6 campaigns.
 
 Local execution was rechecked: Node.js v22.16.0 is present; Docker, Podman, `psql`, `postgres` and `initdb` are unavailable. Therefore local three-pass evidence and clean-cluster restoration remain OPEN.
+
+
+## M1 source-row-lock mutation campaign — staged (2026-10-24)
+
+**Decision remains NOT ACCEPTED; M1 is NOT VERIFIED until CI logs show the actual mutant result.**
+The founder reported three consecutive local PostgreSQL 16 runs on 2026-10-23 with 130/130 passes per run, after correcting Windows CRLF checkout of frozen 0001 and using PostgreSQL 16.15 client tools. The PowerShell transcript records successful exit checks and timestamps, but not TAP test bodies. This is local operator-reported evidence, not an independently archived full TAP log.
+
+**Inspected invariant:** In migration 0002, `si_begin_run` takes request-key advisory lock (rank 1) and explicit source `FOR KEY SHARE` (rank 3) before touching attempts (rank 4); `trg_runs_insert` independently does the same. Rights and control writers acquire the conflicting source row lock. CC-R, CC-C, and LO4 exercise both possible commit orders and lock ordering via separate database connections.
+
+**Frozen mutation and expected detection:** `tests/mutations/step2-source-lock.mjs` removes *both* explicit source `FOR KEY SHARE` clauses (T1 function and insert trigger) in a temporary migration-0002 working copy. The harness runs `node tests/db/run.mjs t1` against CI's disposable PostgreSQL 16 environment. CC-R, CC-C or LO4 must fail for the expected assertion/blocking reason; an unrelated error is INCONCLUSIVE and exit 0 is SURVIVED. Other PostgreSQL locks (for example FK locks) might still protect some schedules, so failure is a hypothesis, not presumed proof.
+
+**Safety and restoration:** the script requires `CI=true`, checks two exact mutation anchors, restores the original raw migration bytes in `finally`, checks byte identity, and never edits migration 0001. The CI workflow runs this after the established full-suite and earlier mutant steps, on its ephemeral PostgreSQL 16 service. No shared/production privileges authorized.
+
+**Evidence status:** staged in GitHub on `codex/b002-m2-acceptance` (harness commit `c986df4`, CI wiring commit `d43e47a`). The execution result, run ID, killed/survived/inconclusive classification, and baseline restoration verification must be filled from GitHub Actions before M1 can be closed. Do not infer a kill from this document or from a CI trigger alone. Other M2 blockers unchanged.
