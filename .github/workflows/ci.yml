@@ -56,7 +56,7 @@ jobs:
         run: node tests/mutations/step2-isolation.mjs
       - name: M4 attempt-limit mutant (must be killed)
         run: node tests/mutations/step2-attempt-cap.mjs
-      - name: Database logs on failure
+      - name: M1 source-row-lock mutant (must be killed)\n        run: node tests/mutations/step2-source-lock.mjs\n      - name: Database logs on failure
         if: failure()
         run: docker compose logs db
       - name: Stop database
