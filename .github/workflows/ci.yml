@@ -58,6 +58,8 @@ jobs:
         run: node tests/mutations/step2-attempt-cap.mjs
       - name: M1 source-row-lock mutant (must be killed)
         run: node tests/mutations/step2-source-lock.mjs
+      - name: M2 rights and source-controls mutants (must be killed)
+        run: node tests/mutations/step2-rights-controls.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
