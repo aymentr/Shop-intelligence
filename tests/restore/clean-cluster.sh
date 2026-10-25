@@ -75,9 +75,9 @@ import sys
 
 source = pathlib.Path(sys.argv[1]).read_text()
 pattern = re.compile(
-    r"^(GRANT\\s+si_owner\\s+TO\\s+si_migrator\\s+WITH\\s+"
-    r"INHERIT\\s+FALSE\\s*,\\s*SET\\s+TRUE\\s*,\\s*ADMIN\\s+FALSE\\s+"
-    r"GRANTED\\s+BY\\s+)si_bootstrap(\\s*;)\\s*$",
+    r"^(GRANT\s+si_owner\s+TO\s+si_migrator\s+WITH\s+"
+    r"INHERIT\s+FALSE\s*,\s*SET\s+TRUE\s*,\s*ADMIN\s+FALSE\s+"
+    r"GRANTED\s+BY\s+)si_bootstrap(\s*;)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 matches = list(pattern.finditer(source))
