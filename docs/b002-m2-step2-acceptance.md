@@ -239,3 +239,18 @@ M1 CLASSIFICATION: KILLED
 **Restoration and safety:** logs report `M2 migration restored byte-for-byte: true; sha256: 3533c0776ee35976e04d8b206e3ca89e97d2c838b3ea70ffdc8549dd9eefeae4` after **each** mutant and again after final baseline. `M2 restored baseline exit: 0 signal: null spawn error: none`, with `ok 2 - T1-2`, `ok 4 - T1-3`, `# tests 20`, `# pass 20`, `# fail 0`; `M2 restored baseline green: true`. Original migration 0001 was not changed. Mutations were applied only to temporary migration 0002 copies in CI's disposable PostgreSQL environment.
 
 **Scope:** Two representative defects were independently detected: incorrect acceptance of `DENIED` evaluation and bypass of both explicit suspension checks. This is not proof of exhaustive rights evaluation or source controls, and it does not establish that either suspension guard alone is indispensable. Other Step 2 blockers (M3/M6, clean-cluster restore, D5b production decision and release gate) remain. No Step 3, T2 or production authorization.
+
+
+## M3 lease and expiry-reaper mutation campaign — frozen before execution (2026-10-25)
+
+**Status: STAGED, NOT EXECUTION-VERIFIED; overall Step 2 remains NOT ACCEPTED.** M3 follows verified M1 and M2 mutation kills. M3 is a bounded experiment on T1 lease semantics, not Step 3 implementation.
+
+**Inspected invariants:** `si_begin_run` must reject a second attempt while an existing `RUNNING` attempt has `lease_expires_at > clock_timestamp()` (C10); after expiration it must atomically mark the old run `FAILED / LEASE_EXPIRED`, clear its lease token and create attempt 2 (C10); a later `SUSPEND` refusal must roll back the expiry transition (EC5). T1-6 asserts all three behaviors. The original five-minute lease interval is separately asserted in T1-1. T1-6's forced expiry is a documented test-only owner helper, not an implemented production reaper.
+
+**Frozen independent mutations and predicted detectors:**
+1. `M3-LIVE`: change the unique live-run predicate `x.lease_expires_at > clock_timestamp()` to `< clock_timestamp()` in the T1 `SI_RUN_IN_PROGRESS` branch. Expect T1-6 to fail its rejection of a second attempt with an unexpired lease. The alternate attempt may be blocked by a different constraint, in which case inspect the actual assertion rather than presuming unsafe insertion.
+2. `M3-REAP`: change the unique expired-run update predicate `x.lease_expires_at <= clock_timestamp()` to `> clock_timestamp()`. Expect T1-6 to fail its expected `FAILED / LEASE_EXPIRED` transition or attempt-2 behavior.
+
+**Protocol:** `tests/mutations/step2-lease.mjs` applies exactly one SQL mutation at a time to the CI working copy of migration `0002_runs.up.sql`, runs `node tests/db/run.mjs t1` against the disposable PostgreSQL 16 test service, records the T1-6 named assertion and exit code, and restores original migration bytes in `finally` after each mutation and again at end. It refuses non-CI, production-mode and non-loopback test host execution. It then runs the unmutated T1 suite and requires a green baseline. KILLED requires named T1-6 failure and an assertion plus nonzero exit; zero exit is SURVIVED; unrelated failures, spawn errors and timeouts are INCONCLUSIVE. A CI success alone does not replace log adjudication.
+
+**Pending evidence:** workflow run URL/ID/attempt, exact commit SHA, PostgreSQL server version, M3-LIVE/M3-REAP detector output, process exit codes, restored migration SHA-256, and green T1 baseline. No M6, fresh-cluster restoration, D5b production change, Step 3, T2 or deployment authorized.
