@@ -82,6 +82,20 @@ pattern = re.compile(
 )
 matches = list(pattern.finditer(source))
 if len(matches) != 1:
+    # Show only the relevant role-grant statements; never print global SQL
+    # because it may contain credentials or unrelated sensitive settings.
+    grant_lines = [
+        line.strip() for line in source.splitlines()
+        if re.match(r"^\\s*GRANT\\s+", line, re.IGNORECASE)
+        and ("si_owner" in line or "si_migrator" in line)
+    ]
+    print("DR-1 owner membership grant candidates:", len(grant_lines))
+    for line in grant_lines[:5]:
+        # Only expected membership grammar is allowed in diagnostics.
+        if re.fullmatch(r"[A-Za-z0-9_,;\\s]+(?:GRANTED BY [A-Za-z0-9_]+)?", line, re.IGNORECASE):
+            print("DR-1 membership candidate:", line)
+        else:
+            print("DR-1 membership candidate: [unexpected syntax; withheld]")
     raise SystemExit(f"DR-1 unexpected membership grant count/format: {len(matches)}")
 updated = pattern.sub(r"\\g<1>si_restore_admin\\g<2>", source, count=1)
 pathlib.Path(sys.argv[2]).write_text(updated)
