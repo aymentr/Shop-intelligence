@@ -64,9 +64,32 @@ target_sysid="$(dst pg_controldata /var/lib/postgresql/data | sed -n 's/^Databas
 }
 echo 'DR-1 independent PostgreSQL cluster identifiers: DIFFERENT'
 
+# A clean cluster has a different bootstrap superuser. PostgreSQL 16
+# includes the original membership grantor in pg_dumpall output. Rewrite
+# ONLY the expected owner-to-migrator grantor for the recovery operator;
+# require exactly one matching grant and preserve all membership flags.
+python3 - "$tmp/globals.sql" "$tmp/globals-restorable.sql" <<'PY'
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+pattern = re.compile(
+    r"^(GRANT\\s+si_owner\\s+TO\\s+si_migrator\\s+WITH\\s+"
+    r"INHERIT\\s+FALSE\\s*,\\s*SET\\s+TRUE\\s*,\\s*ADMIN\\s+FALSE\\s+"
+    r"GRANTED\\s+BY\\s+)si_bootstrap(\\s*;)\\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+matches = list(pattern.finditer(source))
+if len(matches) != 1:
+    raise SystemExit(f"DR-1 unexpected membership grant count/format: {len(matches)}")
+updated = pattern.sub(r"\\g<1>si_restore_admin\\g<2>", source, count=1)
+pathlib.Path(sys.argv[2]).write_text(updated)
+print("DR-1 normalized exactly one membership grantor for recovery")
+PY
 docker exec -i -e PGPASSWORD=local-test-only "$name" \
   psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U si_restore_admin -d postgres \
-  < "$tmp/globals.sql" > "$tmp/globals-restore.out"
+  < "$tmp/globals-restorable.sql" > "$tmp/globals-restore.out"
 echo 'DR-1 global roles/settings/memberships restored'
 docker exec -i -e PGPASSWORD=local-test-only "$name" \
   pg_restore --exit-on-error -h 127.0.0.1 -U si_restore_admin -d postgres --create \
