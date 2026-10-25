@@ -86,13 +86,13 @@ if len(matches) != 1:
     # because it may contain credentials or unrelated sensitive settings.
     grant_lines = [
         line.strip() for line in source.splitlines()
-        if re.match(r"^\\s*GRANT\\s+", line, re.IGNORECASE)
+        if re.match(r"^\s*GRANT\s+", line, re.IGNORECASE)
         and ("si_owner" in line or "si_migrator" in line)
     ]
     print("DR-1 owner membership grant candidates:", len(grant_lines))
     for line in grant_lines[:5]:
         # Only expected membership grammar is allowed in diagnostics.
-        if re.fullmatch(r"[A-Za-z0-9_,;\\s]+(?:GRANTED BY [A-Za-z0-9_]+)?", line, re.IGNORECASE):
+        if re.fullmatch(r"[A-Za-z0-9_,;\s]+(?:GRANTED BY [A-Za-z0-9_]+)?", line, re.IGNORECASE):
             print("DR-1 membership candidate:", line)
         else:
             print("DR-1 membership candidate: [unexpected syntax; withheld]")
