@@ -64,6 +64,8 @@ jobs:
         run: node tests/mutations/step2-lease.mjs
       - name: M6 privilege-boundary mutants (must be killed)
         run: node tests/mutations/step2-privilege-boundary.mjs
+      - name: DR-1 independent clean-cluster restore (mandatory)
+        run: bash tests/restore/clean-cluster.sh
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
