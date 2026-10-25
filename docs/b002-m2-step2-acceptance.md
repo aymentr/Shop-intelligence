@@ -302,3 +302,24 @@ M1 CLASSIFICATION: KILLED
 **Scope and limitations:** These are independently executed representative mutation kills proving the privilege assertions detect the specific new grants. They do not prove a successful unauthorized UPDATE of protected data, execution of `si_begin_run` by the retention role, or exhaustive resistance to all privilege escalation paths. No production privilege grants were committed. PostgreSQL major version 16 is provisioned by CI; exact minor version not established from this excerpt.
 
 **Remaining acceptance gates:** fresh independent PostgreSQL 16 cluster restore of global roles/configuration plus database-local ACLs and objects; explicit founder D5b production hardening strategy and verified enforceability; final evidence reconciliation and release decision. Existing D8 production-serving prohibition remains. Do not advance to Step 3, T2, migrations 0003/0004, live collection, merge or deployment on M6 evidence alone.
+
+
+## DR-1 independent PostgreSQL 16 clean-cluster restore — pre-execution frozen protocol (2026-10-25)
+
+**Status: NOT EXECUTED. Overall Step 2: NOT ACCEPTED.** Goal: demonstrate a complete logical recovery into a **second PostgreSQL server process and separate data directory**, not a new database in the original cluster. This is development/operational evidence only, not production disaster-recovery certification.
+
+**Source:** CI's disposable PostgreSQL 16.15 cluster, database `si_template_test` after baseline migration 0001+0002. Source receives D5b advisory hardening **only after the mutation campaigns**, and only inside the disposable CI cluster. The D5b founder production decision remains OPEN: this test is not authorization to harden shared or production systems.
+
+**Restore inputs:** `pg_dumpall --globals-only --no-role-passwords` for cluster roles/memberships/settings (password hashes intentionally excluded), plus `pg_dump -Fc --create` for the source database, including schema objects, migrations, data, ACLs, default privileges, and PostgreSQL function ACL changes. Do not substitute a same-cluster clone or re-bootstrap the restored objects. The recovery operator must separately provision new login credentials, test-only in CI.
+
+**Independent target:** a newly started isolated PostgreSQL 16.15 container with an empty independent data directory, its own bootstrap superuser, distinct loopback port, `track_commit_timestamp=on`, and no shared source volume. CI must always destroy the target container and temporary dump artifacts. Refuse non-CI or production-mode execution. Use fail-fast SQL clients and abort on any failed dump, restore, preflight, comparison or test.
+
+**Frozen acceptance criteria:**
+1. Prove distinct cluster system identifiers and PostgreSQL major 16; source and target both report `track_commit_timestamp=on`.
+2. Restore global roles/settings/membership before the database; verify `si_owner` has **only** the `si_migrator` membership with SET true, INHERIT false, ADMIN false. Verify role security attributes and configured role session settings.
+3. Restore the complete database from archive, with no reapplication of migration 0001/0002. Compare source/target normalized schema+privilege inventory, including schema, tables, routines, ACLs, default ACLs, migrations and D5b advisory function privileges. Any meaningful mismatch fails the gate.
+4. Independently run `preflight --production` against the restored database; require success. Run the existing G1/SD1 privilege tests against clones of the restored template and require all passing. These tests must not overwrite the restored template.
+5. Record exact CI run/attempt, executed commit, dump/restore command exit codes, comparison evidence, preflight, tests and cleanup. Never print password hashes or raw dump contents in logs.
+6. Classify `PASS` only if every criterion succeeds. Otherwise `FAIL` or `INCONCLUSIVE` with precise reason. CI success alone is not a substitute for examining execution logs.
+
+**Limitations:** a single clean restore does not prove recovery time objectives, large datasets, WAL/PITR, cross-provider compatibility, or production ability to modify `pg_catalog` ownership-dependent ACLs. The D5b deployment decision, fail-closed startup enforcement and D8 serving prohibition remain independent blockers.
