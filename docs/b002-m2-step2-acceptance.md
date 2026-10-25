@@ -270,3 +270,18 @@ M1 CLASSIFICATION: KILLED
 - Unmutated T1 suite after restoration: exit **0**, **20 tests / 20 passed / 0 failed**. Final log: `M3 RESULT: both representative lease mutants KILLED; baseline green`.
 
 **Adjudication boundaries:** These are two meaningful, separately killed mutants. They do not demonstrate that duplicate active attempts were inserted, all lease timings are covered, or a production reaper exists. The CI workflow uses PostgreSQL major version 16; the precise server minor version was not established from the inspected log. The other Step 2 gates (M6, clean-cluster restore, D5b decision and release restrictions) remain open. No Step 3, T2, production migration, deployment or merge is authorized.
+
+
+## M6 privilege-boundary mutation campaign — frozen before execution (2026-10-25)
+
+**Status: STAGED / NOT EXECUTION-VERIFIED. Overall Step 2: NOT ACCEPTED.** The M6 campaign tests whether the existing real-database privilege checks detect explicit grants that break least privilege. It does **not** test an exploit, and a mutated grant alone is not proof of a successful unauthorized state transition.
+
+**Inspected invariants:** application role `si_collector` has SELECT but no direct INSERT/UPDATE/DELETE/TRUNCATE on `si.collection_runs`; it starts runs only through the SECURITY DEFINER `si_begin_run` function. The collector is the sole application-role EXECUTE grantee of `si_begin_run`. `tests/db/privileges.test.mjs` asserts the entire role × table × privilege matrix in G1, attempts a forbidden collector UPDATE, and asserts exact SECURITY DEFINER grantees in SD1.
+
+**Frozen independent mutants and predictions:**
+1. `M6-WRITE`: add `GRANT UPDATE ON si.collection_runs TO si_collector;` after the unique run-error SELECT grant in the temporary working copy of migration 0002. Expected detector: `G1: table privileges match the grant matrix exactly` (and possibly the second G1 negative write check). This deliberately creates an effective unauthorized table privilege; constraints/triggers may still reject particular data modifications.
+2. `M6-EXEC`: add `GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_retention;` after the existing collector grant in temporary migration 0002. Expected detector: `SD1: SECURITY DEFINER contract` exact grantee assertion. This tests a new unauthorized entry point, not privilege escalation to `si_owner`.
+
+**Protocol:** `tests/mutations/step2-privilege-boundary.mjs` requires `CI=true`, refuses `SI_PRODUCTION=1` and non-loopback test hosts, requires exactly one anchor per mutation, and executes `node tests/db/run.mjs privileges` against the disposable CI PostgreSQL 16 cluster. Each mutant is restored byte-for-byte in `finally`, and the original privileges suite is rerun to verify a green baseline. KILLED requires the expected named G1/SD1 assertion failure and nonzero suite exit; SURVIVED requires a zero exit; unrelated failure, timeout, spawn error or absent named detector is INCONCLUSIVE. The full 130-test suite is run three times earlier in CI.
+
+**Evidence pending:** GitHub Actions run URL/ID/attempt, executed SHA, M6-WRITE and M6-EXEC named assertion outputs and exit codes, restored migration hash, baseline privilege-suite summary and independently confirmed integration status. No clean-cluster restore, D5b production decision, Step 3, T2, migration 0003/0004, live collection or deployment is authorized.
