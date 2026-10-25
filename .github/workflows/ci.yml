@@ -62,6 +62,8 @@ jobs:
         run: node tests/mutations/step2-rights-controls.mjs
       - name: M3 lease and expiry mutants (must be killed)
         run: node tests/mutations/step2-lease.mjs
+      - name: M6 privilege-boundary mutants (must be killed)
+        run: node tests/mutations/step2-privilege-boundary.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
