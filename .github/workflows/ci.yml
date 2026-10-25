@@ -60,6 +60,8 @@ jobs:
         run: node tests/mutations/step2-source-lock.mjs
       - name: M2 rights and source-controls mutants (must be killed)
         run: node tests/mutations/step2-rights-controls.mjs
+      - name: M3 lease and expiry mutants (must be killed)
+        run: node tests/mutations/step2-lease.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db
