@@ -254,3 +254,19 @@ M1 CLASSIFICATION: KILLED
 **Protocol:** `tests/mutations/step2-lease.mjs` applies exactly one SQL mutation at a time to the CI working copy of migration `0002_runs.up.sql`, runs `node tests/db/run.mjs t1` against the disposable PostgreSQL 16 test service, records the T1-6 named assertion and exit code, and restores original migration bytes in `finally` after each mutation and again at end. It refuses non-CI, production-mode and non-loopback test host execution. It then runs the unmutated T1 suite and requires a green baseline. KILLED requires named T1-6 failure and an assertion plus nonzero exit; zero exit is SURVIVED; unrelated failures, spawn errors and timeouts are INCONCLUSIVE. A CI success alone does not replace log adjudication.
 
 **Pending evidence:** workflow run URL/ID/attempt, exact commit SHA, PostgreSQL server version, M3-LIVE/M3-REAP detector output, process exit codes, restored migration SHA-256, and green T1 baseline. No M6, fresh-cluster restoration, D5b production change, Step 3, T2 or deployment authorized.
+
+
+## M3 final adjudication — CI #65 (2026-10-25)
+
+**M3-LIVE: KILLED. M3-REAP: KILLED. Step 2: NOT ACCEPTED.** This supersedes the preceding M3 staged/not-verified status. The following is grounded in independently retrieved GitHub Actions run metadata, integration job steps and full job log.
+
+- Workflow: https://github.com/aymentr/Shop-intelligence/actions/runs/40184884808 ; run ID `40184884808`, run number **65**, attempt **1**, push, conclusion **success**.
+- Executed commit: `94fd625607bc2f3a44d7b9a8ccb1c0a8e47d973b` on `codex/b002-m2-acceptance`.
+- Integration job ID: `121143477373`; job conclusion **success**. Node 22 and Node 24 jobs also succeeded.
+- Baseline full PostgreSQL acceptance suite: **three passes, each 130 tests / 130 passed / 0 failed**, independently visible in job logs.
+- `M3-LIVE`: inverted T1's live-lease predicate. Mutated T1 suite exit **1**, **20 tests / 16 passed / 4 failed**. Named T1-6 assertion failed: expected SQLSTATE `23514` (`SI_RUN_IN_PROGRESS`) but received `23505` (unique violation). C5, LO4 and LIB also failed. This proves the named detector catches the wrong live-lease decision, although a database uniqueness constraint still prevents duplicate RUNNING rows in this scenario.
+- `M3-REAP`: inverted the expired-run UPDATE predicate. Mutated T1 suite exit **1**, **20 tests / 18 passed / 2 failed**. Named T1-6 failed with `23505` duplicate key on `runs_one_running` instead of the expected failed-old-attempt/new-attempt transition. LO4 also failed.
+- After each mutation, and at final exit, the script printed `M3 migration restored byte-for-byte: true`, SHA-256 `3533c0776ee35976e04d8b206e3ca89e97d2c838b3ea70ffdc8549dd9eefeae4`.
+- Unmutated T1 suite after restoration: exit **0**, **20 tests / 20 passed / 0 failed**. Final log: `M3 RESULT: both representative lease mutants KILLED; baseline green`.
+
+**Adjudication boundaries:** These are two meaningful, separately killed mutants. They do not demonstrate that duplicate active attempts were inserted, all lease timings are covered, or a production reaper exists. The CI workflow uses PostgreSQL major version 16; the precise server minor version was not established from the inspected log. The other Step 2 gates (M6, clean-cluster restore, D5b decision and release restrictions) remain open. No Step 3, T2, production migration, deployment or merge is authorized.
