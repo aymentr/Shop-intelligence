@@ -285,3 +285,20 @@ M1 CLASSIFICATION: KILLED
 **Protocol:** `tests/mutations/step2-privilege-boundary.mjs` requires `CI=true`, refuses `SI_PRODUCTION=1` and non-loopback test hosts, requires exactly one anchor per mutation, and executes `node tests/db/run.mjs privileges` against the disposable CI PostgreSQL 16 cluster. Each mutant is restored byte-for-byte in `finally`, and the original privileges suite is rerun to verify a green baseline. KILLED requires the expected named G1/SD1 assertion failure and nonzero suite exit; SURVIVED requires a zero exit; unrelated failure, timeout, spawn error or absent named detector is INCONCLUSIVE. The full 130-test suite is run three times earlier in CI.
 
 **Evidence pending:** GitHub Actions run URL/ID/attempt, executed SHA, M6-WRITE and M6-EXEC named assertion outputs and exit codes, restored migration hash, baseline privilege-suite summary and independently confirmed integration status. No clean-cluster restore, D5b production decision, Step 3, T2, migration 0003/0004, live collection or deployment is authorized.
+
+
+## M6 final adjudication — CI #69 (2026-10-25)
+
+**M6-WRITE: KILLED. M6-EXEC: KILLED. Overall Step 2: NOT ACCEPTED.** This supersedes the earlier staged/pending M6 status. Results below were independently checked using GitHub Actions run metadata, job summaries and integration logs.
+
+- Workflow: https://github.com/aymentr/Shop-intelligence/actions/runs/40185887114 ; run ID `40185887114`, number **69**, attempt **1**, push, conclusion **success**.
+- Executed commit: `f16b4b304b3be4e19367b81e077f61df2d68323b`, branch `codex/b002-m2-acceptance`. Integration job ID `121146451027` succeeded, as did Node 22 and Node 24 test jobs.
+- Three full PostgreSQL acceptance passes: **130/130 passed, 0 failed**, each.
+- `M6-WRITE`: inserted `GRANT UPDATE ON si.collection_runs TO si_collector` in disposable migration 0002. Mutated privileges suite exited **1** with **14 tests, 12 passed, 2 failed**. G1 table-level grant matrix failed (`ERR_ASSERTION`), and G1 no-application-role-write privilege check failed with `expected: false`, `actual: true`. Named detector true; classification **KILLED**.
+- `M6-EXEC`: inserted `GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_retention` in disposable migration 0002. Mutated privileges suite exited **1** with **14 tests, 13 passed, 1 failed**. SD1 exact SECURITY DEFINER grant contract failed (`ERR_ASSERTION`); named detector true; classification **KILLED**.
+- After each mutant and at final exit, harness printed `M6 migration restored byte-for-byte: true` with SHA-256 `3533c0776ee35976e04d8b206e3ca89e97d2c838b3ea70ffdc8549dd9eefeae4`.
+- Restored privileges suite: exit **0**, **14/14 passed, 0 failed**. Final line: `M6 RESULT: both representative privilege mutants KILLED; baseline green`.
+
+**Scope and limitations:** These are independently executed representative mutation kills proving the privilege assertions detect the specific new grants. They do not prove a successful unauthorized UPDATE of protected data, execution of `si_begin_run` by the retention role, or exhaustive resistance to all privilege escalation paths. No production privilege grants were committed. PostgreSQL major version 16 is provisioned by CI; exact minor version not established from this excerpt.
+
+**Remaining acceptance gates:** fresh independent PostgreSQL 16 cluster restore of global roles/configuration plus database-local ACLs and objects; explicit founder D5b production hardening strategy and verified enforceability; final evidence reconciliation and release decision. Existing D8 production-serving prohibition remains. Do not advance to Step 3, T2, migrations 0003/0004, live collection, merge or deployment on M6 evidence alone.
