@@ -397,6 +397,89 @@ BEGIN
 END $$;
 
 ------------------------------------------------------------------------------------------
+-- STEP 3 (slice 2): lifecycle boundary, invoked as the caller (not as definer).
+-- T1's owner-side expired-lease reaper remains valid; no application direct
+-- UPDATE privilege is granted. Step 4 will introduce the completion protocol.
+------------------------------------------------------------------------------------------
+CREATE FUNCTION si.trg_runs_transition() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp AS $run_transition$
+DECLARE
+  now_at timestamptz := clock_timestamp();
+BEGIN
+  IF ROW(NEW.run_id, NEW.source_id, NEW.request_key, NEW.request_sha256,
+         NEW.attempt, NEW.rights_version_id, NEW.conflict_policy,
+         NEW.started_at, NEW.start_control_seq)
+     IS DISTINCT FROM
+     ROW(OLD.run_id, OLD.source_id, OLD.request_key, OLD.request_sha256,
+         OLD.attempt, OLD.rights_version_id, OLD.conflict_policy,
+         OLD.started_at, OLD.start_control_seq) THEN
+    RAISE EXCEPTION 'SI_RUN_IDENTITY_IMMUTABLE' USING ERRCODE = '23514';
+  END IF;
+
+  IF OLD.status IN ('REJECTED', 'FAILED', 'COMPLETED') THEN
+    -- A separate future retention operation may update retention columns,
+    -- but no status/counter/decision changes are permitted here.
+    IF NEW.status IS DISTINCT FROM OLD.status OR
+       ROW(NEW.received_count, NEW.published_count, NEW.duplicate_count,
+           NEW.conflict_count, NEW.suppressed_count, NEW.error_count,
+           NEW.outcome_code, NEW.finished_at, NEW.lease_token,
+           NEW.lease_expires_at, NEW.rights_checked_at, NEW.publish_control_seq)
+       IS DISTINCT FROM
+       ROW(OLD.received_count, OLD.published_count, OLD.duplicate_count,
+           OLD.conflict_count, OLD.suppressed_count, OLD.error_count,
+           OLD.outcome_code, OLD.finished_at, OLD.lease_token,
+           OLD.lease_expires_at, OLD.rights_checked_at, OLD.publish_control_seq) THEN
+      RAISE EXCEPTION 'SI_RUN_TERMINAL_IMMUTABLE' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF OLD.status <> 'RUNNING' OR NEW.status NOT IN ('RUNNING', 'FAILED', 'COMPLETED') THEN
+    RAISE EXCEPTION 'SI_RUN_INVALID_TRANSITION' USING ERRCODE = '23514';
+  END IF;
+
+  IF NEW.status = 'RUNNING' THEN
+    IF NEW.lease_token IS DISTINCT FROM OLD.lease_token OR
+       NEW.lease_expires_at IS NULL OR
+       NEW.lease_expires_at <= now_at OR
+       NEW.lease_expires_at > now_at + interval '5 minutes' OR
+       NEW.outcome_code IS NOT NULL OR NEW.finished_at IS NOT NULL OR
+       ROW(NEW.received_count, NEW.published_count, NEW.duplicate_count,
+           NEW.conflict_count, NEW.suppressed_count, NEW.error_count,
+           NEW.rights_checked_at, NEW.publish_control_seq)
+       IS DISTINCT FROM
+       ROW(OLD.received_count, OLD.published_count, OLD.duplicate_count,
+           OLD.conflict_count, OLD.suppressed_count, OLD.error_count,
+           OLD.rights_checked_at, OLD.publish_control_seq) THEN
+      -- Owner fixture shortcuts can expire a lease to test T1, but only
+      -- through an explicit owner session, never a collector.
+      IF current_user <> 'si_owner' OR
+         NEW.lease_expires_at >= now_at OR
+         NEW.lease_token IS DISTINCT FROM OLD.lease_token THEN
+        RAISE EXCEPTION 'SI_RUN_INVALID_HEARTBEAT' USING ERRCODE = '23514';
+      END IF;
+    END IF;
+  ELSIF NEW.status = 'FAILED' THEN
+    IF NEW.outcome_code IS NULL THEN
+      RAISE EXCEPTION 'SI_RUN_FAILURE_CODE_REQUIRED' USING ERRCODE = '23514';
+    END IF;
+    NEW.finished_at := now_at;
+    NEW.lease_token := NULL;
+    NEW.lease_expires_at := NULL;
+    NEW.publish_control_seq := NULL;
+  ELSE
+    IF current_user <> 'si_owner' THEN
+      RAISE EXCEPTION 'SI_RUN_COMPLETION_FORBIDDEN' USING ERRCODE = '42501';
+    END IF;
+  END IF;
+  RETURN NEW;
+END $run_transition$;
+
+CREATE TRIGGER trg_runs_transition BEFORE UPDATE ON si.collection_runs
+FOR EACH ROW EXECUTE FUNCTION si.trg_runs_transition();
+
+------------------------------------------------------------------------------------------
 -- STEP 3 (slice 1): no run may be deleted or truncated. SECURITY INVOKER by default.
 -- Historical run attempts are durable audit evidence; expiry and failure transition
 -- status instead of deleting the record. These guards also apply to si_owner.
@@ -426,6 +509,6 @@ GRANT SELECT ON si.run_errors TO si_retention;
 REVOKE ALL ON FUNCTION
   si.si_request_lock_namespace(), si.si_request_lock_key(text, text), si.si_lock_request_key(text, text),
   si.si_run_lease(), si.si_t1_rights_decision(text, timestamptz, text, text[]), si.trg_runs_insert(),
-  si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete()
+  si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete(), si.trg_runs_transition()
 FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_collector;
