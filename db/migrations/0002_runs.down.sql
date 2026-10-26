@@ -3,6 +3,7 @@
 DROP TABLE si.run_errors;
 DROP TABLE si.publication_receipts;
 DROP TABLE si.collection_runs;
+DROP FUNCTION si.trg_runs_no_delete();
 
 DROP FUNCTION si.si_begin_run(text, text, text, text, text[]);
 DROP FUNCTION si.trg_runs_insert();
