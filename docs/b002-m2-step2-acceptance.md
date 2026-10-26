@@ -323,3 +323,25 @@ M1 CLASSIFICATION: KILLED
 6. Classify `PASS` only if every criterion succeeds. Otherwise `FAIL` or `INCONCLUSIVE` with precise reason. CI success alone is not a substitute for examining execution logs.
 
 **Limitations:** a single clean restore does not prove recovery time objectives, large datasets, WAL/PITR, cross-provider compatibility, or production ability to modify `pg_catalog` ownership-dependent ACLs. The D5b deployment decision, fail-closed startup enforcement and D8 serving prohibition remain independent blockers.
+
+
+## DR-1 final execution adjudication — CI #78 (2026-10-26)
+
+**DR-1: PASS on disposable PostgreSQL 16.15. Overall Step 2: NOT ACCEPTED pending explicit D5b founder decision and final acceptance review.** This section supersedes the earlier DR-1 NOT EXECUTED status above, preserving that section as the pre-execution frozen protocol.
+
+**Independent CI evidence:** https://github.com/aymentr/Shop-intelligence/actions/runs/40295736469 — workflow run **#78**, ID `40295736469`, attempt **1**, push commit `02b7423bccd1c162ae7f940ed591917a614b580d` on `codex/b002-m2-acceptance`; conclusion **success**. Integration job `121481218947`, Node 22, and Node 24 jobs all succeeded. Full integration suite: **130/130 passed, three times**.
+
+**Observed DR-1 checkpoints in integration job logs:**
+1. D5b fixture applied only to disposable source; globals and database archives created, with passwords withheld.
+2. Source and target PostgreSQL cluster system identifiers confirmed **different**.
+3. Exactly one owner membership grantor normalized for the independent recovery administrator. PostgreSQL 16 dump uses `GRANT si_owner TO si_migrator WITH INHERIT FALSE GRANTED BY si_bootstrap;`; the restore procedure adjusts only its grantor, retaining membership semantics. Global roles, settings and memberships restored.
+4. Database archive restored into independent target **without bootstrap or rerunning migrations**. Test-only passwords re-provisioned.
+5. Both servers verified PostgreSQL **16**, `track_commit_timestamp=on`. The preflight reported version number `160015` (PostgreSQL 16.15).
+6. Source/target role attributes, session settings and exclusive owner membership matched, including the exact `si_owner|si_migrator|f|f|t` (ADMIN false, INHERIT false, SET true) assertion.
+7. Source/target schema serialization matched, including migrations, grants, default ACLs and D5b function ACLs.
+8. Restored production-mode D5b/D7 preflight **PASS**, including zero PUBLIC/application advisory exposures and effective owner/migrator advisory-lock privileges.
+9. Restored-cluster G1/SD1 privilege regression suite **14/14 PASS**, zero failures; script emitted `DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)`. CI's EXIT cleanup trap removes temporary target container and backup artifacts.
+
+**Earlier attempts:** #73–#77 failed during global membership-grant restoration/format matching; their failure classifications are not retroactively changed. CI #78 establishes success for the corrected script at the stated commit. A passing DR-1 test is not a production recovery certification: no recovery time/point objective, WAL/PITR, large-scale data, alternate provider, or real production host compatibility was validated.
+
+**Remaining release gates:** founder must explicitly select D5b production strategy; chosen infrastructure must demonstrate the required `pg_catalog` privilege controls; trusted production configuration and every future serving/collector entry point must fail closed if `preflight --production` is not satisfied. The D8 serving prohibition remains independent. Final acceptance review must reconcile historical statuses and verify the chosen gate; no Step 3, T2, migrations 0003/0004, live collection, merge or deployment authorized yet.
