@@ -3,9 +3,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { assertOperationalPreconditions, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from '../../dist/persistence/preconditions.js';
 import { cfg, connect, freshDatabase } from './helpers.mjs';
+import { assertProductionReady } from '../../dist/persistence/production-readiness.js';
 
 const cleanups = [];
 const fileScope = { after: fn => cleanups.push(fn) };
@@ -73,4 +75,47 @@ test('D5b production CLI status rejects a database without advisory hardening', 
   assert.notEqual(r.status, 0, r.stdout + r.stderr);
   assert.match(r.stderr, /PRODUCTION_PREFLIGHT_FAILED/);
   assert.match(r.stderr, /advisory_public_exposures/);
+});
+
+test('D5b decision A: shared readiness rejects unhardened database and query failures', async () => {
+  const client = await connect({ database: db });
+  try {
+    await assert.rejects(assertProductionReady(client), /PRODUCTION_PREFLIGHT_FAILED: .*advisory_public_exposures/);
+  } finally { await client.end(); }
+  await assert.rejects(
+    assertProductionReady({ query: async () => { throw new Error('database unavailable'); } }),
+    /database unavailable/
+  );
+  await assert.rejects(
+    assertProductionReady({ query: async () => ({ rows: [] }) }),
+    /PRECONDITIONS_FAILED/
+  );
+});
+
+test('D5b decision A: explicit preflight --production fails even without SI_PRODUCTION', () => {
+  const cli = fileURLToPath(new URL('../../dist/persistence/cli.js', import.meta.url));
+  const url = `postgres://${cfg.adminUser}:${encodeURIComponent(cfg.adminPassword)}@${cfg.host}:${cfg.port}/${db}`;
+  const env = { ...process.env, SI_DATABASE_URL: url };
+  delete env.SI_PRODUCTION;
+  const r = spawnSync(process.execPath, [cli, 'preflight', '--production'], { encoding: 'utf8', env });
+  assert.notEqual(r.status, 0, r.stdout + r.stderr);
+  assert.match(r.stderr, /PRODUCTION_PREFLIGHT_FAILED/);
+  assert.match(r.stderr, /advisory_public_exposures/);
+});
+
+test('D5b decision A: hardened disposable database passes shared readiness and production preflight', async t => {
+  const hardened = await freshDatabase(t, 'd5bgate');
+  const client = await connect({ database: hardened });
+  try {
+    const sql = readFileSync(new URL('../../db/bootstrap/optional/advisory-lock-hardening.sql', import.meta.url), 'utf8');
+    await client.query(sql); // disposable test database, pg_catalog owner only
+    await assertProductionReady(client);
+  } finally { await client.end(); }
+  const cli = fileURLToPath(new URL('../../dist/persistence/cli.js', import.meta.url));
+  const url = `postgres://${cfg.adminUser}:${encodeURIComponent(cfg.adminPassword)}@${cfg.host}:${cfg.port}/${hardened}`;
+  const env = { ...process.env, SI_DATABASE_URL: url };
+  delete env.SI_PRODUCTION;
+  const r = spawnSync(process.execPath, [cli, 'preflight', '--production'], { encoding: 'utf8', env });
+  assert.equal(r.status, 0, r.stdout + r.stderr);
+  assert.equal((r.stdout.match(/^ok /gm) ?? []).length, 9, r.stdout);
 });
