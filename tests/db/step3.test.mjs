@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { asOwner, createSources, freshDatabase, recordRights, rejects, roles } from './helpers.mjs';
+import { heartbeatRun, failRun } from '../../dist/persistence/runs.js';
 
 const cleanups = [];
 const scope = { after: fn => cleanups.push(fn) };
@@ -79,4 +80,37 @@ test('S3-4: transition trigger is SECURITY INVOKER, and oversized heartbeat is r
   await rejects(assert, asOwner(c.admin, x =>
     x.query("UPDATE si.collection_runs SET lease_expires_at = clock_timestamp() + interval '20 minutes' WHERE run_id = $1", [started.rows[0].run_id])),
   { code: '23514', message: /SI_RUN_INVALID_HEARTBEAT/ });
+});
+
+test('S3-5: heartbeat requires a live matching token; failure is terminal and idempotent', async () => {
+  const started = (await c.si_collector.query(
+    'SELECT * FROM si.si_begin_run($1,$2,$3,$4,$5::text[])',
+    ['step3-source', 'step3-ops', 'e'.repeat(64), 'SYNTHETIC', ['META']]
+  )).rows[0];
+  const id = started.run_id, token = started.lease_token;
+  assert.equal(await heartbeatRun(c.si_collector, id, '00000000-0000-0000-0000-000000000000'), false);
+  assert.equal(await heartbeatRun(c.si_collector, id, token), true);
+  assert.equal(await failRun(c.si_collector, id, token, 'SOURCE_ERROR'), true);
+  assert.equal(await failRun(c.si_collector, id, token, 'SOURCE_ERROR'), false);
+  assert.equal(await heartbeatRun(c.si_collector, id, token), false);
+  const row = (await c.admin.query(
+    'SELECT status, outcome_code, finished_at, lease_token FROM si.collection_runs WHERE run_id = $1', [id])).rows[0];
+  assert.equal(row.status, 'FAILED');
+  assert.equal(row.outcome_code, 'SOURCE_ERROR');
+  assert.ok(row.finished_at);
+  assert.equal(row.lease_token, null);
+});
+
+test('S3-6: expired token cannot be renewed or used to fail with an unrelated code', async () => {
+  const started = (await c.si_collector.query(
+    'SELECT * FROM si.si_begin_run($1,$2,$3,$4,$5::text[])',
+    ['step3-source', 'step3-expired', 'f'.repeat(64), 'SYNTHETIC', ['META']]
+  )).rows[0];
+  const id = started.run_id, token = started.lease_token;
+  await asOwner(c.admin, x => x.query(
+    "UPDATE si.collection_runs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE run_id = $1", [id]));
+  assert.equal(await heartbeatRun(c.si_collector, id, token), false);
+  assert.equal(await failRun(c.si_collector, id, token, 'SOURCE_ERROR'), false);
+  assert.equal(await failRun(c.si_collector, id, token, 'LEASE_EXPIRED'), true);
+  assert.equal((await c.admin.query('SELECT outcome_code FROM si.collection_runs WHERE run_id = $1', [id])).rows[0].outcome_code, 'LEASE_EXPIRED');
 });
