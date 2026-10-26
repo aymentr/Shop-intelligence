@@ -366,3 +366,26 @@ M1 CLASSIFICATION: KILLED
 5. Record the hosting prerequisites, trusted deployment configuration requirement, independent startup-test obligation, rollback/runbook, and a **no-deploy** verdict.
 
 **Current status:** founder decision A recorded; production hosting capability and actual runtime startup enforcement are **NOT VERIFIED**. Overall Step 2 remains **NOT ACCEPTED** until bounded implementation, CI adjudication and final review.
+
+
+## Final bounded Step 2 acceptance review — 2026-10-26
+
+**Decision: ACCEPTED FOR CONTINUED DEVELOPMENT ONLY, WITH EXPLICIT PRODUCTION RESTRICTIONS.** This final dated review supersedes historical NOT ACCEPTED summaries above *for the Step 2 development gate only*; it does not erase prior failures, authorize deployment, or amend the frozen rev-2 transaction invariants.
+
+**Verified final implementation CI:** https://github.com/aymentr/Shop-intelligence/actions/runs/40300444065 — CI #84, attempt 1, executed SHA `7babd56a76f6b4bfde7b2896cc22d680b18afac0`, conclusion SUCCESS. Node 22, Node 24, and PostgreSQL integration jobs passed. Integration logs confirm **133/133 tests, zero failures, in each of three consecutive PostgreSQL runs**; the new decision-A D5b positive/negative and error-path tests passed. Previously staged M1–M6 representative mutations were KILLED and the restored baselines passed; final CI reran mutation campaigns. DR-1 clean-cluster restore finished with `DR-1 RESULT: PASS`, restored production preflight and 14/14 privileges tests. Original migration bytes were restored by mutation harnesses.
+
+**Closed development blockers:**
+- M1 source locking; M2 rights/suspension; M3 live/expired lease; M4 cap; M5 isolation; M6 privilege boundary — meaningful representative kills, not exhaustive proof.
+- DR-1 independent PostgreSQL 16.15 cluster roles/database/ACL restore — PASS in #78 and repeated in #84.
+- D5b founder decision A — explicit mandatory fail-closed production design; shared D7/D5b assertion and operator CLI gate tested in #84. No production hardening was applied.
+- Historical independent Windows local triple run was recorded as 3×130/130 with timestamped successful exit codes, but TAP output was not captured; final 3×133/133 CI is stronger reproducible current-commit evidence. Do not claim 3×133/133 was executed locally.
+
+**Scope of acceptance:** permits planning and implementing the next **development-only** milestone on a separate branch after review of its frozen requirements. It does **not** declare a complete M2 implementation, authorize T2 or other functionality without their own acceptance criteria, authorize merging this branch, or release any production service. No further Step 2 mutation campaigns are required absent a new material defect.
+
+**Outstanding independent production gates (not waived):**
+1. Identify actual production PostgreSQL host and demonstrate it can apply D5b as the `pg_catalog` function owner on each database; reject incompatible hosting.
+2. Require trusted immutable production configuration and mandatory fail-closed startup checks in each future collector/API/worker/service entry point; test a blocked startup on negative cases. No such runtime entry point exists yet.
+3. Resolve and independently verify D8 before **any** production content serving.
+4. Independently review any deployment/merge against its own operational release checklist. This Step 2 development acceptance is **NOT production readiness**.
+
+**Efficiency decision:** stop repeating Step 2 tests for reassurance. Build the next user-value functionality with proportional tests and security-focused checks only where consequential.
