@@ -345,3 +345,24 @@ M1 CLASSIFICATION: KILLED
 **Earlier attempts:** #73–#77 failed during global membership-grant restoration/format matching; their failure classifications are not retroactively changed. CI #78 establishes success for the corrected script at the stated commit. A passing DR-1 test is not a production recovery certification: no recovery time/point objective, WAL/PITR, large-scale data, alternate provider, or real production host compatibility was validated.
 
 **Remaining release gates:** founder must explicitly select D5b production strategy; chosen infrastructure must demonstrate the required `pg_catalog` privilege controls; trusted production configuration and every future serving/collector entry point must fail closed if `preflight --production` is not satisfied. The D8 serving prohibition remains independent. Final acceptance review must reconcile historical statuses and verify the chosen gate; no Step 3, T2, migrations 0003/0004, live collection, merge or deployment authorized yet.
+
+
+## Founder decision A — mandatory fail-closed D5b (2026-10-26)
+
+**Decision: APPROVED AS A DESIGN POLICY, NOT A DEPLOYMENT AUTHORIZATION.** The founder explicitly selects option A: production must use D5b advisory-lock privilege hardening in **every** application database; all production runtime entry points and operator commands must fail closed unless D7 operational preconditions and D5b effective privilege checks succeed. Incompatible managed PostgreSQL hosts are rejected or require a separately designed and tested security alternative; logging a warning is insufficient. Do not apply D5b to a shared/production database, launch services, merge, or begin Step 3 as a result of this decision.
+
+**Pre-implementation risk and invariants (frozen):**
+- D5b hardening must be an explicit privileged provisioning operation, executed by the actual owner of the relevant `pg_catalog` functions, with transactional postcondition verification. It is never applied automatically by application startup, and is database-local. No unprivileged or best-effort fallback.
+- D7 and D5b must be checked on the **same target database** before a production command or runtime starts. Failure, missing database, malformed results, or exceptions block execution. Checks do not repair permissions.
+- Production-mode CLI checks must use one reusable shared function; `preflight --production` must enforce both D7 and D5b regardless of `SI_PRODUCTION`. An explicit `SI_PRODUCTION=1` must gate every existing CLI command before dispatch.
+- No actual API/worker/collector production startup entry point exists at this milestone. A reusable gate plus CLI tests cannot establish future runtime enforcement. Every new production entry point requires a trusted, mandatory gate call before connecting to untrusted data or serving requests, with independently verified negative startup tests.
+- D8's separate ban on production content serving remains absolute.
+
+**Acceptance criteria for this bounded implementation:**
+1. Refactor existing CLI checks into one shared, typed, fail-closed production-readiness assertion without weakening existing D7/D5b SQL semantics.
+2. Positive real-PostgreSQL test: D5b hardened disposable database passes the production-readiness assertion and explicit `preflight --production`.
+3. Negative real-PostgreSQL tests: an unhardened database rejects the shared assertion, explicit `preflight --production`, and production-mode operator `status`. A fake client returning a failed check or throwing must fail closed.
+4. Confirm existing CI tests and mutation campaigns remain green and no SQL privilege grants or product behavior changed.
+5. Record the hosting prerequisites, trusted deployment configuration requirement, independent startup-test obligation, rollback/runbook, and a **no-deploy** verdict.
+
+**Current status:** founder decision A recorded; production hosting capability and actual runtime startup enforcement are **NOT VERIFIED**. Overall Step 2 remains **NOT ACCEPTED** until bounded implementation, CI adjudication and final review.
