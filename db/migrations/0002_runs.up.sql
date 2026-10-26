@@ -403,10 +403,10 @@ END $$;
 ------------------------------------------------------------------------------------------
 CREATE FUNCTION si.trg_runs_no_delete() RETURNS trigger
 LANGUAGE plpgsql SECURITY INVOKER
-SET search_path = pg_catalog, pg_temp AS $
+SET search_path = pg_catalog, pg_temp AS $run_guard$
 BEGIN
   RAISE EXCEPTION 'SI_RUN_DELETE_FORBIDDEN: run history is append-only' USING ERRCODE = '23514';
-END $;
+END $run_guard$;
 
 CREATE TRIGGER trg_runs_no_delete BEFORE DELETE ON si.collection_runs
 FOR EACH ROW EXECUTE FUNCTION si.trg_runs_no_delete();
