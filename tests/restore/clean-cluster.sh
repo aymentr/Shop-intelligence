@@ -76,7 +76,7 @@ import sys
 source = pathlib.Path(sys.argv[1]).read_text()
 pattern = re.compile(
     r"^(GRANT\s+si_owner\s+TO\s+si_migrator\s+WITH\s+"
-    r"INHERIT\s+FALSE\s*,\s*SET\s+TRUE\s*,\s*ADMIN\s+FALSE\s+"
+    r"INHERIT\s+FALSE\s+"
     r"GRANTED\s+BY\s+)si_bootstrap(\s*;)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
@@ -97,7 +97,7 @@ if len(matches) != 1:
         else:
             print("DR-1 membership candidate: [unexpected syntax; withheld]")
     raise SystemExit(f"DR-1 unexpected membership grant count/format: {len(matches)}")
-updated = pattern.sub(r"\\g<1>si_restore_admin\\g<2>", source, count=1)
+updated = pattern.sub(r"\g<1>si_restore_admin\g<2>", source, count=1)
 pathlib.Path(sys.argv[2]).write_text(updated)
 print("DR-1 normalized exactly one membership grantor for recovery")
 PY
