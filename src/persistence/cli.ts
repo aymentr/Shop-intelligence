@@ -16,6 +16,7 @@ import pg from 'pg';
 import { bootstrapCluster, bootstrapDatabase, LOGIN_ROLES, type LoginRole } from './bootstrap.js';
 import { migrateDown, migrateUp, migrationStatus } from './migrate.js';
 import { checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
+import { assertProductionReady } from './production-readiness.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -29,12 +30,12 @@ async function main(): Promise<void> {
   const client = new pg.Client({ connectionString: url, application_name: 'si-migrate' });
   await client.connect();
   try {
-    // Production is opt-in and fail-closed: all operator entry points must pass D7 + D5b.
-    // First-time setup must be done in an isolated provisioning phase, before production mode.
-    if (process.env.SI_PRODUCTION === '1') {
-      const checks = [...await checkOperationalPreconditions(client), ...await checkProductionAdvisoryPermissions(client)];
-      const failed = checks.filter(p => !p.ok);
-      if (failed.length) throw new Error('PRODUCTION_PREFLIGHT_FAILED: ' + failed.map(p => p.name + '=' + p.actual).join('; '));
+    // Production CLI operations and explicit production preflight must fail closed
+    // before dispatch. Provisioning D5b remains a separate privileged operation.
+    // Trusted deployment must set SI_PRODUCTION=1 for ALL production entry points.
+    if (process.env.SI_PRODUCTION === '1' ||
+        (command === 'preflight' && process.argv.includes('--production'))) {
+      await assertProductionReady(client);
     }
     if (command === 'bootstrap') {
       const passwords: Partial<Record<LoginRole, string>> = {};
