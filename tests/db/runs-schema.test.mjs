@@ -210,11 +210,11 @@ test('S10: run_errors hold codes, indices and field names only', async () => {
   assert.deepEqual(cols, ['run_id', 'seq', 'code', 'row_index', 'field', 'correlation_id'], 'no free-text column exists');
 });
 
-test('step-2 scope: no step-3/4 objects exist yet; the only user trigger is trg_runs_insert', async () => {
+test('step-3 slice 1: audit guard exists, no publication/transition routines yet', async () => {
   const fns = (await c.admin.query(`SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'si'::regnamespace
                                       AND proname IN ('si_complete_run','trg_runs_transition','trg_runs_publish_check','trg_runs_no_delete')`)).rows[0].n;
-  assert.equal(fns, 0);
+  assert.equal(fns, 1, 'only trg_runs_no_delete is implemented in this slice');
   const trg = (await c.admin.query(`SELECT array_agg(tgname::text) AS t FROM pg_trigger WHERE NOT tgisinternal
                                       AND tgrelid IN ('si.collection_runs'::regclass, 'si.publication_receipts'::regclass, 'si.run_errors'::regclass)`)).rows[0].t;
-  assert.deepEqual(trg, ['trg_runs_insert']);
+  assert.deepEqual(trg?.slice().sort(), ['trg_runs_insert', 'trg_runs_no_delete', 'trg_runs_no_truncate'].sort());
 });
