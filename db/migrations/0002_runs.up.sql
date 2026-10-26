@@ -441,6 +441,7 @@ BEGIN
 
   IF NEW.status = 'RUNNING' THEN
     IF NEW.lease_token IS DISTINCT FROM OLD.lease_token OR
+       (OLD.lease_expires_at <= now_at AND NEW.lease_expires_at > now_at) OR
        NEW.lease_expires_at IS NULL OR
        NEW.lease_expires_at <= now_at OR
        NEW.lease_expires_at > now_at + interval '5 minutes' OR
@@ -480,6 +481,54 @@ CREATE TRIGGER trg_runs_transition BEFORE UPDATE ON si.collection_runs
 FOR EACH ROW EXECUTE FUNCTION si.trg_runs_transition();
 
 ------------------------------------------------------------------------------------------
+-- STEP 3 (slice 3): bounded heartbeat and token-checked T3 failure.
+-- Each operation locks only its run row (rank 4). No free-text error input.
+------------------------------------------------------------------------------------------
+CREATE FUNCTION si.si_heartbeat_run(p_run_id uuid, p_lease_token uuid)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $run_heartbeat$
+DECLARE
+  r si.collection_runs%ROWTYPE;
+  tick timestamptz;
+BEGIN
+  SELECT * INTO r FROM si.collection_runs WHERE run_id = p_run_id FOR UPDATE;
+  tick := clock_timestamp();
+  IF NOT FOUND OR r.status <> 'RUNNING' OR r.lease_token IS DISTINCT FROM p_lease_token
+     OR p_lease_token IS NULL OR r.lease_expires_at <= tick THEN
+    RETURN false;
+  END IF;
+  UPDATE si.collection_runs
+     SET lease_expires_at = tick + interval '4 minutes'
+   WHERE run_id = p_run_id;
+  RETURN true;
+END $run_heartbeat$;
+
+CREATE FUNCTION si.si_fail_run(p_run_id uuid, p_lease_token uuid, p_code text)
+RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $run_fail$
+DECLARE
+  r si.collection_runs%ROWTYPE;
+  tick timestamptz;
+BEGIN
+  SELECT * INTO r FROM si.collection_runs WHERE run_id = p_run_id FOR UPDATE;
+  tick := clock_timestamp();
+  IF NOT FOUND OR r.status <> 'RUNNING' OR p_lease_token IS NULL
+     OR r.lease_token IS DISTINCT FROM p_lease_token THEN
+    RETURN false;
+  END IF;
+  IF r.lease_expires_at <= tick AND p_code <> 'LEASE_EXPIRED' THEN
+    RETURN false;
+  END IF;
+  -- Table CHECK enforces the exact enumerated FAILED codes; an invalid
+  -- code rolls back atomically rather than accepting arbitrary strings.
+  UPDATE si.collection_runs SET status = 'FAILED', outcome_code = p_code
+   WHERE run_id = p_run_id;
+  RETURN true;
+END $run_fail$;
+
+------------------------------------------------------------------------------------------
 -- STEP 3 (slice 1): no run may be deleted or truncated. SECURITY INVOKER by default.
 -- Historical run attempts are durable audit evidence; expiry and failure transition
 -- status instead of deleting the record. These guards also apply to si_owner.
@@ -509,6 +558,8 @@ GRANT SELECT ON si.run_errors TO si_retention;
 REVOKE ALL ON FUNCTION
   si.si_request_lock_namespace(), si.si_request_lock_key(text, text), si.si_lock_request_key(text, text),
   si.si_run_lease(), si.si_t1_rights_decision(text, timestamptz, text, text[]), si.trg_runs_insert(),
-  si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete(), si.trg_runs_transition()
+  si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete(), si.trg_runs_transition(),
+  si.si_heartbeat_run(uuid, uuid), si.si_fail_run(uuid, uuid, text)
 FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_collector;
+GRANT EXECUTE ON FUNCTION si.si_heartbeat_run(uuid, uuid), si.si_fail_run(uuid, uuid, text) TO si_collector;
