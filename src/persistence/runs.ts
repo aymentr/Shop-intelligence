@@ -3,7 +3,8 @@
  * SECURITY DEFINER si.si_begin_run(). The database applies the whole decision table under
  * the request-key lock; this module only maps outcomes to typed results and errors.
  *
- * Not in this step: heartbeat, T3, reaper (step 3) and T2 publication (step 4).
+ * Step 3 adds token-checked heartbeat and T3 failure. The independent reaper and
+ * T2 publication are not implemented yet.
  */
 import type { ClientBase } from 'pg';
 
@@ -75,4 +76,21 @@ export async function t1Preflight(client: ClientBase, req: T1Request): Promise<T
     try { await client.query('ROLLBACK'); } catch { /* connection may be gone */ }
     throw mapError(err);
   }
+}
+
+/** Returns false when the run is absent, terminal, expired or the lease token is stale. */
+export async function heartbeatRun(client: ClientBase, runId: string, leaseToken: string): Promise<boolean> {
+  const r = await client.query('SELECT si.si_heartbeat_run($1::uuid, $2::uuid) AS accepted', [runId, leaseToken]);
+  return r.rows[0]?.accepted === true;
+}
+
+/** Fail a matching RUNNING attempt without permitting free-text failure details. */
+export async function failRun(
+  client: ClientBase, runId: string, leaseToken: string,
+  code: 'SOURCE_ERROR' | 'VALIDATION_FAILED' | 'DUPLICATE_CONFLICT' | 'LEASE_EXPIRED'
+    | 'RIGHTS_TERMINATED' | 'SOURCE_SUSPENDED' | 'SOURCE_RETIRED' | 'RIGHTS_CHANGED'
+    | 'RIGHTS_EXPIRING' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR' | 'INTERNAL'
+): Promise<boolean> {
+  const r = await client.query('SELECT si.si_fail_run($1::uuid, $2::uuid, $3::text) AS accepted', [runId, leaseToken, code]);
+  return r.rows[0]?.accepted === true;
 }
