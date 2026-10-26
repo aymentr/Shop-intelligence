@@ -44,3 +44,39 @@ test('S3-2: deletion trigger runs as invoker; collector has no direct DELETE', a
     "SELECT pg_catalog.has_table_privilege('si_collector', 'si.collection_runs', 'DELETE') AS can_delete");
   assert.equal(perms.rows[0].can_delete, false);
 });
+
+test('S3-3: run identity cannot change, and a terminal failure freezes counters', async () => {
+  const started = await c.si_collector.query(
+    'SELECT * FROM si.si_begin_run($1,$2,$3,$4,$5::text[])',
+    ['step3-source', 'step3-transition', 'b'.repeat(64), 'SYNTHETIC', ['META']]
+  );
+  const id = started.rows[0].run_id;
+  await rejects(assert, asOwner(c.admin, x =>
+    x.query("UPDATE si.collection_runs SET request_sha256 = $2 WHERE run_id = $1", [id, 'c'.repeat(64)])),
+  { code: '23514', message: /SI_RUN_IDENTITY_IMMUTABLE/ });
+
+  await asOwner(c.admin, x =>
+    x.query("UPDATE si.collection_runs SET status = 'FAILED', outcome_code = 'SOURCE_ERROR' WHERE run_id = $1", [id]));
+  const row = (await c.admin.query('SELECT status, finished_at, lease_token FROM si.collection_runs WHERE run_id = $1', [id])).rows[0];
+  assert.equal(row.status, 'FAILED');
+  assert.ok(row.finished_at);
+  assert.equal(row.lease_token, null);
+
+  await rejects(assert, asOwner(c.admin, x =>
+    x.query('UPDATE si.collection_runs SET received_count = 1 WHERE run_id = $1', [id])),
+  { code: '23514', message: /SI_RUN_TERMINAL_IMMUTABLE/ });
+});
+
+test('S3-4: transition trigger is SECURITY INVOKER, and oversized heartbeat is rejected', async () => {
+  const cat = (await c.admin.query(`
+    SELECT prosecdef FROM pg_catalog.pg_proc
+    WHERE pronamespace = 'si'::regnamespace AND proname = 'trg_runs_transition'`)).rows[0];
+  assert.equal(cat.prosecdef, false);
+  const started = await c.si_collector.query(
+    'SELECT * FROM si.si_begin_run($1,$2,$3,$4,$5::text[])',
+    ['step3-source', 'step3-heartbeat', 'd'.repeat(64), 'SYNTHETIC', ['META']]
+  );
+  await rejects(assert, asOwner(c.admin, x =>
+    x.query("UPDATE si.collection_runs SET lease_expires_at = clock_timestamp() + interval '20 minutes' WHERE run_id = $1", [started.rows[0].run_id])),
+  { code: '23514', message: /SI_RUN_INVALID_HEARTBEAT/ });
+});
