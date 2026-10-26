@@ -397,6 +397,24 @@ BEGIN
 END $$;
 
 ------------------------------------------------------------------------------------------
+-- STEP 3 (slice 1): no run may be deleted or truncated. SECURITY INVOKER by default.
+-- Historical run attempts are durable audit evidence; expiry and failure transition
+-- status instead of deleting the record. These guards also apply to si_owner.
+------------------------------------------------------------------------------------------
+CREATE FUNCTION si.trg_runs_no_delete() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp AS $
+BEGIN
+  RAISE EXCEPTION 'SI_RUN_DELETE_FORBIDDEN: run history is append-only' USING ERRCODE = '23514';
+END $;
+
+CREATE TRIGGER trg_runs_no_delete BEFORE DELETE ON si.collection_runs
+FOR EACH ROW EXECUTE FUNCTION si.trg_runs_no_delete();
+
+CREATE TRIGGER trg_runs_no_truncate BEFORE TRUNCATE ON si.collection_runs
+FOR EACH STATEMENT EXECUTE FUNCTION si.trg_runs_no_delete();
+
+------------------------------------------------------------------------------------------
 -- Privileges. Nothing is granted to PUBLIC. Step 1: read only. Step 2: the collector may
 -- execute si_begin_run; it has no INSERT or UPDATE privilege on the run tables.
 ------------------------------------------------------------------------------------------
@@ -408,6 +426,6 @@ GRANT SELECT ON si.run_errors TO si_retention;
 REVOKE ALL ON FUNCTION
   si.si_request_lock_namespace(), si.si_request_lock_key(text, text), si.si_lock_request_key(text, text),
   si.si_run_lease(), si.si_t1_rights_decision(text, timestamptz, text, text[]), si.trg_runs_insert(),
-  si.si_begin_run(text, text, text, text, text[])
+  si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete()
 FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_collector;
