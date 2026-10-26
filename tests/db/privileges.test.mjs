@@ -44,7 +44,9 @@ const EXPECTED_VOLATILITY = {
   trg_source_controls_insert: 'v',
   // 0002 step 2
   si_request_lock_namespace: 'i', si_request_lock_key: 'i', si_lock_request_key: 'v', si_run_lease: 'i',
-  si_t1_rights_decision: 's', trg_runs_insert: 'v', si_begin_run: 'v'
+  si_t1_rights_decision: 's', trg_runs_insert: 'v', si_begin_run: 'v',
+  // Step 3 slice 1: SECURITY INVOKER audit guard
+  trg_runs_no_delete: 'v'
 };
 
 let db, c;
