@@ -59,6 +59,12 @@ Ask the chosen PostgreSQL hosting provider:
 
 **Founder decision required:** Approve D5b as mandatory, fail-closed policy *only after* provider capability is verified; alternatively select infrastructure with the required permissions, or explicitly commission a redesigned advisory-lock architecture and new acceptance testing. Do not silently weaken the policy. Do not apply the optional hardening script on a shared or production cluster without explicit approval.
 
+> **Resolved after this guide was written:** founder decision A (2026-10-26), confirmed at
+> Milestone 2 closure as D-M2-09 (2026-10-29) — D5b is a mandatory, fail-closed **production
+> operator step**; ordinary bootstrap does not apply it; it has not been applied to production;
+> `preflight --production` must fail closed without verified hardening. See
+> `docs/b002-d5b-production-hardening.md`. The text above is kept as the Step 2 record.
+
 ## Clean-cluster restoration requirement (still unexecuted)
 
 A fresh PostgreSQL 16 **cluster** is required, not merely `CREATE DATABASE` in an existing cluster. The test must independently restore `pg_dumpall --globals-only`-equivalent roles and membership options, database dump, pg_catalog ACLs and PostgreSQL configuration. Re-run bootstrap/migrations and compare sanitized `pg_roles`, `pg_auth_members`, `pg_namespace`, `pg_proc`, `pg_default_acl` and `pg_init_privs` catalogs. Restore must be performed in a second disposable cluster with isolated data directory and container/volume identity, and cleanup must target only those disposable resources. No such end-to-end result is yet claimed.

@@ -6,7 +6,45 @@ Branch: `claude/b002-m2-step5-acceptance`, from Step 4 `3a9c863f3e8062b951213531
 Authority: `docs/b002-m2-plan.md` revision 2. Supporting: `docs/b002-persistence.md`,
 `docs/b002-m2-step2-acceptance.md`, `docs/b002-m2-step3-lean.md`, `docs/b002-m2-step4-contract.md`.
 
-This is an engineering review, not an approval. Milestone 2 acceptance is a human decision.
+This matrix is an engineering review. The founder's decisions on it are recorded in the next
+section; they do **not** change any evidence status below.
+
+## Status: CONDITIONAL DEVELOPMENT ACCEPTANCE (D-M2-01, 2026-10-29)
+
+Steps 1–5 have been implemented or reviewed against the available revision-2 plan. This is
+**not** full historical-contract parity and **not** production approval. Review baseline:
+`23fa7ba0bb9b49aecdc54e230339ba2ab5499685` (CI #108 green).
+
+## Founder decisions — Milestone 2 governance closure (2026-10-29)
+
+| Decision | Content | Effect on this matrix |
+|---|---|---|
+| D-M2-01 | **Conditional development acceptance** of Milestone 2. Not historical-contract parity; not production approval. | None; statuses unchanged |
+| D-M2-02 | **BD1 amendment ratified** (Step 3, commit `22df3c3`): `si_collector` may execute `si_heartbeat_run`, `si_fail_run` and `si_reap_expired_runs`, in addition to `si_begin_run` and `si_complete_run`. **No direct application-role table write is authorized.** | Closes F-6. R-PUB stays PARTIAL as evidence (ratification is a policy decision, not new evidence) |
+| D-M2-03 | **T2 mechanism approved:** receipt INSERT and COMPLETED UPDATE in one SQL statement, as required for compatibility with immediate constraint checking (CR-IMM). | PB4 stays PARTIAL (queue order inferred, not observed) |
+| D-M2-04 | **Conditions (a)/(b) accepted** as documented in `docs/b002-m2-step4-contract.md` C4, against the available revision-2 plan. **No equivalence to the unavailable original Amendment C is claimed.** | Historical equivalence stays UNVERIFIED |
+| D-M2-05 | **Historical parity DEFERRED** — neither demonstrated nor waived as satisfied. The 40 BLOCKED identifiers and every PARTIAL and NOT TESTED entry are preserved. | None |
+| D-M2-06 | **No additional mutation campaign** is required for closure. Unexecuted mutants (MUT-1…MUT-6, LO1-M) remain recorded verification gaps. | AC2, AC6 stay PARTIAL; MUT rows stay NOT TESTED |
+| D-M2-07 | **EMPTY `conflict_count`:** current non-negative behaviour accepted under the frozen contract. **Revisit the semantics before enabling non-empty collection.** | Closes F-1 as a decision; open item before non-empty collection |
+| D-M2-08 | **Isolation and timing recorded as limitations**, not proven security failures: heartbeat/T3 accept non-READ COMMITTED callers (correct or fail-closed with 40001 in the Step 5 probe; F-2); S4-8 is timing-sensitive (F-3). | TX-RC, AC3 stay PARTIAL |
+| D-M2-09 | **D5b production policy approved** (confirms founder decision A of 2026-10-26, `docs/b002-m2-step2-acceptance.md` "Founder decision A"): advisory-lock EXECUTE hardening is an explicit production operator step; ordinary bootstrap does not apply it; **it has not been applied to production**; production preflight must fail closed without verified hardening. No privilege or bootstrap behaviour changed. | Closes F-5 (texts reconciled); D5b row stays PARTIAL as evidence |
+| D-M2-10 | **Absolute release restriction preserved:** no production content-serving path may launch until the G3 clock-to-commit gap is addressed by the D8 fail-closed read gate **and independently verified**. | D8 stays BLOCKED |
+
+### What each category means at closure
+
+- **Implemented:** migration 0002 Steps 1–4 (T1, lifecycle trigger, heartbeat, T3, reaper,
+  `run_errors` checks, T2 for EMPTY runs, publication check, receipt guards) and the
+  `src/persistence/runs.ts` library; the D5b script and production preflight (not applied).
+- **Tested:** the PASS rows below with their cited tests (CI #108: three DB passes, Step 2
+  mutant scripts, DR-1). PARTIAL rows are tested only to the extent stated.
+- **Accepted design decisions:** D-M2-02, -03, -04, -07, -09. A decision is not evidence and
+  does not upgrade any status.
+- **Unverified historical requirements:** the 40 BLOCKED identifiers; historical equivalence of
+  (a), (b), C-S2′ and the G1 wording (D-M2-04, D-M2-05).
+- **Production-release blockers:** D8 / G3 (D-M2-10); D5b applied and verified on the actual
+  production databases (D-M2-09); production host capability per
+  `docs/b002-d5b-production-hardening.md`; independent security review. Non-empty collection
+  additionally requires D-M2-07 to be revisited.
 
 ## How to read this
 
@@ -217,15 +255,25 @@ functions. A9 0001 write routines never reference run tables.
   source policy is KEEP_FIRST (Step 5 probe). No frozen rule forbids it (plan §5 constrains
   FAIL_RUN only; Step 4 contract C7 allows `conflict ≥ 0`); no publication or security effect.
   Human decision: forbid in a later step, or accept.
+  **Disposition: D-M2-07** — accepted for EMPTY runs; revisit before non-empty collection.
 - **F-2 (low).** Heartbeat and T3 do not refuse non-READ COMMITTED callers; behaviour is correct
   or fails with 40001 (Step 5 probe). Deviation from the §3.2 heading only.
+  **Disposition: D-M2-08** — recorded limitation, not a proven security failure.
 - **F-3 (low).** S4-8 is timing-sensitive (1.5 s budget); a slow host fails it (false negative,
   never a false pass). Clock-free evidence of commit-time rollback: S4-9.
+  **Disposition: D-M2-08** — recorded limitation.
 - **F-4 (documentation).** `0002:52` comment attributes `publish_control_seq` to triggers. Left
   unchanged: editing an applied migration changes its checksum.
+  **Disposition:** remains a known comment inaccuracy; applied migration SQL is not edited.
 - **F-5 (governance).** Plan §7 says D5b needs a founder decision; `docs/b002-persistence.md`
   records one (production operator step + `preflight --production`). Reconcile the texts.
+  **Disposition: D-M2-09.** Correction to the Step 5 wording: the decision was already recorded
+  as founder decision A (2026-10-26) in `docs/b002-m2-step2-acceptance.md` and
+  `docs/b002-d5b-production-hardening.md`; the stale texts were plan line 19, plan §7 and
+  `docs/b002-m2-windows-local-acceptance.md`. Dated decision notes were added to them at
+  closure; their original wording is kept as the historical record.
 - **F-6 (governance).** BD1 amendment (Step 3, `22df3c3`) awaits ratification.
+  **Disposition: D-M2-02** — ratified.
 
 ## Gap classification
 
@@ -237,9 +285,9 @@ functions. A9 0001 write routines never reference run tables.
 | Requires a code correction | none demonstrated |
 | Not done by instruction or low value | Step 3/4 mutants (AC2, AC6), PB3, LO4c, LOCK-RET, parity extension |
 | Blocked by unavailable primary sources | all BLOCKED rows in §G; historical equivalence of (a), (b), C-S2′, G1 wording |
-| Human decision | F-1, F-5, F-6; acceptance of the single-statement mechanism and (a)/(b) mapping |
+| Human decision | F-1, F-5, F-6; acceptance of the single-statement mechanism and (a)/(b) mapping — **decided at closure**: D-M2-07, D-M2-09, D-M2-02, D-M2-03, D-M2-04. Evidence statuses unchanged. |
 
-## Release boundaries (unchanged)
+## Release boundaries (unchanged; see D-M2-10)
 
 - Milestone 2 completes **EMPTY** runs only (Q1); non-empty counts are refused.
 - No live advertisement collection exists; sources are SYNTHETIC only (0001 CHECK).

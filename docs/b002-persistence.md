@@ -203,7 +203,7 @@ that was scheduled earlier.
 - **Migrations** are run by the dedicated non-superuser `si_migrator`: `SI_DATABASE_URL` as `si_migrator` for `up`, `down` and `status`. `bootstrap` needs an administrator. Every bootstrap run also revokes any other membership in `si_owner` (any member, any grantor, with CASCADE), so a stray grant such as an application role's cannot survive a bootstrap (test MG1b).
 - **`db/bootstrap/optional/advisory-lock-hardening.sql`** (D5b) is **not** applied by bootstrap; see `docs/b002-m2-plan.md` §7.
 
-## Milestone 2 — migration 0002 (steps 1–4 implemented; acceptance pending human review)
+## Milestone 2 — migration 0002 (conditional development acceptance, D-M2-01; not production-approved)
 
 Plan: `docs/b002-m2-plan.md` (authoritative, revision 2). Step 1 adds the tables
 `collection_runs`, `publication_receipts` and `run_errors`, their CHECK constraints (2.1 shapes,
@@ -213,8 +213,9 @@ Steps 2–4 add T1 (below), the lifecycle trigger, heartbeat, T3, the reaper and
 checks (`docs/b002-m2-step3-lean.md`), and T2 `si_complete_run` for **EMPTY runs only** with the
 commit-time publication check and receipt guards (`docs/b002-m2-step4-contract.md`).
 **No application role can write to these tables directly**; every write goes through a
-SECURITY DEFINER routine on the BD1 allowlist. Requirement-by-requirement status, evidence and
-open gaps: `docs/b002-m2-final-acceptance.md`.
+SECURITY DEFINER routine on the BD1 allowlist (ratified, D-M2-02). Requirement-by-requirement
+status, evidence, open gaps and the founder's closure decisions D-M2-01 … D-M2-10:
+`docs/b002-m2-final-acceptance.md`. Historical-contract parity is deferred (D-M2-05).
 
 `cli.js preflight` checks the operational preconditions (D7): PostgreSQL 16,
 `max_prepared_transactions = 0`, `track_commit_timestamp = on`, no synchronous standby,
@@ -265,7 +266,9 @@ durable commit.
 
 ## D5b production advisory-lock hardening (operator-controlled)
 
-Founder decision: separate privileged operator operation, not part of routine bootstrap.
+Founder decision A (2026-10-26), confirmed at Milestone 2 closure as D-M2-09: separate
+privileged operator operation, not part of routine bootstrap. **It has not been applied to any
+production database.**
 After database bootstrap and before any production deployment, an operator with
 ownership privileges over the PostgreSQL built-in advisory-lock functions must
 apply `db/bootstrap/optional/advisory-lock-hardening.sql` **to each database**.

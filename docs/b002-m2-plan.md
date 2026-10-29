@@ -16,7 +16,7 @@
 | D3 | Receipt monitor stays in 0004 | Approved |
 | D4 | Consistency constraints (§5) | Approved |
 | D5 | T1 foreign-key lock exception, with adversarial tests | Approved |
-| D5b | Revoke advisory-lock EXECUTE from PUBLIC | Conditional. Step 2: dedicated migrator implemented; hardening script written and tested but **not applied** — founder decision needed (§7). |
+| D5b | Revoke advisory-lock EXECUTE from PUBLIC | Conditional. Step 2: dedicated migrator implemented; hardening script written and tested but **not applied** — founder decision needed (§7). **Decided:** founder decision A (2026-10-26), confirmed as D-M2-09 (2026-10-29) — mandatory, fail-closed production operator step; not applied by bootstrap; not applied to production (§7, §10). |
 | D6 | T2 failure codes and their order (§3.3) | Approved |
 | D7 | Operational preconditions asserted in tests and deployment checks | Approved |
 | D8 | Verified commit timestamps plus a fail-closed content-read gate | Deferred to 0004 design. **Production-release dependency** (§4). |
@@ -113,6 +113,7 @@ Milestone 2 serves no content. Any later PR that adds a content-reading path for
   5. In new statements: `publish_control_seq := max(control_seq)`; conditions (a) and (b); early rights check.
   6. **INSERT the receipt.**
   7. **Then** UPDATE to COMPLETED (EMPTY): `published = suppressed = 0`, `rights_checked_at = finished_at = clock`, `retain_until = NULL`. The publication check is therefore the last deferred event queued in T2.
+  - *Closure note (D-M2-03, 2026-10-29):* steps 6 and 7 are implemented as one SQL statement (receipt INSERT consumed by the COMPLETED UPDATE), approved for compatibility with immediate constraint checking (CR-IMM). Conditions (a) and (b) in step 5 are interpreted per `docs/b002-m2-step4-contract.md` C4 (D-M2-04); no equivalence to the unavailable original Amendment C is claimed.
   8. Return. It never commits.
 - **`trg_runs_publish_check`:** DEFERRABLE INITIALLY DEFERRED, **SECURITY DEFINER and read-only** (no INSERT, UPDATE or DELETE; tested).
   1. READ COMMITTED only.
@@ -200,7 +201,7 @@ A REJECTED `SOURCE_SUSPENDED` row is impossible (Q3).
 | Group | Tests |
 | --- | --- |
 | Lock order | LO1 (adversarial two-session test; mutant LO1-M must deadlock); LO1-ref; LO2; LO3; LO4; **LO4b** (real-object version of Y6: T1 reaping, T2, R); **LO4c** (deliberate advisory cycle gives `40P01` with no partial state); LO5–LO7 |
-| Boundary | **BD1** (catalog allowlist of definer routines × grantees: collector = {`si_begin_run`, `si_heartbeat_run`, `si_fail_run`, `si_reap_expired_runs`, `si_complete_run`}; rights admin = {`si_record_rights_version`, `si_record_source_control`}; no grantee: the read-only commit-time check `trg_run_errors_count`. Step 3 amendment under R-PUB: heartbeat, T3 and the reaper are the only status writers besides T1 and T2; they lock only the run row, never reach COMPLETED (`trg_runs_transition`), and give the collector no table write privilege); **BD2** (`trg_runs_transition` not definer; `trg_runs_publish_check` contains no DML); **BD3** (hostile `search_path`); **BD4** (rights and control routines leave runs untouched); **BD5** (`SET ROLE si_owner` refused for application roles; the only member of `si_owner` is `si_migrator`, with SET and without INHERIT or ADMIN) |
+| Boundary | **BD1** (catalog allowlist of definer routines × grantees: collector = {`si_begin_run`, `si_heartbeat_run`, `si_fail_run`, `si_reap_expired_runs`, `si_complete_run`}; rights admin = {`si_record_rights_version`, `si_record_source_control`}; no grantee: the read-only commit-time check `trg_run_errors_count`. Step 3 amendment under R-PUB: heartbeat, T3 and the reaper are the only status writers besides T1 and T2; they lock only the run row, never reach COMPLETED (`trg_runs_transition`), and give the collector no table write privilege; **ratified as D-M2-02, 2026-10-29**); **BD2** (`trg_runs_transition` not definer; `trg_runs_publish_check` contains no DML); **BD3** (hostile `search_path`); **BD4** (rights and control routines leave runs untouched); **BD5** (`SET ROLE si_owner` refused for application roles; the only member of `si_owner` is `si_migrator`, with SET and without INHERIT or ADMIN) |
 | Protocol | **CR-IMM** (`SET CONSTRAINTS ALL IMMEDIATE`, then a SUSPEND attempted before COMMIT waits until T2 ends; COMPLETED, and `publish_control_seq < suspend.control_seq`: G1 without deferral); **PB1** (library sends exactly BEGIN / function / COMMIT); **PB2** (static: no `SET CONSTRAINTS` or `PREPARE TRANSACTION` in `src/`); **PB3** (forensic: IMMEDIATE plus a pause records `commit_ts − rights_checked_at`; documents G3); **PB4** (receipt queued before the publication check) |
 | Frozen and amendment tests | C1–C10, L1/L2/L4/L6–L8, LS1/LS2, IA1/IA1b/IA1c (behavioural), A2–A7/A10/A11, E1/E3/E6/E7, CR1–CR7, CR4b, CK-R, LI-R, EC1–EC5, I4′ teardown, H2 forensic |
 
@@ -257,6 +258,8 @@ The previous plan's mutants (control interval, rights at publication, idempotenc
 
   Today no application role needs advisory functions, so the residual risk without D5b is only the deliberate-deadlock path (detected, `40P01`).
 
+**Decision (recorded at Milestone 2 closure, D-M2-09; confirms founder decision A of 2026-10-26):** D5b is mandatory and fail-closed for production, applied as an explicit privileged **production operator step** — none of options (a)–(c) above as written (it is not run from `bootstrapDatabase`, and it is not optional for production). "Decision A" is lettered in `docs/b002-m2-step2-acceptance.md`, not in this list. Ordinary bootstrap does not apply the hardening; it has **not** been applied to production; `preflight --production` fails closed without verified hardening. Details: `docs/b002-m2-step2-acceptance.md` ("Founder decision A") and `docs/b002-d5b-production-hardening.md`. The text above is kept as the 2026-10-21 audit record.
+
 **Original proposal** (superseded by the step 2 results above): apply D5b in Step 2, together with T1's grant, as a `bootstrap/database.sql` change.
 - REVOKE all 21 from PUBLIC.
 - GRANT `pg_advisory_xact_lock(integer, integer)` to `si_collector`.
@@ -284,3 +287,16 @@ The previous plan's mutants (control interval, rights at publication, idempotenc
 - CR-IMM proves G1 without deferral.
 - Documentation uses the §4 wording.
 - The release invariant is stated in the README and in the persistence docs.
+
+## 10. Milestone 2 closure (2026-10-29)
+
+Founder decisions D-M2-01 … D-M2-10 are recorded in `docs/b002-m2-final-acceptance.md`.
+Summary: **conditional development acceptance** (D-M2-01) — not historical-contract parity, not
+production approval. BD1 amendment ratified (D-M2-02, §6). Single-statement T2 receipt/completion
+approved (D-M2-03). Conditions (a)/(b) accepted against this plan only (D-M2-04). Historical parity
+deferred, with every BLOCKED, PARTIAL and NOT TESTED entry preserved (D-M2-05). No further mutation
+campaign for closure; unexecuted mutants remain gaps (D-M2-06). EMPTY `conflict_count` accepted;
+revisit before non-empty collection (D-M2-07). Heartbeat/T3 isolation and S4-8 timing recorded as
+limitations (D-M2-08). D5b policy approved (D-M2-09, §7). The release invariant at the top of this
+plan is unchanged (D-M2-10). The §9 acceptance criteria are unchanged; their status is reported in
+the acceptance matrix.
