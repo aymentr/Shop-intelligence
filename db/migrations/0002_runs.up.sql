@@ -6,8 +6,8 @@
 -- STEP 2: si_request_lock_key, trg_runs_insert, si_begin_run (T1 preflight) - see below.
 -- STEP 3: trg_runs_transition (SECURITY INVOKER), trg_runs_no_delete, heartbeat, T3,
 --   the expired-run reaper and the run_errors integrity checks - see below.
--- Not yet present (later steps of the M2 plan):
---   si_complete_run, trg_runs_publish_check, receipt checks -> step 4 (T2)
+-- STEP 4: si_complete_run (T2, EMPTY runs only), trg_runs_publish_check and the receipt
+--   checks - see below.
 -- Until those exist NO application role may write to these tables: write grants are
 -- added in the same step as the trigger that enforces them.
 -- Runs as si_owner with search_path = pg_catalog, pg_temp (runner), so everything is qualified.
@@ -632,6 +632,199 @@ FOR EACH ROW WHEN (NEW.error_count IS DISTINCT FROM OLD.error_count)
 EXECUTE FUNCTION si.trg_run_errors_count();
 
 ------------------------------------------------------------------------------------------
+-- STEP 4: T2 controlled completion for EMPTY runs (docs/b002-m2-step4-contract.md).
+-- Lock order: sources FOR SHARE (rank 3) -> run FOR UPDATE (rank 4). The sources lock is
+-- held to the end of the transaction, so no control, rights version or retirement for the
+-- source can commit while T2 is open (G1, G2). G3 (clock validity) is NOT a durable
+-- commit-time guarantee: see the plan, section 4, and D8.
+------------------------------------------------------------------------------------------
+
+-- Control-sequence conditions (plan 3.3), shared by T2 and the commit-time check.
+-- (b) RIGHTS_TERMINATED: a TERMINATE_RETENTION with control_seq <= p_publish_seq covers
+--     the run's version. (a) SOURCE_SUSPENDED: a SUSPEND or TERMINATE_RETENTION lies in
+--     (p_start_seq, p_publish_seq], or the state at p_start_seq is not LIFT. A later LIFT
+--     does not clear (a). NULL means neither applies.
+CREATE FUNCTION si.si_t2_control_outcome(p_source_id text, p_start_seq int, p_publish_seq int, p_version int)
+RETURNS text
+LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $$
+  SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM si.source_controls c
+                  WHERE c.source_id = p_source_id AND c.kind = 'TERMINATE_RETENTION'
+                    AND c.control_seq <= p_publish_seq AND c.through_version >= p_version)
+      THEN 'RIGHTS_TERMINATED'
+    WHEN EXISTS (SELECT 1 FROM si.source_controls c
+                  WHERE c.source_id = p_source_id AND c.kind IN ('SUSPEND', 'TERMINATE_RETENTION')
+                    AND c.control_seq > p_start_seq AND c.control_seq <= p_publish_seq)
+      OR EXISTS (SELECT 1 FROM si.source_controls c
+                  WHERE c.source_id = p_source_id AND c.control_seq = p_start_seq AND c.kind <> 'LIFT')
+      THEN 'SOURCE_SUSPENDED'
+  END
+$$;
+
+-- T2: the only publication path (D1, A4). Refusals raise 'SI_T2_<CODE>: ...' (plan 3.3
+-- order) or SI_T2_NOT_OWNER / SI_BAD_ARGUMENT / SI_ISOLATION; nothing is written on any
+-- refusal. It never commits: the caller sends BEGIN / SELECT / COMMIT (PB1).
+CREATE FUNCTION si.si_complete_run(p_run_id uuid, p_lease_token uuid,
+  p_received int DEFAULT 0, p_duplicate int DEFAULT 0, p_suppressed int DEFAULT 0, p_conflict int DEFAULT 0)
+RETURNS TABLE (outcome text, run_id uuid, retention_state text, publish_control_seq int, finished_at timestamptz)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $run_complete$
+#variable_conflict use_column
+DECLARE
+  src text;
+  r si.collection_runs%ROWTYPE;
+  tick timestamptz;
+  pub int;
+  ver int;
+  retired timestamptz;
+  code text;
+BEGIN
+  -- 1. Spelled differently from the T1/insert-trigger guards, which mutant M5 anchors on exactly.
+  IF current_setting('transaction_isolation') IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: collection runs require READ COMMITTED, not %', current_setting('transaction_isolation')
+      USING ERRCODE = 'invalid_transaction_state';
+  END IF;
+  -- M2 publishes EMPTY runs only (Q1): nothing received, published, duplicated or suppressed.
+  IF p_received IS DISTINCT FROM 0 OR p_duplicate IS DISTINCT FROM 0 OR p_suppressed IS DISTINCT FROM 0
+     OR p_conflict IS NULL OR p_conflict < 0 THEN
+    RAISE EXCEPTION 'SI_BAD_ARGUMENT: Milestone 2 completes EMPTY runs only' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  -- 2. source_id is immutable: read it without a lock.
+  SELECT x.source_id INTO src FROM si.collection_runs x WHERE x.run_id = p_run_id;
+  IF NOT FOUND OR p_lease_token IS NULL THEN
+    RAISE EXCEPTION 'SI_T2_NOT_OWNER: no RUNNING attempt % holds this lease', p_run_id USING ERRCODE = 'check_violation';
+  END IF;
+  -- 3. Source before run.
+  PERFORM 1 FROM si.sources s WHERE s.source_id = src FOR SHARE;                               -- rank 3
+  -- 4. Live lease and matching token, read under the run lock.
+  SELECT * INTO r FROM si.collection_runs x WHERE x.run_id = p_run_id FOR UPDATE;              -- rank 4
+  IF r.status <> 'RUNNING' OR r.lease_token IS DISTINCT FROM p_lease_token THEN
+    RAISE EXCEPTION 'SI_T2_NOT_OWNER: no RUNNING attempt % holds this lease', p_run_id USING ERRCODE = 'check_violation';
+  END IF;
+  tick := clock_timestamp();
+  IF r.lease_expires_at <= tick THEN
+    RAISE EXCEPTION 'SI_T2_LEASE_EXPIRED: lease of run % has expired', p_run_id USING ERRCODE = 'check_violation';
+  END IF;
+  -- 5. New statements, under the source lock.
+  SELECT coalesce(max(c.control_seq), 0) INTO pub FROM si.source_controls c WHERE c.source_id = src;
+  SELECT v.version INTO ver FROM si.rights_versions v WHERE v.rights_version_id = r.rights_version_id;
+  SELECT s.retired_at INTO retired FROM si.sources s WHERE s.source_id = src;
+  code := si.si_t2_control_outcome(src, r.start_control_seq, pub, ver);
+  IF code IS NULL AND retired IS NOT NULL AND retired <= tick + si.si_publish_margin() THEN
+    code := 'SOURCE_RETIRED';
+  END IF;
+  IF code IS NULL AND EXISTS (SELECT 1 FROM si.rights_versions n
+                               WHERE n.source_id = src AND n.version > ver AND n.effective_from <= tick) THEN
+    code := 'RIGHTS_CHANGED';
+  END IF;
+  IF code IS NULL AND NOT si.rights_valid_for_publish(r.rights_version_id, tick) THEN
+    code := 'RIGHTS_EXPIRING';
+  END IF;
+  IF code IS NOT NULL THEN
+    RAISE EXCEPTION 'SI_T2_%: run % cannot be published', code, p_run_id USING ERRCODE = 'check_violation';
+  END IF;
+  -- 6 + 7. Receipt first, then COMPLETED, in one statement: the UPDATE consumes the receipt
+  -- row, so the receipt check is queued first and the publication check last (PB4), and the
+  -- deferred checks see both writes even under SET CONSTRAINTS ALL IMMEDIATE (CR-IMM).
+  WITH receipt AS (
+    INSERT INTO si.publication_receipts (run_id, source_id, rights_version_id)
+    VALUES (r.run_id, r.source_id, r.rights_version_id)
+    RETURNING run_id)
+  UPDATE si.collection_runs x
+     SET status = 'COMPLETED', retention_state = 'EMPTY', retain_until = NULL,
+         received_count = 0, published_count = 0, duplicate_count = 0, suppressed_count = 0,
+         conflict_count = p_conflict, finished_at = tick, rights_checked_at = tick,
+         lease_token = NULL, lease_expires_at = NULL, publish_control_seq = pub
+    FROM receipt
+   WHERE x.run_id = receipt.run_id;
+  -- 8.
+  RETURN QUERY SELECT 'COMPLETED'::text, r.run_id, 'EMPTY'::text, pub, tick;
+END $run_complete$;
+
+-- Commit-time publication check (C6). SECURITY DEFINER because it fires at COMMIT as the
+-- session role; read-only (no data-changing statement, only a row lock); no current_query()
+-- guard (D2'). Fires for every transition to COMPLETED, by any role.
+CREATE FUNCTION si.trg_runs_publish_check() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $run_publish_check$
+DECLARE
+  r si.collection_runs%ROWTYPE;
+  pub int;
+  ver int;
+  code text;
+BEGIN
+  IF current_setting('transaction_isolation') IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: collection runs require READ COMMITTED, not %', current_setting('transaction_isolation')
+      USING ERRCODE = 'invalid_transaction_state';
+  END IF;
+  PERFORM 1 FROM si.sources s WHERE s.source_id = NEW.source_id FOR SHARE;     -- already held by T2
+  SELECT * INTO r FROM si.collection_runs x WHERE x.run_id = NEW.run_id;
+  SELECT coalesce(max(c.control_seq), 0) INTO pub FROM si.source_controls c WHERE c.source_id = r.source_id;
+  SELECT v.version INTO ver FROM si.rights_versions v WHERE v.rights_version_id = r.rights_version_id;
+  IF r.publish_control_seq IS DISTINCT FROM pub THEN
+    code := 'SOURCE_SUSPENDED';                            -- a control committed after T2 decided
+  ELSE
+    code := si.si_t2_control_outcome(r.source_id, r.start_control_seq, pub, ver);
+  END IF;
+  IF code IS NULL AND NOT si.rights_valid_for_publish(r.rights_version_id, clock_timestamp()) THEN
+    code := 'RIGHTS_EXPIRING';
+  END IF;
+  IF code IS NULL AND (r.published_count <> 0 OR r.suppressed_count <> 0
+       OR NOT EXISTS (SELECT 1 FROM si.publication_receipts p
+                       WHERE p.run_id = r.run_id AND p.source_id = r.source_id
+                         AND p.rights_version_id = r.rights_version_id)) THEN
+    code := 'PERSISTENCE_ERROR';
+  END IF;
+  IF code IS NOT NULL THEN
+    RAISE EXCEPTION 'SI_T2_%: publication check failed for run %', code, r.run_id USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NULL;
+END $run_publish_check$;
+
+CREATE CONSTRAINT TRIGGER trg_runs_publish_check AFTER UPDATE ON si.collection_runs
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW WHEN (NEW.status = 'COMPLETED' AND OLD.status IS DISTINCT FROM 'COMPLETED')
+EXECUTE FUNCTION si.trg_runs_publish_check();
+
+-- A receipt must belong to a COMPLETED run at COMMIT. Read-only, definer for the same
+-- reason as the publication check.
+CREATE FUNCTION si.trg_receipts_run_completed() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $receipt_completed$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM si.collection_runs x WHERE x.run_id = NEW.run_id AND x.status = 'COMPLETED') THEN
+    RAISE EXCEPTION 'SI_RECEIPT_RUN_NOT_COMPLETED: run % is not COMPLETED', NEW.run_id USING ERRCODE = '23514';
+  END IF;
+  RETURN NULL;
+END $receipt_completed$;
+
+CREATE CONSTRAINT TRIGGER trg_receipts_run_completed AFTER INSERT ON si.publication_receipts
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION si.trg_receipts_run_completed();
+
+-- Receipts are permanent for every role. The only change is the 0004 monitor setting
+-- commit_ts and within_validity from NULL to a value, once each.
+CREATE FUNCTION si.trg_receipts_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp AS $receipt_guard$
+BEGIN
+  IF TG_OP <> 'UPDATE'
+     OR ROW(NEW.run_id, NEW.source_id, NEW.rights_version_id, NEW.receipt_at)
+        IS DISTINCT FROM ROW(OLD.run_id, OLD.source_id, OLD.rights_version_id, OLD.receipt_at)
+     OR (OLD.commit_ts IS NOT NULL AND NEW.commit_ts IS DISTINCT FROM OLD.commit_ts)
+     OR (OLD.within_validity IS NOT NULL AND NEW.within_validity IS DISTINCT FROM OLD.within_validity) THEN
+    RAISE EXCEPTION 'SI_RECEIPT_IMMUTABLE: publication receipts cannot be changed or removed' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END $receipt_guard$;
+
+CREATE TRIGGER trg_receipts_guard BEFORE UPDATE OR DELETE ON si.publication_receipts
+FOR EACH ROW EXECUTE FUNCTION si.trg_receipts_guard();
+
+CREATE TRIGGER trg_receipts_no_truncate BEFORE TRUNCATE ON si.publication_receipts
+FOR EACH STATEMENT EXECUTE FUNCTION si.trg_receipts_guard();
+
+------------------------------------------------------------------------------------------
 -- STEP 3 (slice 1): no run may be deleted or truncated. SECURITY INVOKER by default.
 -- Historical run attempts are durable audit evidence; expiry and failure transition
 -- status instead of deleting the record. These guards also apply to si_owner.
@@ -663,8 +856,11 @@ REVOKE ALL ON FUNCTION
   si.si_run_lease(), si.si_t1_rights_decision(text, timestamptz, text, text[]), si.trg_runs_insert(),
   si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete(), si.trg_runs_transition(),
   si.si_heartbeat_run(uuid, uuid), si.si_fail_run(uuid, uuid, text, int, text[], int[], text[], uuid),
-  si.si_reap_expired_runs(int), si.trg_run_errors_append_only(), si.trg_run_errors_count()
+  si.si_reap_expired_runs(int), si.trg_run_errors_append_only(), si.trg_run_errors_count(),
+  si.si_t2_control_outcome(text, int, int, int), si.si_complete_run(uuid, uuid, int, int, int, int),
+  si.trg_runs_publish_check(), si.trg_receipts_run_completed(), si.trg_receipts_guard()
 FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_collector;
 GRANT EXECUTE ON FUNCTION si.si_heartbeat_run(uuid, uuid),
   si.si_fail_run(uuid, uuid, text, int, text[], int[], text[], uuid), si.si_reap_expired_runs(int) TO si_collector;
+GRANT EXECUTE ON FUNCTION si.si_complete_run(uuid, uuid, int, int, int, int) TO si_collector;          -- step 4 (T2)

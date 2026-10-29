@@ -1,13 +1,13 @@
 // Milestone 2 step 2: T1 preflight (si.si_begin_run), the request-key lock and trg_runs_insert.
 // Concurrency order is established by construction (a holder keeps its locks in an open
 // transaction; waiters are proven blocked with pg_blocking_pids). No assertion uses clocks
-// for correctness. Step-2 shortcuts (owner UPDATEs that expire a lease or mark a run
-// COMPLETED) stand in for step 3/4 paths that do not exist yet; they are labelled.
+// for correctness. A step-2 shortcut (an owner UPDATE that expires a lease) is labelled;
+// completion uses the real step-4 T2 path.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { t1Preflight, T1Refused } from '../../dist/persistence/runs.js';
+import { completeRun, t1Preflight, T1Refused } from '../../dist/persistence/runs.js';
 import {
   asOwner, control, createSources, expectWaiterError, expectWaiterOk, freshDatabase, holderCommit, lift, pid,
   recordRights, rejects, roles, settle, waitUntilBlocked, waiter
@@ -40,9 +40,9 @@ async function source(id, { networks = ['META'], rights = {} } = {}) {
 // Step-2 shortcuts (owner-only; replaced by step 3/4 paths later).
 const expireLease = runId => asOwner(c.admin, x => x.query(
   `UPDATE si.collection_runs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE run_id = $1`, [runId]));
-const markEmptyCompleted = runId => asOwner(c.admin, x => x.query(
-  `UPDATE si.collection_runs SET status = 'COMPLETED', finished_at = clock_timestamp(), rights_checked_at = clock_timestamp(),
-     retention_state = 'EMPTY', publish_control_seq = start_control_seq, lease_token = NULL WHERE run_id = $1`, [runId]));
+// Step 4: the real T2 path replaces the former owner COMPLETED shortcut.
+const completeEmpty = async (runId, token) =>
+  assert.equal((await completeRun(c.si_collector, runId, token)).outcome, 'COMPLETED');
 async function extra(t, role) { const cl = (await roles(t, db, [role]))[role]; return { cl, p: await pid(cl) }; }
 async function ownerSession(t) {
   const cl = (await roles(t, db, ['admin'])).admin;
@@ -152,7 +152,7 @@ test('T1-4 (C1, C8, C4/E6): retries re-evaluate rights; a different hash is refu
   const a2 = await begin(c.si_collector, 't4', key);
   assert.deepEqual([a2.outcome, a2.attempt, a2.rights_version_id], ['RUNNING', 2, await vid('t4', 2)]);
   assert.equal((await runs('t4', key))[0].rights_version_id, await vid('t4', 1), 'attempt 1 keeps the version it was decided under');
-  await markEmptyCompleted(a2.run_id);                                                            // step-4 stand-in
+  await completeEmpty(a2.run_id, a2.lease_token);                                                 // T2 (step 4)
   await recordRights(c.si_rights_admin, 't4', { evaluation: 'DENIED', retain: 'DENIED', retention_days: null });
   await control(c.si_rights_admin, 't4', 'SUSPEND');
   const again = await begin(c.si_collector, 't4', key);                                          // row 2 precedes the suspension throw

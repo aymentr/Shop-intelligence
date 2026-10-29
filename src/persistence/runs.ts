@@ -4,7 +4,7 @@
  * the request-key lock; this module only maps outcomes to typed results and errors.
  *
  * Step 3 adds token-checked heartbeat, T3 failure with coded error records, and the
- * independent expired-run reaper. T2 publication is not implemented yet.
+ * independent expired-run reaper. Step 4 adds the T2 protocol for EMPTY runs (completeRun).
  */
 import type { ClientBase } from 'pg';
 
@@ -121,4 +121,56 @@ export async function failRun(
 export async function reapExpiredRuns(client: ClientBase, limit = 100): Promise<number> {
   const r = await client.query('SELECT si.si_reap_expired_runs($1::int) AS reaped', [limit]);
   return r.rows[0].reaped;
+}
+
+/** T2 failure codes, in the order the database decides them (plan section 3.3). */
+export type T2FailureCode =
+  | 'LEASE_EXPIRED' | 'RIGHTS_TERMINATED' | 'SOURCE_SUSPENDED' | 'SOURCE_RETIRED' | 'RIGHTS_CHANGED'
+  | 'RIGHTS_EXPIRING' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR';
+
+export type T2Result =
+  | { outcome: 'COMPLETED'; runId: string; publishControlSeq: number; finishedAt: Date }
+  /** Rolled back; failRecorded tells whether T3 then marked the attempt FAILED with this code. */
+  | { outcome: 'FAILED'; code: T2FailureCode; failRecorded: boolean }
+  /** The caller does not hold a RUNNING attempt with this lease (stale token, finished or unknown run). */
+  | { outcome: 'NOT_OWNER' };
+
+/** A caller error refused before any write (bad arguments, wrong isolation). No T3 is attempted. */
+export class T2Refused extends Error {
+  constructor(readonly code: 'BAD_ARGUMENT' | 'ISOLATION', message: string, readonly sqlstate?: string) {
+    super(message);
+    this.name = 'T2Refused';
+  }
+}
+
+const T2_CODES = new Set<T2FailureCode>(['LEASE_EXPIRED', 'RIGHTS_TERMINATED', 'SOURCE_SUSPENDED', 'SOURCE_RETIRED',
+  'RIGHTS_CHANGED', 'RIGHTS_EXPIRING', 'LOCK_TIMEOUT', 'PERSISTENCE_ERROR']);
+
+/**
+ * T2 (controlled protocol, D2'): sends exactly BEGIN, SELECT si.si_complete_run(...), COMMIT.
+ * Milestone 2 completes EMPTY runs only. Any error, including one raised by the commit-time
+ * publication check, is followed by ROLLBACK and then T3 with the mapped code.
+ */
+export async function completeRun(
+  client: ClientBase, runId: string, leaseToken: string, opts: { conflictCount?: number } = {}
+): Promise<T2Result> {
+  await client.query('BEGIN');
+  try {
+    const res = await client.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, 0, 0, 0, $3::int)',
+      [runId, leaseToken, opts.conflictCount ?? 0]);
+    await client.query('COMMIT');
+    const r = res.rows[0];
+    return { outcome: 'COMPLETED', runId: r.run_id, publishControlSeq: r.publish_control_seq, finishedAt: r.finished_at };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* connection may be gone */ }
+    const e = err as { message?: string; code?: string };
+    const prefix = /^SI_([A-Z0-9_]+):/.exec(e?.message ?? '')?.[1];
+    if (prefix === 'BAD_ARGUMENT' || prefix === 'ISOLATION') throw new T2Refused(prefix, e.message ?? prefix, e.code);
+    if (prefix === 'T2_NOT_OWNER') return { outcome: 'NOT_OWNER' };
+    const named = prefix?.startsWith('T2_') ? prefix.slice(3) as T2FailureCode : undefined;
+    const code: T2FailureCode = named && T2_CODES.has(named) ? named : e?.code === '55P03' ? 'LOCK_TIMEOUT' : 'PERSISTENCE_ERROR';
+    let failRecorded = false;
+    try { failRecorded = await failRun(client, runId, leaseToken, code); } catch { /* the reaper will expire it */ }
+    return { outcome: 'FAILED', code, failRecorded };
+  }
 }

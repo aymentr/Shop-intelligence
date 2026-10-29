@@ -31,14 +31,16 @@ const EXPECTED_EXECUTE = {
   si_begin_run: ['si_collector'],
   si_heartbeat_run: ['si_collector'], si_fail_run: ['si_collector'],                      // 0002 step 3 (heartbeat, T3)
   si_reap_expired_runs: ['si_collector'],                                                  // 0002 step 3 (reaper)
+  si_complete_run: ['si_collector'],                                                       // 0002 step 4 (T2)
   rights_valid_for_publish: ['si_collector'],
   si_source_suspended: ['si_collector'],
   si_retention_terminated: ['si_collector'],
   si_window_end: ['si_collector'],
   si_publish_margin: ['si_collector']
 };
-const EXPECTED_DEFINER = ['si_begin_run', 'si_fail_run', 'si_heartbeat_run', 'si_reap_expired_runs', 'si_record_rights_version',
-                          'si_record_source_control', 'trg_run_errors_count'];
+const EXPECTED_DEFINER = ['si_begin_run', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_reap_expired_runs',
+                          'si_record_rights_version', 'si_record_source_control', 'trg_receipts_run_completed',
+                          'trg_run_errors_count', 'trg_runs_publish_check'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
   trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
@@ -50,7 +52,10 @@ const EXPECTED_VOLATILITY = {
   si_t1_rights_decision: 's', trg_runs_insert: 'v', si_begin_run: 'v',
   // Step 3 slice 1: SECURITY INVOKER audit guard
   trg_runs_no_delete: 'v', trg_runs_transition: 'v', si_heartbeat_run: 'v', si_fail_run: 'v',
-  si_reap_expired_runs: 'v', trg_run_errors_append_only: 'v', trg_run_errors_count: 'v'
+  si_reap_expired_runs: 'v', trg_run_errors_append_only: 'v', trg_run_errors_count: 'v',
+  // 0002 step 4
+  si_t2_control_outcome: 's', si_complete_run: 'v', trg_runs_publish_check: 'v', trg_receipts_run_completed: 'v',
+  trg_receipts_guard: 'v'
 };
 
 let db, c;

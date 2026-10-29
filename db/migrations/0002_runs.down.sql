@@ -3,6 +3,11 @@
 DROP TABLE si.run_errors;
 DROP TABLE si.publication_receipts;
 DROP TABLE si.collection_runs;
+DROP FUNCTION si.trg_receipts_guard();
+DROP FUNCTION si.trg_receipts_run_completed();
+DROP FUNCTION si.trg_runs_publish_check();
+DROP FUNCTION si.si_complete_run(uuid, uuid, int, int, int, int);
+DROP FUNCTION si.si_t2_control_outcome(text, int, int, int);
 DROP FUNCTION si.trg_runs_no_delete();
 DROP FUNCTION si.trg_runs_transition();
 DROP FUNCTION si.si_heartbeat_run(uuid, uuid);
