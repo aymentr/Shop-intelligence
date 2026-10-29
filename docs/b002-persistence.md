@@ -187,7 +187,7 @@ through source controls, which are outside the version sequence (test `C2`). Rem
 liveness limit: after a termination, a new authorization cannot take effect before a version
 that was scheduled earlier.
 
-## Milestone 2, step 2 — T1 preflight and the migrator (in progress)
+## Milestone 2, step 2 — T1 preflight and the migrator
 
 - **T1** is `si.si_begin_run(source, key, request_sha256, evidence_kind, networks)`, SECURITY DEFINER, executable by `si_collector` only. Library: `t1Preflight` in `src/persistence/runs.ts`.
   - It takes the request-key advisory lock (two-int form, namespace 21321) and then `sources` FOR KEY SHARE.
@@ -203,16 +203,18 @@ that was scheduled earlier.
 - **Migrations** are run by the dedicated non-superuser `si_migrator`: `SI_DATABASE_URL` as `si_migrator` for `up`, `down` and `status`. `bootstrap` needs an administrator. Every bootstrap run also revokes any other membership in `si_owner` (any member, any grantor, with CASCADE), so a stray grant such as an application role's cannot survive a bootstrap (test MG1b).
 - **`db/bootstrap/optional/advisory-lock-hardening.sql`** (D5b) is **not** applied by bootstrap; see `docs/b002-m2-plan.md` §7.
 
-## Milestone 2, step 1 — migration 0002 schema (in progress)
+## Milestone 2 — migration 0002 (steps 1–4 implemented; acceptance pending human review)
 
-Plan: `docs/b002-m2-plan.md` (authoritative, revision 2). Step 1 adds only the tables
+Plan: `docs/b002-m2-plan.md` (authoritative, revision 2). Step 1 adds the tables
 `collection_runs`, `publication_receipts` and `run_errors`, their CHECK constraints (2.1 shapes,
 Amendment A2 EMPTY rules, D4 consistency rules, outcome codes per status, control-sequence
 columns), the IA-1 composite foreign keys (runs and receipts), indexes, and **read-only** grants.
-
-Not yet enforced (steps 2–4): attempt numbering and the request-key lock, computed columns,
-allowed transitions, the publication path (`si_complete_run`), receipts only for COMPLETED runs,
-errors only for FAILED runs. Until then **no application role can write to these tables**.
+Steps 2–4 add T1 (below), the lifecycle trigger, heartbeat, T3, the reaper and the `run_errors`
+checks (`docs/b002-m2-step3-lean.md`), and T2 `si_complete_run` for **EMPTY runs only** with the
+commit-time publication check and receipt guards (`docs/b002-m2-step4-contract.md`).
+**No application role can write to these tables directly**; every write goes through a
+SECURITY DEFINER routine on the BD1 allowlist. Requirement-by-requirement status, evidence and
+open gaps: `docs/b002-m2-final-acceptance.md`.
 
 `cli.js preflight` checks the operational preconditions (D7): PostgreSQL 16,
 `max_prepared_transactions = 0`, `track_commit_timestamp = on`, no synchronous standby,
