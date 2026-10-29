@@ -305,3 +305,21 @@ test('S3-12: run_errors are append-only and a terminal error_count is frozen, fo
     ['trg_runs_error_count', true, true, true]
   ]);
 });
+
+test('S3-13: under SET CONSTRAINTS ALL IMMEDIATE a valid failure still commits and a mismatch is still refused', async () => {
+  const run = await begin('step3-immediate');
+  const id = randomUUID();
+  await c.si_collector.query('BEGIN');
+  await c.si_collector.query('SET CONSTRAINTS ALL IMMEDIATE');
+  assert.equal(await failRun(c.si_collector, run.run_id, run.lease_token, 'VALIDATION_FAILED',
+    { errorCount: 2, records: ERR(2), correlationId: id }), true);
+  await holderCommit(assert, c.si_collector, await pid(c.si_collector));
+  assert.deepEqual([(await runRow(run.run_id)).error_count, (await runRow(run.run_id)).stored], [2, 2]);
+
+  const other = await begin('step3-immediate-bad');
+  await rejects(assert, asOwner(c.admin, async x => {
+    await x.query('SET CONSTRAINTS ALL IMMEDIATE');
+    await x.query(`UPDATE si.collection_runs SET status = 'FAILED', outcome_code = 'VALIDATION_FAILED', error_count = 1 WHERE run_id = $1`, [other.run_id]);
+  }), { code: '23514', message: /SI_RUN_ERRORS_COUNT/ });
+  assert.equal((await runRow(other.run_id)).status, 'RUNNING');
+});

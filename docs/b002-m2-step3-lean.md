@@ -94,4 +94,9 @@ status change; append-only and frozen terminal `error_count` for owner and colle
 
 Local, PostgreSQL 16.15: DB suite 145/145 in three consecutive passes; unit 39/39;
 typecheck; demo; all nine CI mutation scripts killed/restored; DR-1 PASS.
+Final gate: BD1 (plan §6) amended explicitly under R-PUB for the three collector
+definer routines that write run status (the catalog and `privileges.test.mjs` already
+matched). Defect fixed: under `SET CONSTRAINTS ALL IMMEDIATE` a valid T3 with error
+records was refused, because the status UPDATE and the error INSERT were separate
+statements; they are now one statement (S3-13).
 Status remains **IN PROGRESS** until CI is green on the implementation commit.

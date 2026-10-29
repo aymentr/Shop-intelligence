@@ -506,7 +506,7 @@ END $run_heartbeat$;
 
 -- T3. Optional error records are positional arrays of length least(p_error_count, 100):
 -- codes, row indices and field names only (table CHECKs), one correlation id. The status
--- change and the error rows are one statement's work: any invalid input rolls back both.
+-- change and the error rows are one SQL statement: any invalid input rolls back both.
 CREATE FUNCTION si.si_fail_run(p_run_id uuid, p_lease_token uuid, p_code text,
   p_error_count int DEFAULT 0, p_error_codes text[] DEFAULT '{}', p_error_rows int[] DEFAULT '{}',
   p_error_fields text[] DEFAULT '{}', p_correlation_id uuid DEFAULT NULL)
@@ -539,11 +539,15 @@ BEGIN
   END IF;
   -- Table CHECK enforces the exact enumerated FAILED codes; an invalid
   -- code rolls back atomically rather than accepting arbitrary strings.
-  UPDATE si.collection_runs SET status = 'FAILED', outcome_code = p_code, error_count = p_error_count
-   WHERE run_id = p_run_id;
+  -- One SQL statement, so the error-count check sees both writes even under
+  -- SET CONSTRAINTS ALL IMMEDIATE (it then fires at the end of this statement).
+  WITH failed AS (
+    UPDATE si.collection_runs SET status = 'FAILED', outcome_code = p_code, error_count = p_error_count
+     WHERE run_id = p_run_id
+    RETURNING run_id)
   INSERT INTO si.run_errors (run_id, seq, code, row_index, field, correlation_id)
-  SELECT p_run_id, e.seq::int, e.code, e.row_index, e.field, p_correlation_id
-    FROM unnest(p_error_codes, p_error_rows, p_error_fields) WITH ORDINALITY AS e(code, row_index, field, seq);
+  SELECT failed.run_id, e.seq::int, e.code, e.row_index, e.field, p_correlation_id
+    FROM failed, unnest(p_error_codes, p_error_rows, p_error_fields) WITH ORDINALITY AS e(code, row_index, field, seq);
   RETURN true;
 END $run_fail$;
 
