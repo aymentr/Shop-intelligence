@@ -194,27 +194,31 @@ test('S9 (IA1c, EC4 schema part): receipts name exactly their run\'s source and 
 });
 
 test('S10: run_errors hold codes, indices and field names only', async () => {
+  // Step 3: count(run_errors) = least(error_count, 100) at COMMIT, so the two valid records go in one transaction.
   const run = await insertRun(row('FAILED', { outcome_code: 'VALIDATION_FAILED', error_count: 2 }));
-  const err = o => insertAs('run_errors', { run_id: run, seq: 1, code: 'INVALID_TIMESTAMP', row_index: 0, field: 'seenAt', correlation_id: randomUUID(), ...o });
-  await err({});
+  const rec = o => ({ run_id: run, seq: 1, code: 'INVALID_TIMESTAMP', row_index: 0, field: 'seenAt', correlation_id: randomUUID(), ...o });
+  const ins = (x, r) => x.query(`INSERT INTO si.run_errors (${Object.keys(r).join(', ')})
+                                 VALUES (${Object.keys(r).map((_, i) => `$${i + 1}`).join(', ')})`, Object.values(r));
+  const err = o => asOwner(c.admin, x => ins(x, rec(o)));
+  await asOwner(c.admin, async x => { await ins(x, rec({})); await ins(x, rec({ seq: 2, row_index: null, field: null })); });
   await rejects(assert, err({}), { code: UNIQUE });
   for (const bad of [{ seq: 0 }, { seq: 101 }, { code: 'lowercase' }, { code: 'AB' }, { code: 'HAS SPACE' }, { row_index: -1 },
                      { field: 'rawPayload' }]) {
-    await rejects(assert, err({ seq: 2, ...bad }), { code: CHECK });
+    await rejects(assert, err({ seq: 3, ...bad }), { code: CHECK });
   }
-  await rejects(assert, err({ seq: 2, correlation_id: null }), { code: '23502' });
-  await rejects(assert, err({ seq: 2, run_id: randomUUID() }), { code: FK });
-  await err({ seq: 2, row_index: null, field: null });
+  await rejects(assert, err({ seq: 3, correlation_id: null }), { code: '23502' });
+  await rejects(assert, err({ seq: 3, run_id: randomUUID() }), { code: FK });
   const cols = (await c.admin.query(`SELECT array_agg(attname::text ORDER BY attnum) AS c FROM pg_attribute
                                      WHERE attrelid = 'si.run_errors'::regclass AND attnum > 0 AND NOT attisdropped`)).rows[0].c;
   assert.deepEqual(cols, ['run_id', 'seq', 'code', 'row_index', 'field', 'correlation_id'], 'no free-text column exists');
 });
 
-test('step-3 slice 1: audit guard exists, no publication/transition routines yet', async () => {
+test('step-3 scope: lifecycle and run_errors guards exist, no publication routines yet', async () => {
   const fns = (await c.admin.query(`SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'si'::regnamespace
                                       AND proname IN ('si_complete_run','trg_runs_transition','trg_runs_publish_check','trg_runs_no_delete')`)).rows[0].n;
-  assert.equal(fns, 2, 'only transition and no-delete Step 3 routines are implemented');
+  assert.equal(fns, 2, 'only transition and no-delete Step 3 routines are implemented; Step 4 publication is absent');
   const trg = (await c.admin.query(`SELECT array_agg(tgname::text) AS t FROM pg_trigger WHERE NOT tgisinternal
                                       AND tgrelid IN ('si.collection_runs'::regclass, 'si.publication_receipts'::regclass, 'si.run_errors'::regclass)`)).rows[0].t;
-  assert.deepEqual(trg?.slice().sort(), ['trg_runs_insert', 'trg_runs_no_delete', 'trg_runs_no_truncate', 'trg_runs_transition'].sort());
+  assert.deepEqual(trg?.slice().sort(), ['trg_run_errors_append_only', 'trg_run_errors_count', 'trg_run_errors_no_truncate',
+    'trg_runs_error_count', 'trg_runs_insert', 'trg_runs_no_delete', 'trg_runs_no_truncate', 'trg_runs_transition'].sort());
 });

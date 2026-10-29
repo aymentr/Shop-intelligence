@@ -3,8 +3,8 @@
  * SECURITY DEFINER si.si_begin_run(). The database applies the whole decision table under
  * the request-key lock; this module only maps outcomes to typed results and errors.
  *
- * Step 3 adds token-checked heartbeat and T3 failure. The independent reaper and
- * T2 publication are not implemented yet.
+ * Step 3 adds token-checked heartbeat, T3 failure with coded error records, and the
+ * independent expired-run reaper. T2 publication is not implemented yet.
  */
 import type { ClientBase } from 'pg';
 
@@ -84,13 +84,41 @@ export async function heartbeatRun(client: ClientBase, runId: string, leaseToken
   return r.rows[0]?.accepted === true;
 }
 
-/** Fail a matching RUNNING attempt without permitting free-text failure details. */
+/** One stored error: a code, an optional input row index and an optional field name (no free text). */
+export interface RunError {
+  code: string;
+  rowIndex: number | null;
+  field: string | null;
+}
+
+/** Errors observed by a failed attempt: the total, and at most the first 100 records. */
+export interface RunErrors {
+  errorCount: number;
+  records: RunError[];
+  correlationId: string;
+}
+
+/**
+ * Fail a matching RUNNING attempt without permitting free-text failure details. The status
+ * change and the error records commit together; records.length must equal min(errorCount, 100).
+ */
 export async function failRun(
   client: ClientBase, runId: string, leaseToken: string,
   code: 'SOURCE_ERROR' | 'VALIDATION_FAILED' | 'DUPLICATE_CONFLICT' | 'LEASE_EXPIRED'
     | 'RIGHTS_TERMINATED' | 'SOURCE_SUSPENDED' | 'SOURCE_RETIRED' | 'RIGHTS_CHANGED'
-    | 'RIGHTS_EXPIRING' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR' | 'INTERNAL'
+    | 'RIGHTS_EXPIRING' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR' | 'INTERNAL',
+  errors?: RunErrors
 ): Promise<boolean> {
-  const r = await client.query('SELECT si.si_fail_run($1::uuid, $2::uuid, $3::text) AS accepted', [runId, leaseToken, code]);
+  const recs = errors?.records ?? [];
+  const r = await client.query(
+    'SELECT si.si_fail_run($1::uuid, $2::uuid, $3::text, $4::int, $5::text[], $6::int[], $7::text[], $8::uuid) AS accepted',
+    [runId, leaseToken, code, errors?.errorCount ?? 0, recs.map(e => e.code), recs.map(e => e.rowIndex),
+     recs.map(e => e.field), errors?.correlationId ?? null]);
   return r.rows[0]?.accepted === true;
+}
+
+/** Independent reaper: fails up to `limit` RUNNING attempts whose lease has expired. No lease token needed. */
+export async function reapExpiredRuns(client: ClientBase, limit = 100): Promise<number> {
+  const r = await client.query('SELECT si.si_reap_expired_runs($1::int) AS reaped', [limit]);
+  return r.rows[0].reaped;
 }

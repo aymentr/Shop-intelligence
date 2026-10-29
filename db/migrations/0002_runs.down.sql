@@ -6,7 +6,10 @@ DROP TABLE si.collection_runs;
 DROP FUNCTION si.trg_runs_no_delete();
 DROP FUNCTION si.trg_runs_transition();
 DROP FUNCTION si.si_heartbeat_run(uuid, uuid);
-DROP FUNCTION si.si_fail_run(uuid, uuid, text);
+DROP FUNCTION si.si_fail_run(uuid, uuid, text, int, text[], int[], text[], uuid);
+DROP FUNCTION si.si_reap_expired_runs(int);
+DROP FUNCTION si.trg_run_errors_count();
+DROP FUNCTION si.trg_run_errors_append_only();
 
 DROP FUNCTION si.si_begin_run(text, text, text, text, text[]);
 DROP FUNCTION si.trg_runs_insert();

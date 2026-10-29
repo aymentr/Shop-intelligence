@@ -76,3 +76,22 @@ Until those checks pass: Step 3 **IN PROGRESS**, not accepted. No
 production authorization. Once they pass, close the milestone without
 inventing additional experiments. The original revision-2 M2-wide
 acceptance and D8 production restrictions are not waived.
+
+## Evidence (slice 4: reaper, run_errors integrity)
+
+Implemented in migration 0002 (0001 untouched): `si_reap_expired_runs` (definer,
+collector EXECUTE only, rank-4 `FOR UPDATE SKIP LOCKED`, no token), `si_fail_run`
+extended with positional coded error records written in the same statement as the
+FAILED transition, `trg_run_errors_append_only` (invoker, UPDATE/DELETE/TRUNCATE refused
+for every role) and the deferred `trg_run_errors_count` / `trg_runs_error_count`
+constraint triggers (`count = least(error_count, 100)` at COMMIT). Down migration drops all.
+
+Tests (`tests/db/step3.test.mjs` S3-7 to S3-12): real lease expiry by database clock;
+reaper completes while the `sources` row and request-key advisory lock are held
+elsewhere; heartbeat-held row skipped, reaper-held row makes heartbeat and T3 lose
+cleanly; 150-error failure stores 100 records; mismatched/invalid records roll back the
+status change; append-only and frozen terminal `error_count` for owner and collector.
+
+Local, PostgreSQL 16.15: DB suite 145/145 in three consecutive passes; unit 39/39;
+typecheck; demo; all nine CI mutation scripts killed/restored; DR-1 PASS.
+Status remains **IN PROGRESS** until CI is green on the implementation commit.

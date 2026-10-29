@@ -4,9 +4,9 @@
 --
 -- STEP 1: tables, CHECK constraints, indexes, IA-1 composite foreign keys, read grants.
 -- STEP 2: si_request_lock_key, trg_runs_insert, si_begin_run (T1 preflight) - see below.
+-- STEP 3: trg_runs_transition (SECURITY INVOKER), trg_runs_no_delete, heartbeat, T3,
+--   the expired-run reaper and the run_errors integrity checks - see below.
 -- Not yet present (later steps of the M2 plan):
---   trg_runs_transition (SECURITY INVOKER), heartbeat,
---   trg_runs_no_delete, run_errors integrity checks      -> step 3 (T3, reaper)
 --   si_complete_run, trg_runs_publish_check, receipt checks -> step 4 (T2)
 -- Until those exist NO application role may write to these tables: write grants are
 -- added in the same step as the trigger that enforces them.
@@ -504,14 +504,30 @@ BEGIN
   RETURN true;
 END $run_heartbeat$;
 
-CREATE FUNCTION si.si_fail_run(p_run_id uuid, p_lease_token uuid, p_code text)
+-- T3. Optional error records are positional arrays of length least(p_error_count, 100):
+-- codes, row indices and field names only (table CHECKs), one correlation id. The status
+-- change and the error rows are one statement's work: any invalid input rolls back both.
+CREATE FUNCTION si.si_fail_run(p_run_id uuid, p_lease_token uuid, p_code text,
+  p_error_count int DEFAULT 0, p_error_codes text[] DEFAULT '{}', p_error_rows int[] DEFAULT '{}',
+  p_error_fields text[] DEFAULT '{}', p_correlation_id uuid DEFAULT NULL)
 RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $run_fail$
 DECLARE
   r si.collection_runs%ROWTYPE;
   tick timestamptz;
+  n int;
 BEGIN
+  n := LEAST(p_error_count, 100);
+  IF p_error_count IS NULL OR p_error_count < 0
+     OR p_error_codes IS NULL OR p_error_rows IS NULL OR p_error_fields IS NULL
+     OR coalesce(array_ndims(p_error_codes), 1) <> 1 OR coalesce(array_ndims(p_error_rows), 1) <> 1
+     OR coalesce(array_ndims(p_error_fields), 1) <> 1
+     OR cardinality(p_error_codes) <> n OR cardinality(p_error_rows) <> n OR cardinality(p_error_fields) <> n
+     OR (n > 0 AND p_correlation_id IS NULL) THEN
+    RAISE EXCEPTION 'SI_BAD_ARGUMENT: error records must be % positional entries with a correlation id', n
+      USING ERRCODE = 'invalid_parameter_value';
+  END IF;
   SELECT * INTO r FROM si.collection_runs WHERE run_id = p_run_id FOR UPDATE;
   tick := clock_timestamp();
   IF NOT FOUND OR r.status <> 'RUNNING' OR p_lease_token IS NULL
@@ -523,10 +539,93 @@ BEGIN
   END IF;
   -- Table CHECK enforces the exact enumerated FAILED codes; an invalid
   -- code rolls back atomically rather than accepting arbitrary strings.
-  UPDATE si.collection_runs SET status = 'FAILED', outcome_code = p_code
+  UPDATE si.collection_runs SET status = 'FAILED', outcome_code = p_code, error_count = p_error_count
    WHERE run_id = p_run_id;
+  INSERT INTO si.run_errors (run_id, seq, code, row_index, field, correlation_id)
+  SELECT p_run_id, e.seq::int, e.code, e.row_index, e.field, p_correlation_id
+    FROM unnest(p_error_codes, p_error_rows, p_error_fields) WITH ORDINALITY AS e(code, row_index, field, seq);
   RETURN true;
 END $run_fail$;
+
+------------------------------------------------------------------------------------------
+-- STEP 3 (slice 4): independent reaper, append-only run_errors, commit-time error count.
+------------------------------------------------------------------------------------------
+-- Reaper: needs no lease token. Rank 4 only: it locks run rows and nothing else (no
+-- advisory key, no sources row; the FK columns never change, so no FK parent lock).
+-- SKIP LOCKED: a row held by a heartbeat, T3 or T1 is left to that holder. After the
+-- lock, READ COMMITTED re-evaluates the predicate on the newest row version, so a
+-- heartbeat that committed in between makes the row ineligible.
+CREATE FUNCTION si.si_reap_expired_runs(p_limit int DEFAULT 100)
+RETURNS int
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $run_reap$
+DECLARE
+  n int;
+BEGIN
+  -- Spelled differently from the T1/insert-trigger guards, which mutant M5 anchors on exactly.
+  IF current_setting('transaction_isolation') IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION 'SI_ISOLATION: collection runs require READ COMMITTED, not %', current_setting('transaction_isolation')
+      USING ERRCODE = 'invalid_transaction_state';
+  END IF;
+  IF p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 1000 THEN
+    RAISE EXCEPTION 'SI_BAD_ARGUMENT: reaper limit must be between 1 and 1000' USING ERRCODE = 'invalid_parameter_value';
+  END IF;
+  WITH due AS (
+    SELECT d.run_id FROM si.collection_runs d
+     WHERE d.status = 'RUNNING' AND d.lease_expires_at <= clock_timestamp()
+     ORDER BY d.lease_expires_at, d.run_id
+     LIMIT p_limit
+       FOR UPDATE SKIP LOCKED)
+  UPDATE si.collection_runs r SET status = 'FAILED', outcome_code = 'LEASE_EXPIRED'
+    FROM due
+   WHERE r.run_id = due.run_id AND r.status = 'RUNNING' AND r.lease_expires_at <= clock_timestamp();
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $run_reap$;
+
+-- run_errors are append-only for every role, including si_owner.
+CREATE FUNCTION si.trg_run_errors_append_only() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = pg_catalog, pg_temp AS $run_errors_guard$
+BEGIN
+  RAISE EXCEPTION 'SI_RUN_ERRORS_APPEND_ONLY: run errors cannot be changed or removed' USING ERRCODE = '23514';
+END $run_errors_guard$;
+
+CREATE TRIGGER trg_run_errors_append_only BEFORE UPDATE OR DELETE ON si.run_errors
+FOR EACH ROW EXECUTE FUNCTION si.trg_run_errors_append_only();
+
+CREATE TRIGGER trg_run_errors_no_truncate BEFORE TRUNCATE ON si.run_errors
+FOR EACH STATEMENT EXECUTE FUNCTION si.trg_run_errors_append_only();
+
+-- Deferred to COMMIT: count(run_errors) = least(error_count, 100) for every run whose
+-- errors or error_count changed in the transaction. error_count is 0 unless FAILED
+-- (runs_errors_only_failed) and frozen once terminal, so this also keeps errors to FAILED
+-- runs and forbids appending to a finished run. SECURITY DEFINER because the check fires
+-- at COMMIT as the session role, which cannot read run_errors; it is read-only.
+CREATE FUNCTION si.trg_run_errors_count() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $run_errors_count$
+DECLARE
+  want int;
+  have int;
+BEGIN
+  SELECT LEAST(r.error_count, 100) INTO want FROM si.collection_runs r WHERE r.run_id = NEW.run_id;
+  SELECT count(*)::int INTO have FROM si.run_errors e WHERE e.run_id = NEW.run_id;
+  IF have IS DISTINCT FROM coalesce(want, 0) THEN
+    RAISE EXCEPTION 'SI_RUN_ERRORS_COUNT: run % has % error records, expected %', NEW.run_id, have, coalesce(want, 0)
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NULL;
+END $run_errors_count$;
+
+CREATE CONSTRAINT TRIGGER trg_run_errors_count AFTER INSERT ON si.run_errors
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW EXECUTE FUNCTION si.trg_run_errors_count();
+
+CREATE CONSTRAINT TRIGGER trg_runs_error_count AFTER UPDATE ON si.collection_runs
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW WHEN (NEW.error_count IS DISTINCT FROM OLD.error_count)
+EXECUTE FUNCTION si.trg_run_errors_count();
 
 ------------------------------------------------------------------------------------------
 -- STEP 3 (slice 1): no run may be deleted or truncated. SECURITY INVOKER by default.
@@ -559,7 +658,9 @@ REVOKE ALL ON FUNCTION
   si.si_request_lock_namespace(), si.si_request_lock_key(text, text), si.si_lock_request_key(text, text),
   si.si_run_lease(), si.si_t1_rights_decision(text, timestamptz, text, text[]), si.trg_runs_insert(),
   si.si_begin_run(text, text, text, text, text[]), si.trg_runs_no_delete(), si.trg_runs_transition(),
-  si.si_heartbeat_run(uuid, uuid), si.si_fail_run(uuid, uuid, text)
+  si.si_heartbeat_run(uuid, uuid), si.si_fail_run(uuid, uuid, text, int, text[], int[], text[], uuid),
+  si.si_reap_expired_runs(int), si.trg_run_errors_append_only(), si.trg_run_errors_count()
 FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION si.si_begin_run(text, text, text, text, text[]) TO si_collector;
-GRANT EXECUTE ON FUNCTION si.si_heartbeat_run(uuid, uuid), si.si_fail_run(uuid, uuid, text) TO si_collector;
+GRANT EXECUTE ON FUNCTION si.si_heartbeat_run(uuid, uuid),
+  si.si_fail_run(uuid, uuid, text, int, text[], int[], text[], uuid), si.si_reap_expired_runs(int) TO si_collector;
