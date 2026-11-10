@@ -76,27 +76,29 @@ test('CP-3: a legacy unscoped run completes EMPTY as in Milestone 2', async () =
   assert.deepEqual([(await row(run.run_id)).retention_state, (await row(run.run_id)).receipts], ['EMPTY', 1]);
 });
 
-test('CP-4: every non-empty or malformed payload is refused before any lock, with nothing written', async () => {
+test('CP-4: malformed or oversized payloads are refused before any lock; non-empty payloads need a matching scope; nothing is written', async () => {
   const src = await source();
   const sc = await scoped(src, [ROW('1')]), lg = await plain(src);
   for (const run of [sc, lg]) {
-    for (const payload of [[ROW('1')], [{}], [null], [[]]]) {
-      await rejects(assert, rawT2(run, payload), { code: '22023', message: /^SI_BAD_ARGUMENT/ });
-    }
     for (const raw of ['{}', 'null', '"[]"', '0']) {
       await rejects(assert, c.si_collector.query(T2, [run.run_id, run.lease_token, raw]), { code: '22023', message: /^SI_BAD_ARGUMENT/ });
     }
     await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, NULL::jsonb)', [run.run_id, run.lease_token]),
       { code: '22023' });
+    await rejects(assert, rawT2(run, Array.from({ length: 501 }, (_, i) => ROW(String(i)))), { code: '22023', message: /^SI_BAD_ARGUMENT/ });
     await untouched(run);
   }
-  // refused before any lock: a non-empty call does not wait for a source held FOR UPDATE elsewhere
+  // migration 0005: non-empty payloads are accepted only for a scoped run and only when they match its fixture
+  await rejects(assert, rawT2(lg, [ROW('1')]), { code: CHECK, message: /^SI_T2_VALIDATION_FAILED/ });       // REQUEST_SCOPE_MISSING
+  await rejects(assert, rawT2(sc, [ROW('2')]), { code: CHECK, message: /^SI_T2_VALIDATION_FAILED/ });       // REQUEST_HASH_MISMATCH
+  await untouched(lg); await untouched(sc);
+  // shape and bounds are refused before any lock: no wait on a source held FOR UPDATE elsewhere
   await c.admin.query('BEGIN');
   try {
     await c.admin.query('SELECT 1 FROM si.sources WHERE source_id = $1 FOR UPDATE', [src]);
     const x = await connect({ user: 'si_collector', database: db }); cleanups.push(() => x.end());
     await x.query(`SET lock_timeout = '500ms'`);
-    await rejects(assert, x.query(T2, [sc.run_id, sc.lease_token, JSON.stringify([ROW('1')])]), { code: '22023' });
+    await rejects(assert, x.query(T2, [sc.run_id, sc.lease_token, '{}']), { code: '22023' });
   } finally { await c.admin.query('ROLLBACK'); }
 });
 

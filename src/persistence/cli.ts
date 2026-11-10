@@ -7,6 +7,8 @@
  *   node dist/persistence/cli.js down --to N --allow-destructive
  *   node dist/persistence/cli.js status
  *   node dist/persistence/cli.js preflight            operational preconditions (deployment check, D7)
+ *   node dist/persistence/cli.js preflight --collector   also checks collector logging safety in a
+ *                                                     real collector session (SI_COLLECTOR_DATABASE_URL)
  *
  * bootstrap sets login passwords only if SI_ROLE_PASSWORD_<ROLE> (e.g.
  * SI_ROLE_PASSWORD_SI_COLLECTOR) or SI_ROLE_PASSWORD is set. Passwords never
@@ -15,7 +17,7 @@
 import pg from 'pg';
 import { bootstrapCluster, bootstrapDatabase, LOGIN_ROLES, type LoginRole } from './bootstrap.js';
 import { migrateDown, migrateUp, migrationStatus } from './migrate.js';
-import { checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
+import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
 import { assertProductionReady } from './production-readiness.js';
 
 function arg(name: string): string | undefined {
@@ -61,10 +63,17 @@ async function main(): Promise<void> {
     } else if (command === 'preflight') {
       const results = await checkOperationalPreconditions(client);
       if (process.argv.includes('--production')) results.push(...await checkProductionAdvisoryPermissions(client));
+      if (process.argv.includes('--collector')) {
+        const curl = process.env.SI_COLLECTOR_DATABASE_URL;
+        if (!curl) throw new Error('preflight --collector requires SI_COLLECTOR_DATABASE_URL (an si_collector login)');
+        const col = new pg.Client({ connectionString: curl, application_name: 'si-preflight-collector' });
+        await col.connect();
+        try { results.push(...await checkCollectorLogging(col)); } finally { await col.end(); }
+      }
       for (const p of results) console.log(`${p.ok ? 'ok  ' : 'FAIL'} ${p.name}: ${p.actual} (expected ${p.expected})`);
       if (results.some(p => !p.ok)) process.exitCode = 1;
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight [--production]');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight [--production] [--collector]');
     }
   } finally {
     await client.end();

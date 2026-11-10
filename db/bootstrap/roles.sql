@@ -53,6 +53,12 @@ END $$;
 ALTER ROLE si_collector    SET statement_timeout = '30s';
 ALTER ROLE si_collector    SET idle_in_transaction_session_timeout = '10s';
 ALTER ROLE si_collector    SET lock_timeout = '30s';
+-- Milestone 3 (M3-P2B): the collector transmits evidence payloads as bind parameters. The server
+-- must never write them to its log, whatever statement, duration or error logging is enabled.
+-- Superuser-only settings: bootstrap runs as an administrator. D7 (`preflight --collector`) and
+-- the library verify the effective values in a real collector session before any payload is sent.
+ALTER ROLE si_collector    SET log_parameter_max_length = 0;
+ALTER ROLE si_collector    SET log_parameter_max_length_on_error = 0;
 ALTER ROLE si_rights_admin SET lock_timeout = '30s';
 -- Amendment C rev1 R5: bounds how long a control can sit between its decision instant
 -- (occurred_at) and its commit while holding the source-row lock.

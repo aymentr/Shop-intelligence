@@ -20,9 +20,16 @@ Every statement carries one of these labels, and none is upgraded by being writt
 | **UNVERIFIED** | An assumption about PostgreSQL or library behaviour; the named test must confirm it before implementation relies on it. |
 | **BLOCKED** | Cannot proceed until the stated condition is met. |
 
-Implemented so far: **only the request-scope foundation** (migration 0003, §4.2.3), with tests SC-1…SC-14,
-pending founder acceptance. Everything else in Milestone 3 (ads, observations, non-empty T2) is
-PROPOSED and unimplemented; invariants in §5 and tests in §8 are PROPOSED unless marked otherwise.
+Implemented so far (each pending founder acceptance; none is production-approved):
+- **0003 — request scope** (M3-P1, §4.2.3): scoped T1, v1 hash reproduction, `run_request_scope`. Tests SC-1…SC-14.
+- **0004 — completion hardening** (M3-P2A): counts-based T2 removed; `si_complete_run(uuid, uuid, jsonb)`;
+  scoped EMPTY must match the empty fixture. Tests CP-1…CP-8.
+- **0005 — evidence persistence** (M3-P2B): `si.ads`, `si.observations`, non-empty T2 for SYNTHETIC
+  sources, extended publication check; collector logging prerequisite (bootstrap, D7, library).
+  Tests EV-1…EV-15, DG-1…DG-2.
+
+Not implemented: retention enforcement and purge, the read function, monitors, D8, suppression,
+`publication_gate`, live adapters. §10 lists what remains unverified.
 
 ## 1. Frozen scope (PROPOSED)
 
@@ -33,17 +40,17 @@ In (migration 0003, SYNTHETIC sources only):
 - `si_begin_run_scoped` — the scoped T1 wrapper (FD7 option C). **Implemented in 0003.**
 - v1 hash functions `si_canonical_json_v1`, `si_fixture_sha256_v1`, `si_request_sha256_v1`. **Implemented in 0003.**
 
-Migration numbering: the request-scope foundation is migration **0003** (Milestone 3 part 1). The
-remaining Milestone 3 objects (ads, observations, non-empty T2) follow in the next migration. The
-items the M2 plan allocated to "0004" (tombstones, retention, the read function, monitors, D8) move
-to the migration after that. This is a recorded numbering deviation from plan §1, not a change of
-scope.
+Migration numbering (recorded deviation from M2 plan §1, not a change of scope): Milestone 3 is
+migrations **0003** (request scope), **0004** (completion hardening) and **0005** (evidence). The
+items the M2 plan allocated to "0003"/"0004" that remain deferred — `publication_gate`, tombstones,
+retention enforcement and purge, the read function, monitors, D8 — move to **0006 or later**
+("0006+" below). Earlier revisions of this document used "0004" for that later migration.
 - Non-empty T2: `si_complete_run(uuid, uuid, jsonb)` replaces the counts-based signature.
 - Extended `trg_runs_publish_check`; insert-scoped integrity checks; replaceable append-only guards.
 - Library: `completeRun(..., rows)`, scope binding inside T1, strict diagnostics parsing.
 - Logging preconditions and in-function effective-session checks (§5.1).
 
-Out (§9): `publication_gate` (0004), suppression (S = 0), purge/deletion, the read function,
+Out (§9): `publication_gate` (0006+), suppression (S = 0), purge/deletion, the read function,
 monitors, D8, cross-source identity resolution, non-SYNTHETIC evidence, live adapters, any
 content read or serving.
 
@@ -53,17 +60,17 @@ content read or serving.
 
 | ID | Status | Disposition |
 |---|---|---|
-| FD1 | APPROVED | `publication_gate` deferred to 0004; lock rank 2 stays reserved. Recorded deviation from plan §1 line 42 (which allocates it to 0003). M3 invariant: no M3 path acquires any lock before rank 3 except T1's existing advisory lock. |
-| FD2 | APPROVED | Deterministic database-derived counts; `EMPTY ⇒ C = 0` (§6.3). |
-| FD3 | APPROVED, conditional | Transactional replacement of the T2 signature, conditional on the dependency and privilege verification in §7. |
-| FD4 | APPROVED (proposed anchor) | `retain_until = least(finished_at + retention_days(v), si_retention_end(source, v) as of T2)` for the collected version `v`, as a static upper bound. Dynamic effective end enforced in 0004. |
-| FD5 | APPROVED, provisional | Cap 500 rows and 1 MiB (octets of the `jsonb` text form), subject to M3-T14. |
+| FD1 | APPROVED | `publication_gate` deferred to 0006+; lock rank 2 stays reserved. Recorded deviation from plan §1 line 42 (which allocates it to 0003). M3 invariant: no M3 path acquires any lock before rank 3 except T1's existing advisory lock. |
+| FD2 | APPROVED; IMPLEMENTED (0004 removes caller counts, 0005 derives them) | Deterministic database-derived counts; `EMPTY ⇒ C = 0` (§6.3). |
+| FD3 | APPROVED; IMPLEMENTED in 0004 (DROP + CREATE; verified: single overload, M1d byte-exact rollback) | Transactional replacement of the T2 signature, conditional on the dependency and privilege verification in §7. |
+| FD4 | APPROVED (proposed anchor) | `retain_until = least(finished_at + retention_days(v), si_retention_end(source, v) as of T2)` for the collected version `v`, as a static upper bound. Dynamic effective end enforced in 0006+. |
+| FD5 | APPROVED; IMPLEMENTED in 0005; timing gate EV-15 passes on PostgreSQL 16.15 (local and CI image) — not a production measurement | Cap 500 rows and 1 MiB (octets of the `jsonb` text form), subject to M3-T14. |
 | FD6 | APPROVED | FAILED runs keep every count at 0 and record bounded coded errors only. |
 | FD7 | **APPROVED — option C; IMPLEMENTED (0003), acceptance pending** | The `xmin` binder (option A) is rejected on PostgreSQL 16 evidence (§4.2.2). Option C, the scoped T1 wrapper (§4.2.3), is approved and implemented. FD7 is not marked VERIFIED until the founder accepts the M3-P1 evidence. Non-empty T2 remains unimplemented. |
 | FD11 | APPROVED | BD1 amendment: `si_begin_run_scoped` is added to the collector's SECURITY DEFINER allowlist (it starts runs, so R-PUB applies). `si_bind_request_scope` is withdrawn. Plain `si_begin_run` is unchanged; plain-T1 runs stay EMPTY-only. |
 | FD8 | APPROVED | Synthetic-only development; no content reads; no purge; no production authorization. |
-| FD9 | APPROVED, conditional | Canonical fixture hashing: preserve historical request-hash and retry compatibility; versioning policy in §4.4. |
-| FD10 | APPROVED, with verification requirements | Collector logging preconditions (§5.1). No claim of absolute protection from server logging; effective-session checks and negative leakage tests (M3-T19, M3-T21) are required. |
+| FD9 | APPROVED; v1 frozen and reproduced in SQL (SC-1, EV-1); non-reproducible inputs fail closed | Canonical fixture hashing: preserve historical request-hash and retry compatibility; versioning policy in §4.4. |
+| FD10 | APPROVED; IMPLEMENTED in 0005 + bootstrap + D7 + library; canaries EV-11/EV-12 pass | Collector logging preconditions (§5.1). No claim of absolute protection from server logging; effective-session checks and negative leakage tests (M3-T19, M3-T21) are required. |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -76,7 +83,7 @@ design by FD2, not yet implemented); D-M2-08 heartbeat/T3 isolation and S4-8 tim
 limitations; D-M2-09 D5b production operator policy; **D-M2-10 no production content-serving path
 until the G3 gap is addressed by the D8 fail-closed read gate and independently verified.**
 
-## 3. Schema (PROPOSED; all owner-only — no application-role privilege of any kind)
+## 3. Schema (IMPLEMENTED in 0003 and 0005 as described, except where §11 notes a difference; all owner-only)
 
 `si.ads`
 - `ad_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY`
@@ -105,7 +112,7 @@ until the G3 gap is addressed by the D8 fail-closed read gate and independently 
   unique, non-empty), `fixture_sha256 text NOT NULL CHECK (fixture_sha256 ~ '^[0-9a-f]{64}$')`,
   `hash_version smallint NOT NULL CHECK (hash_version = 1)` (§4.4), `bound_at timestamptz NOT NULL`
 
-Guards are trigger functions, so that 0004 can replace them; they are never CHECK or rule objects:
+Guards are trigger functions, so that 0006+ can replace them; they are never CHECK or rule objects:
 - `ads`, `observations`, `run_request_scope`: UPDATE, DELETE and TRUNCATE refused for every role.
 - Insert-scoped deferred checks, firing on INSERT only, so later purges never trigger them:
   - observation ⇒ its run is COMPLETED;
@@ -114,7 +121,7 @@ Guards are trigger functions, so that 0004 can replace them; they are never CHEC
 
 Lock ranks: `run_request_scope` is run-scoped (rank 4); `ads` rank 5; `observations` rank 6.
 
-## 4. Transaction protocols (PROPOSED)
+## 4. Transaction protocols (IMPLEMENTED in 0003–0005; differences in §11)
 
 ### 4.1 Library flow (non-empty)
 1. Read the offline fixture rows. Validate each with B-001 `parseAd` **without changing the rows**.
@@ -283,7 +290,7 @@ COMMIT — deferred, read-only checks:
 
   Milestone 3 introduces no version 2.
 
-## 5. Security invariants (PROPOSED; C = clock-free, T = clock-dependent)
+## 5. Security invariants (C = clock-free, T = clock-dependent; evidence in §11)
 
 | # | Invariant | Kind |
 |---|---|---|
@@ -294,10 +301,10 @@ COMMIT — deferred, read-only checks:
 | S5 | Database-derived counts: `R = P + D + S`, `S = 0`, `C ≤ D`, `R = 0 ∨ D < R`; hence EMPTY ⇔ R = 0 and EMPTY ⇒ C = 0 | C |
 | S6 | Lock order: (1 advisory, in T1) → 3 → 4 → 5 (sorted) → 6; no deadlock between concurrent T2s | C |
 | S7 | Least privilege: no application-role privilege on the new tables; the definer allowlist grows only by `si_begin_run_scoped` (BD1 amendment FD11); T2 returns no content | C |
-| S8 | Append-only for every role, with guards 0004 can replace | C |
+| S8 | Append-only for every role, with guards 0006+ can replace | C |
 | S9 | Request scope recorded by the scoped T1 in the same statement as the attempt, equal to T1's network argument, and bound to the immutable `request_sha256` (FD7 option C; implemented, acceptance pending; §4.2.3 states the limits) | C |
 | S10 | Logging protections within the boundary of §5.1 | C |
-| S11 | Retention: `retain_until` is a static upper bound; the effective end is dynamic (0004); **not enforced in M3** | T |
+| S11 | Retention: `retain_until` is a static upper bound; the effective end is dynamic (0006+); **not enforced in M3** | T |
 | S12 | No serving: no read function; a catalog check that no `si` function returns or outputs content columns; SYNTHETIC-only CHECK unchanged | C |
 | S13 | Lease checks (T1, T2, T3, reaper) | T |
 
@@ -351,7 +358,7 @@ D5b (D-M2-09) and D8/G3 (D-M2-10) remain production-release blockers.
 
 **Required negative tests:** M3-T19 (configuration) and M3-T21 (leakage canary).
 
-## 6. Failure handling (PROPOSED)
+## 6. Failure handling (IMPLEMENTED; differences in §11)
 
 ### 6.1 Codes and SQLSTATE
 
@@ -427,7 +434,7 @@ and no records. Malformed diagnostics are never trusted or logged.
   3. the insert-scoped deferred checks make orphan observations, ads and scopes impossible for any role;
   4. T3 writes only `collection_runs` and `run_errors`.
 
-## 7. Migration strategy (PROPOSED)
+## 7. Migration strategy (as planned; implemented as 0004 + 0005, see §11)
 
 **Catalog verification on the baseline** (VERIFIED baseline, local PostgreSQL 16.15 template migrated to 0002):
 - `si.si_complete_run(uuid,uuid,integer,integer,integer,integer)` is the only overload;
@@ -472,7 +479,7 @@ Verified by catalog fingerprint: up → down equals the 0002-only catalog, and u
 - 0001 and 0002 stay byte-identical (frozen-checksum test);
 - the Step 2 CI mutants remain valid only while `si_begin_run` is not replaced (option C does not replace it; §4.2.2).
 
-## 8. Risk-based acceptance tests (PROPOSED; M3-T07 and the scope-binding parts of M3-T08 and M3-T18 executed as SC-1…SC-14)
+## 8. Risk-based acceptance tests (executed: see the mapping in §11)
 
 Timing thresholds are acceptance gates measured on the CI PostgreSQL 16.15 image (median of 20
 runs; p95 reported). They are evidence for that host class only, not guarantees.
@@ -503,7 +510,7 @@ runs; p95 reported). They are evidence for that host class only, not guarantees.
 
 One targeted mutant only: unsorted ad insertion, which M3-T09 must detect.
 
-## 9. Deferred functionality (0004 or later)
+## 9. Deferred functionality (0006+ or later)
 
 - `publication_gate` (rank 2) and its purpose (FD1).
 - Suppression semantics; S stays 0.
@@ -511,12 +518,12 @@ One targeted mutant only: unsorted ad insertion, which M3-T09 must detect.
   PARTIALLY_PURGED → PURGED transitions. `trg_runs_transition` already allows retention columns to
   change on terminal rows; historical counts stay frozen.
 - **Identity lifecycle:**
-  - Milestone 3's guards are trigger functions that 0004 replaces to admit only a definer purge routine.
+  - Milestone 3's guards are trigger functions that 0006+ replaces to admit only a definer purge routine.
   - Purge deletes observations first (FK `RESTRICT`), then deletes an ad identity when no
     observation references it.
   - Milestone 3's "ad ⇒ observation" check fires on INSERT only, so it never blocks lawful
     deletion or retention cleanup.
-  - Whether 0004 tombstones keep a non-reversible identity digest is a 0004 decision.
+  - Whether 0006+ tombstones keep a non-reversible identity digest is a 0006+ decision.
 - **Dynamic retention:** effective end = `least(retain_until, si_retention_end(source, v))`,
   evaluated at purge time and at read time (D8). Termination and retain revocation shorten it
   immediately. `cleanup_within` bounds purge latency, never permission.
@@ -526,15 +533,12 @@ One targeted mutant only: unsorted ad insertion, which M3-T09 must detect.
 
 ## 10. Remaining blockers
 
-Implementation blockers:
-1. **FD7 acceptance pending:** option C is implemented (0003) and its tests pass. The founder must
-   accept the M3-P1 evidence before FD7 is marked VERIFIED. The T2-side scope checks (M3-T08) are
-   verified only when non-empty T2 is implemented.
-2. **FD9 conditional:** M3-T18 must show v1 hash parity (or deterministic fail-closed behaviour)
-   and retry compatibility.
-3. **FD10 conditional:** M3-T19 and M3-T21 must pass. No claim of absolute protection from server
-   logging is made (§5.1).
-4. **FD5 provisional:** M3-T14 must pass on CI hardware.
+Implementation status of the former blockers (all pending founder acceptance):
+1. **FD7:** implemented (0003, SC-1…SC-14); the T2-side scope checks (M3-T08) are implemented in 0005
+   and pass (EV-1…EV-3). Founder acceptance required before FD7 is marked VERIFIED.
+2. **FD9:** v1 parity and retry compatibility pass (SC-1, SC-7, SC-8, EV-1).
+3. **FD10:** implemented; EV-9, EV-11 and EV-12 pass. No claim of absolute protection (§5.1, §11.3).
+4. **FD5:** EV-15 passes on PostgreSQL 16.15 (local and CI image); production must re-measure.
 
 Production-release blockers (unchanged from Milestone 2):
 5. **D8 / G3 (D-M2-10).**
@@ -556,3 +560,61 @@ Unverified historical requirements:
   under the §5.1 controls;
 - that the 500-row / 1 MiB cap meets the timing gates (§8, M3-T14);
 - that sorted ad insertion prevents deadlock between concurrent T2s (M3-T09).
+
+## 11. Implementation record (M3-P2A migration 0004, M3-P2B migration 0005)
+
+### 11.1 Differences between §3–§8 and the implementation
+- **Migration split:** §7 described one migration; it is 0004 (signature swap, EMPTY-only) then 0005
+  (`CREATE OR REPLACE` of the same signature and return type; no second DROP).
+- **Return columns:** T2 returns `outcome, run_id, retention_state, publish_control_seq, finished_at,
+  received_count, published_count, duplicate_count, conflict_count` — counts only, no content.
+- **No TEMP staging:** `si_owner` has no TEMP privilege by design, so rows are staged in a typed
+  in-memory array (`si.t2_stage_row[]`).
+- **Refusal order:** isolation → payload bounds → logging tripwire → (no lock) staging → locks and
+  authority (unchanged) → scope/fixture (`REQUEST_HASH_MISMATCH`, `REQUEST_SCOPE_MISSING`) → network
+  authorization (valid network values only) → row validation → FAIL_RUN conflicts. A row containing a
+  number cannot be reproduced by the SQL v1 hash, so a scoped run carrying one fails at the scope
+  check, not with `INVALID_SHAPE`.
+- **Per-row errors:** the first error of each row; a row that cannot be canonicalized is `INVALID_SHAPE`.
+- **Text bounds:** `advertiserName`/`title` ≤ 1000 characters, URLs ≤ 2048, `nativeAdId` ≤ 256 — stricter than B-001.
+- **Table CHECKs** are implied by the validation, so validated rows never reach a CHECK (whose detail
+  would quote content).
+- **Retention metadata:** `retain_until = least(finished_at + retention_days, si_retention_end(...))`
+  (EV-8). It is static and **not enforced**; dynamic shortening and purge are 0006+.
+- **Logging (FD10):** bootstrap sets `log_parameter_max_length = 0` and `log_parameter_max_length_on_error
+  = 0` on `si_collector` (superuser-only settings); `checkCollectorLogging` / `cli.js preflight --collector`
+  check the effective collector session; `completeRunWithEvidence` runs that check on its own connection,
+  rejects NUL / unpaired surrogates / non-JSON values and oversize payloads **before any statement**, and
+  never returns or logs PostgreSQL error text. T2's in-function check is a secondary tripwire only:
+  statement logging writes parameters before the function runs (EV-12).
+
+### 11.2 Acceptance-test mapping
+| §8 test | Implemented as |
+|---|---|
+| M3-T01, T02 | EV-1, EV-2, CP-1, CP-3 |
+| M3-T03, T04, T05 | EV-5 |
+| M3-T06 | EV-4, CP-4, EV-10 (library refusals) |
+| M3-T07 | SC-2…SC-14 |
+| M3-T08 | EV-1, EV-2, EV-3 |
+| M3-T09 + targeted mutant | EV-13, EV-14 (unsorted inserts deadlock; sorted control does not) |
+| M3-T10, T11, T14 | EV-15 (gates: median ≤ 2 s, p95 ≤ 5 s, emergency wait ≤ 5 s; 10 + 4 runs) |
+| M3-T12, T13 | EV-6, CP-7 |
+| M3-T15 | DG-1, DG-2, EV-10 |
+| M3-T16 | EV-7, CP-8, SC-13, privileges G1/SD1/SD2 |
+| M3-T17 | M1, M1c, M1d, M1e, MG2 |
+| M3-T18 | SC-1, EV-1, EV-4 |
+| M3-T19 | EV-9 |
+| M3-T20 | full suite |
+| M3-T21 | EV-11 (protected: absent), EV-12 (sensitivity control: present) |
+
+### 11.3 Remaining unverified assumptions and limits
+- Timing is measured on the CI/test PostgreSQL 16.15 image only; production must be re-measured.
+- Hash parity beyond the tested corpus and on other Node.js/PostgreSQL/Unicode versions (fails closed).
+- Logging protection covers only §5.1's boundary; a superuser, extensions or debug levels are outside it.
+  The bootstrap settings require a superuser-capable bootstrap administrator.
+- Retention is not enforced; data past `retain_until` remains (synthetic only, unreadable).
+- `supported_networks` can still be changed by the owner directly (narrowing fails closed).
+
+### 11.4 Production restrictions (unchanged)
+SYNTHETIC sources only; no read path; no content serving; D8/G3 (D-M2-10) and D5b (D-M2-09) remain
+production-release blockers; no production authorization of Milestone 3.

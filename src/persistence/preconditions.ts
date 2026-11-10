@@ -39,6 +39,34 @@ export async function checkOperationalPreconditions(client: ClientBase): Promise
   ];
 }
 
+/**
+ * Collector logging safety (Milestone 3, M3-P2B). Must run in a real si_collector session: role
+ * settings apply at login, so only the session that will carry an evidence payload can show
+ * what the server will log for it. Evidence payloads are sent only when every check passes.
+ * Out of scope: a superuser changing system settings later, extensions, debug log levels.
+ */
+export async function checkCollectorLogging(client: ClientBase): Promise<PreconditionResult[]> {
+  const s = (await client.query<{
+    who: string; plen: string; plen_err: string; stmt: string; dur: string; sample: string; rate: string;
+  }>(`SELECT current_user AS who,
+             current_setting('log_parameter_max_length') AS plen,
+             current_setting('log_parameter_max_length_on_error') AS plen_err,
+             current_setting('log_statement') AS stmt,
+             current_setting('log_min_duration_statement') AS dur,
+             current_setting('log_min_duration_sample') AS sample,
+             current_setting('log_transaction_sample_rate') AS rate`)).rows[0];
+  if (!s) throw new Error('PRECONDITIONS_FAILED: could not read collector session settings');
+  return [
+    { name: 'collector_session', ok: s.who === 'si_collector', actual: s.who, expected: 'si_collector' },
+    { name: 'log_parameter_max_length', ok: s.plen === '0', actual: s.plen, expected: '0' },
+    { name: 'log_parameter_max_length_on_error', ok: s.plen_err === '0', actual: s.plen_err, expected: '0' },
+    { name: 'log_statement', ok: s.stmt === 'none' || s.stmt === 'ddl', actual: s.stmt, expected: 'none or ddl' },
+    { name: 'log_min_duration_statement', ok: s.dur === '-1', actual: s.dur, expected: '-1' },
+    { name: 'log_min_duration_sample', ok: s.sample === '-1', actual: s.sample, expected: '-1' },
+    { name: 'log_transaction_sample_rate', ok: Number(s.rate) === 0, actual: s.rate, expected: '0' }
+  ];
+}
+
 /** Throws with every failed precondition listed; resolves when all hold. */
 export async function assertOperationalPreconditions(client: ClientBase): Promise<void> {
   const failed = (await checkOperationalPreconditions(client)).filter(p => !p.ok);

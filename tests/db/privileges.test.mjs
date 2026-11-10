@@ -8,7 +8,7 @@ import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, r
 
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
 const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
-                'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope'];
+                'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope', 'si.ads', 'si.observations'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
@@ -40,8 +40,8 @@ const EXPECTED_EXECUTE = {
   si_publish_margin: ['si_collector']
 };
 const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_reap_expired_runs',
-                          'si_record_rights_version', 'si_record_source_control', 'trg_receipts_run_completed',
-                          'trg_run_errors_count', 'trg_runs_publish_check'];
+                          'si_record_rights_version', 'si_record_source_control', 'trg_ad_has_observation',
+                          'trg_observation_run_completed', 'trg_receipts_run_completed', 'trg_run_errors_count', 'trg_runs_publish_check'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
   trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
@@ -59,7 +59,10 @@ const EXPECTED_VOLATILITY = {
   trg_receipts_guard: 'v',
   // 0003 request scope
   si_canonical_json_v1: 's', si_fixture_sha256_v1: 's', si_request_sha256_v1: 's', trg_run_scope_insert: 'v',
-  trg_run_scope_append_only: 'v', si_begin_run_scoped: 'v'
+  trg_run_scope_append_only: 'v', si_begin_run_scoped: 'v',
+  // 0005 evidence
+  si_t2_fingerprint: 's', si_t2_row_error: 's', trg_evidence_append_only: 'v', trg_observation_run_completed: 'v',
+  trg_ad_has_observation: 'v'
 };
 
 let db, c;
@@ -159,7 +162,8 @@ test('SD2/G3: role attributes and per-role session settings', async () => {
     assert.equal(r[name].rolcanlogin, name !== 'si_owner', `${name} login`);
   }
   const settings = n => (r[n].rolconfig ?? []).slice().sort();
-  assert.deepEqual(settings('si_collector'), ['idle_in_transaction_session_timeout=10s', 'lock_timeout=30s', 'statement_timeout=30s']);
+  assert.deepEqual(settings('si_collector'), ['idle_in_transaction_session_timeout=10s', 'lock_timeout=30s',
+    'log_parameter_max_length=0', 'log_parameter_max_length_on_error=0', 'statement_timeout=30s']);
   assert.deepEqual(settings('si_rights_admin'), ['idle_in_transaction_session_timeout=10s', 'lock_timeout=30s']);
   assert.deepEqual(settings('si_retention'), ['lock_timeout=30s', 'statement_timeout=120s']);
   assert.deepEqual(settings('si_monitor'), ['statement_timeout=30s']);

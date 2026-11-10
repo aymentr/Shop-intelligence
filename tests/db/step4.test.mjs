@@ -97,10 +97,15 @@ test('S4-2: a stale token, an expired lease, non-EMPTY counts or the wrong isola
     await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, $3::int, $4::int, $5::int, $6::int)',
       [run.run_id, run.lease_token, ...args]), { code: '42883' });
   }
-  for (const payload of ['[{"network":"META"}]', '{}', 'null', '"x"']) {
+  for (const payload of ['{}', 'null', '"x"']) {                     // malformed: refused before any lock (0004/0005)
     await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, $3::jsonb)', [run.run_id, run.lease_token, payload]),
       { code: '22023', message: /^SI_BAD_ARGUMENT/ });
   }
+  // 0005: a non-empty payload on an unscoped (plain T1) run is refused; nothing is written
+  await c.si_collector.query('BEGIN');
+  await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, $3::jsonb)', [run.run_id, run.lease_token, '[{"network":"META"}]']),
+    { code: CHECK, message: /^SI_T2_VALIDATION_FAILED/ });
+  await c.si_collector.query('ROLLBACK');
   await c.si_collector.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
   await rejects(assert, c.si_collector.query(T2_SQL, [run.run_id, run.lease_token]), { code: '25000', message: /^SI_ISOLATION/ });
   await c.si_collector.query('ROLLBACK');

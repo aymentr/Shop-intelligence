@@ -7,8 +7,11 @@
  * independent expired-run reaper. Step 4 adds the T2 protocol for EMPTY runs (completeRun).
  * Milestone 3 part 1 adds the scoped T1 (t1PreflightScoped): the database verifies the v1 request
  * hash and records the request scope a later non-empty completion will be checked against.
+ * Milestone 3 part 2B adds completeRunWithEvidence: bounded, synthetic-only evidence persistence.
  */
+import { randomUUID } from 'node:crypto';
 import type { ClientBase } from 'pg';
+import { checkCollectorLogging } from './preconditions.js';
 
 export interface T1Request {
   sourceId: string;
@@ -147,7 +150,7 @@ export async function reapExpiredRuns(client: ClientBase, limit = 100): Promise<
 /** T2 failure codes, in the order the database decides them (plan section 3.3). */
 export type T2FailureCode =
   | 'LEASE_EXPIRED' | 'RIGHTS_TERMINATED' | 'SOURCE_SUSPENDED' | 'SOURCE_RETIRED' | 'RIGHTS_CHANGED'
-  | 'RIGHTS_EXPIRING' | 'VALIDATION_FAILED' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR';
+  | 'RIGHTS_EXPIRING' | 'VALIDATION_FAILED' | 'DUPLICATE_CONFLICT' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR';
 
 export type T2Result =
   | { outcome: 'COMPLETED'; runId: string; publishControlSeq: number; finishedAt: Date }
@@ -158,14 +161,15 @@ export type T2Result =
 
 /** A caller error refused before any write (bad arguments, wrong isolation). No T3 is attempted. */
 export class T2Refused extends Error {
-  constructor(readonly code: 'BAD_ARGUMENT' | 'ISOLATION', message: string, readonly sqlstate?: string) {
+  constructor(readonly code: 'BAD_ARGUMENT' | 'ISOLATION' | 'UNSAFE_LOGGING' | 'UNSAFE_PAYLOAD', message: string,
+              readonly sqlstate?: string) {
     super(message);
     this.name = 'T2Refused';
   }
 }
 
 const T2_CODES = new Set<T2FailureCode>(['LEASE_EXPIRED', 'RIGHTS_TERMINATED', 'SOURCE_SUSPENDED', 'SOURCE_RETIRED',
-  'RIGHTS_CHANGED', 'RIGHTS_EXPIRING', 'VALIDATION_FAILED', 'LOCK_TIMEOUT', 'PERSISTENCE_ERROR']);
+  'RIGHTS_CHANGED', 'RIGHTS_EXPIRING', 'VALIDATION_FAILED', 'DUPLICATE_CONFLICT', 'LOCK_TIMEOUT', 'PERSISTENCE_ERROR']);
 
 /**
  * T2 (controlled protocol, D2'): sends exactly BEGIN, SELECT si.si_complete_run(...), COMMIT.
@@ -192,5 +196,124 @@ export async function completeRun(client: ClientBase, runId: string, leaseToken:
     let failRecorded = false;
     try { failRecorded = await failRun(client, runId, leaseToken, code); } catch { /* the reaper will expire it */ }
     return { outcome: 'FAILED', code, failRecorded };
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Milestone 3 part 2B: non-empty evidence completion.
+// ---------------------------------------------------------------------------------------------
+
+/** Bounds enforced before transmission (the database enforces them again, on the jsonb text form). */
+export const MAX_EVIDENCE_ROWS = 500;
+export const MAX_EVIDENCE_BYTES = 1048576;
+
+const EVIDENCE_FIELDS = new Set(['network', 'nativeAdId', 'advertiserName', 'countries', 'seenAt', 'sourceUrl', 'title',
+  'destinationUrl', 'creativeUrl', 'sourceReportedFirstSeen', 'sourceReportedLastSeen']);
+
+/** Coded diagnostics of a refused payload: codes, row indices and field names only. */
+export interface T2Diagnostics {
+  errorCount: number;
+  records: RunError[];
+}
+
+const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+
+/**
+ * Strict parser for the database's diagnostics DETAIL. Accepts exactly
+ * {"v":1,"n":N,"e":[{"c":CODE,"r":row|null,"f":field|null} x min(N,100)]} with known field names
+ * and in-range row indices; anything else returns null (fail closed: no records are trusted).
+ */
+export function parseT2Diagnostics(detail: unknown, rowCount: number): T2Diagnostics | null {
+  if (typeof detail !== 'string' || detail.length > 8192) return null;
+  let d: unknown;
+  try { d = JSON.parse(detail); } catch { return null; }
+  if (!isPlainObject(d) || Object.keys(d).sort().join(',') !== 'e,n,v') return null;
+  const { v, n, e } = d;
+  if (v !== 1 || typeof n !== 'number' || !Number.isInteger(n) || n < 1 || n > 1_000_000) return null;
+  if (!Array.isArray(e) || e.length !== Math.min(n, 100)) return null;
+  const records: RunError[] = [];
+  for (const x of e) {
+    if (!isPlainObject(x) || Object.keys(x).sort().join(',') !== 'c,f,r') return null;
+    const { c, r, f } = x;
+    if (typeof c !== 'string' || !/^[A-Z][A-Z_]{2,40}$/.test(c)) return null;
+    if (!(r === null || (typeof r === 'number' && Number.isInteger(r) && r >= 0 && r < rowCount))) return null;
+    if (!(f === null || (typeof f === 'string' && EVIDENCE_FIELDS.has(f)))) return null;
+    records.push({ code: c, rowIndex: r, field: f });
+  }
+  return { errorCount: n, records };
+}
+
+// A NUL or an unpaired surrogate makes PostgreSQL's JSON input fail with an error that quotes
+// the input, so such payloads are refused before transmission.
+const UNSAFE_TEXT = /\u0000|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+function payloadSafe(v: unknown, depth = 0): boolean {
+  if (depth > 32) return false;
+  if (typeof v === 'string') return !UNSAFE_TEXT.test(v);
+  if (v === null || typeof v === 'boolean') return true;
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (Array.isArray(v)) return v.every(x => payloadSafe(x, depth + 1));
+  if (isPlainObject(v)) return Object.entries(v).every(([k, x]) => !UNSAFE_TEXT.test(k) && payloadSafe(x, depth + 1));
+  return false;                                           // undefined, functions, class instances
+}
+
+export type T2EvidenceResult =
+  | { outcome: 'COMPLETED'; runId: string; publishControlSeq: number; finishedAt: Date; retentionState: string;
+      counts: { received: number; published: number; duplicate: number; conflict: number } }
+  /** Rolled back; T3 then recorded the code and, when the diagnostics parsed strictly, the coded errors. */
+  | { outcome: 'FAILED'; code: T2FailureCode; failRecorded: boolean; diagnostics: T2Diagnostics | null }
+  | { outcome: 'NOT_OWNER' };
+
+const REFUSAL: Record<string, string> = {
+  BAD_ARGUMENT: 'the evidence payload is outside the accepted bounds',
+  ISOLATION: 'collection runs require READ COMMITTED',
+  UNSAFE_LOGGING: 'this collector session could log evidence parameters'
+};
+
+/**
+ * T2 with an evidence payload (synthetic sources only). Before anything is sent: row and byte
+ * bounds, NUL / malformed-Unicode / non-JSON values, and collector logging safety in this very
+ * session (D7). Then exactly BEGIN, SELECT si.si_complete_run(run, token, rows), COMMIT; on error
+ * ROLLBACK and T3. Never returns or throws PostgreSQL error text: results carry codes only.
+ */
+export async function completeRunWithEvidence(
+  client: ClientBase, runId: string, leaseToken: string, rows: unknown[]
+): Promise<T2EvidenceResult> {
+  if (!Array.isArray(rows)) throw new T2Refused('BAD_ARGUMENT', 'evidence rows must be an array');
+  if (rows.length > MAX_EVIDENCE_ROWS) throw new T2Refused('BAD_ARGUMENT', REFUSAL.BAD_ARGUMENT as string);
+  if (!payloadSafe(rows)) throw new T2Refused('UNSAFE_PAYLOAD', 'the evidence payload contains NUL, malformed Unicode or non-JSON values');
+  const body = JSON.stringify(rows);
+  if (Buffer.byteLength(body, 'utf8') > MAX_EVIDENCE_BYTES) throw new T2Refused('BAD_ARGUMENT', REFUSAL.BAD_ARGUMENT as string);
+  if (rows.length > 0) {
+    const unsafe = (await checkCollectorLogging(client)).filter(p => !p.ok).map(p => p.name);
+    if (unsafe.length > 0) throw new T2Refused('UNSAFE_LOGGING', `${REFUSAL.UNSAFE_LOGGING}: ${unsafe.join(', ')}`);
+  }
+  await client.query('BEGIN');
+  try {
+    const res = await client.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, $3::jsonb)', [runId, leaseToken, body]);
+    await client.query('COMMIT');
+    const r = res.rows[0];
+    return { outcome: 'COMPLETED', runId: r.run_id, publishControlSeq: r.publish_control_seq, finishedAt: r.finished_at,
+             retentionState: r.retention_state,
+             counts: { received: r.received_count, published: r.published_count, duplicate: r.duplicate_count, conflict: r.conflict_count } };
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch { /* connection may be gone */ }
+    const e = err as { message?: string; code?: string; detail?: unknown };
+    const prefix = /^SI_([A-Z0-9_]+):/.exec(typeof e?.message === 'string' ? e.message : '')?.[1];
+    if (prefix === 'BAD_ARGUMENT' || prefix === 'ISOLATION' || prefix === 'UNSAFE_LOGGING') {
+      throw new T2Refused(prefix, REFUSAL[prefix] as string, e.code);
+    }
+    if (prefix === 'T2_NOT_OWNER') return { outcome: 'NOT_OWNER' };
+    const named = prefix?.startsWith('T2_') ? prefix.slice(3) as T2FailureCode : undefined;
+    const code: T2FailureCode = named && T2_CODES.has(named) ? named : e?.code === '55P03' ? 'LOCK_TIMEOUT' : 'PERSISTENCE_ERROR';
+    const diagnostics = code === 'VALIDATION_FAILED' || code === 'DUPLICATE_CONFLICT' ? parseT2Diagnostics(e.detail, rows.length) : null;
+    let failRecorded = false;
+    try {
+      failRecorded = await failRun(client, runId, leaseToken, code,
+        diagnostics ? { errorCount: diagnostics.errorCount, records: diagnostics.records, correlationId: randomUUID() } : undefined);
+    } catch {
+      try { failRecorded = await failRun(client, runId, leaseToken, code); } catch { /* the reaper will expire it */ }
+    }
+    return { outcome: 'FAILED', code, failRecorded, diagnostics };
   }
 }
