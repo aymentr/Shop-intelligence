@@ -158,6 +158,7 @@ echo 'DR-1 schema, migration objects, grants, default ACLs and D5b function ACLs
 
 # Actual restored-cluster operational preflight and role privilege probes.
 SI_DATABASE_URL="postgresql://si_restore_admin:local-test-only@127.0.0.1:${target_port}/si_template_test" \
+  SI_COLLECTOR_DATABASE_URL="postgresql://si_collector:local-test-only@127.0.0.1:${target_port}/si_template_test" \
   node dist/persistence/cli.js preflight --production
 echo 'DR-1 restored production-mode D5b/D7 preflight PASS (disposable target only)'
 SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
@@ -171,4 +172,10 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^RT-(2|11|14):' tests/db/m3-retention.test.mjs
 echo 'DR-1 restored retention purge, purge privileges and 0006 reversibility PASS'
+# Migration 0007 on the restored cluster: verification, its privilege boundary and the production gate.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^(VR-(1|10|13):|PR-(1|3|4):)' tests/db/m3-verification.test.mjs tests/db/production-gate.test.mjs
+echo 'DR-1 restored receipt verification, verification privileges and D7 production gate PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

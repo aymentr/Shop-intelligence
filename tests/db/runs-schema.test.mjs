@@ -185,10 +185,15 @@ test('S9 (IA1c, EC4 schema part): receipts name exactly their run\'s source and 
   await rejects(assert, receipt({ source_id: 'rs-b' }), { code: FK, message: /receipts_match_run|receipts_ia1/ });       // version of another source
   await rejects(assert, receipt({ run_id: runB }), { code: FK, message: /receipts_match_run/ });                         // another run
   await rejects(assert, receipt({ run_id: randomUUID() }), { code: FK, message: /receipts_match_run/ });
-  await rejects(assert, receipt({ within_validity: true }), { code: CHECK, message: /receipts_validity_needs_commit_ts/ });
+  await rejects(assert, receipt({ within_validity: true }), { code: CHECK, message: /receipts_validity_needs_commit_ts|receipts_legacy_columns_unused/ });
   await receipt({});
   await rejects(assert, receipt({}), { code: UNIQUE });                                                                 // one per run
-  await insertAs('publication_receipts', { run_id: runB, source_id: 'rs-b', rights_version_id: VB, commit_ts: NOW(), within_validity: true });
+  // 0007: the legacy monitor columns can never carry a value (no fabricated commit time or validity).
+  for (const legacy of [{ commit_ts: NOW() }, { commit_ts: NOW(), within_validity: true }, { within_validity: false }]) {
+    await rejects(assert, insertAs('publication_receipts', { run_id: runB, source_id: 'rs-b', rights_version_id: VB, ...legacy }),
+      { code: CHECK, message: /receipts_legacy_columns_unused|receipts_validity_needs_commit_ts/ });
+  }
+  await insertAs('publication_receipts', { run_id: runB, source_id: 'rs-b', rights_version_id: VB });
   const r = (await c.admin.query(`SELECT receipt_at IS NOT NULL AS stamped FROM si.publication_receipts WHERE run_id = $1`, [run])).rows[0];
   assert.equal(r.stamped, true);
 });

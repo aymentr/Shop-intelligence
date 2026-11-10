@@ -1,8 +1,8 @@
 # B-002 Milestone 3 — design contract (migrations 0003 and later)
 
-**Status: design contract with implementation record. Migrations 0003–0005 are accepted development
-milestones; migration 0006 (§12) is implemented and pending independent acceptance. Nothing here is
-production-approved.** (The original status, "proposed design", applied to the first revision.)
+**Status: design contract with implementation record. Migrations 0003–0006 are accepted development
+milestones; migration 0007 (§13) is implemented and pending independent acceptance. Nothing here is
+production-approved; D8/G3 is not production-resolved.** (The original status, "proposed design", applied to the first revision.)
 Baseline: `ccb87ed91954e11d4fa4c6c37b3a782357640595` (Milestone 2: conditional development
 acceptance, D-M2-01; CI #109 green).
 Authority: `docs/b002-m2-plan.md` revision 2 and the Milestone 2 closure decisions D-M2-01…D-M2-10
@@ -33,10 +33,15 @@ Implemented so far (none is production-approved):
   FD7 end-to-end scope enforcement is accepted through it (EV-1…EV-3).
 - **0006 — retention enforcement and safe purge** (M3-P3A, §12): effective retention end, RETAINED →
   PURGED state machine, data-based evidence guard, `si_purge_due`, content-free audit and status.
-  Tests RT-1…RT-14, RT-M (6 mutants), RL-1…RL-3, M1f. **Pending independent acceptance.**
+  Tests RT-1…RT-14, RT-M (6 mutants), RL-1…RL-3, M1f. **Accepted** (baseline `c0b2cce`, CI #115).
+- **0007 — receipt verification** (M3-P3B, §13): `si.receipt_verifications` (VALID / INVALID /
+  UNVERIFIABLE, database-computed, append-only), `si_verify_receipts` (si_monitor), frozen legacy receipt
+  columns, fail-closed `si_evidence_readable` (granted to no role), RIGHTS_ENDED purge label, D7 production
+  gate with a live collector session. Tests VR-1…VR-16, VR-M (9 mutants), PR-1…PR-5, RT-15, VL-1…VL-3,
+  M1g. **Pending independent acceptance.**
 
-Not implemented: the read function, monitors (receipt `commit_ts` / `within_validity`), D8,
-suppression, `publication_gate`, deletion requests, live adapters. §10 and §12.6 list what remains unverified.
+Not implemented: any read function or reader role (D8's read gate), suppression, `publication_gate`,
+deletion requests, live adapters. §10, §12.6 and §13.7 list what remains unverified.
 
 ## 1. Frozen scope (PROPOSED)
 
@@ -79,7 +84,9 @@ content read or serving.
 | FD9 | APPROVED; v1 frozen and reproduced in SQL (SC-1, EV-1); non-reproducible inputs fail closed | Canonical fixture hashing: preserve historical request-hash and retry compatibility; versioning policy in §4.4. |
 | FD10 | APPROVED; IMPLEMENTED in 0005 + bootstrap + D7 + library; canaries EV-11/EV-12 pass | Collector logging preconditions (§5.1). No claim of absolute protection from server logging; effective-session checks and negative leakage tests (M3-T19, M3-T21) are required. |
 | FD12 | APPROVED (M3-P3A authorization); IMPLEMENTED in 0006 | Retention decisions: retirement alone does not end retention; TERMINATE_RETENTION and applicable rights changes shorten the effective end; orphan identities are deleted completely, without tombstone digests; the stricter applicable cleanup deadline applies; evidence with unverifiable commit timestamps follows normal retention; no derived advertising evidence is kept beyond retention (§12.1). |
-| FD13 | **PROPOSED — BD1 amendment, pending acceptance** | Definer allowlist × grantees gains: `si_retention` → `si_purge_due`, `si_record_purge_failure`; `si_retention`, `si_monitor` → `si_retention_status`, `si_purge_failures`; `si_retention` SELECT on `si.purge_log`, `si.purge_failures`. No application role gains any privilege on `si.ads` or `si.observations` (privileges G1/SD1). |
+| FD13 | **ACCEPTED with M3-P3A** — BD1 amendment | Definer allowlist × grantees gains: `si_retention` → `si_purge_due`, `si_record_purge_failure`; `si_retention`, `si_monitor` → `si_retention_status`, `si_purge_failures`; `si_retention` SELECT on `si.purge_log`, `si.purge_failures`. No application role gains any privilege on `si.ads` or `si.observations` (privileges G1/SD1). |
+| FD14 | APPROVED (M3-P3B security proof decisions); IMPLEMENTED in 0007 | Verdicts in a new append-only table, legacy receipt columns frozen (F1); verifier executed by `si_monitor` only (F2); VALID ⇔ `window_start ≤ commit_ts < window_end` with no extra margin (F3); INVALID / UNVERIFIABLE evidence follows normal retention (F4, FD12); slow CI job for real deadlines (F5); the `SET CONSTRAINTS … IMMEDIATE` vector is detected, not prevented (F6); RIGHTS_ENDED label fix (F7); D7 gate requires the collector login (F8); `step2-d5b.mjs` rebuild fix (F9). |
+| FD15 | **PROPOSED — BD1 amendment, pending acceptance** | Definer allowlist × grantees gains: `si_monitor` → `si_verify_receipts`, `si_record_verification_failure`, `si_verification_status`, `si_verification_failures`. No table grant on `si.receipt_verifications` / `si.verification_failures`; `si_evidence_readable`, `si_receipt_verdict`, `si_commit_ts` granted to no role. |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -549,7 +556,8 @@ Implementation status of the former blockers (all pending founder acceptance):
 4. **FD5:** EV-15 passes on PostgreSQL 16.15 (local and CI image); production must re-measure.
 
 Production-release blockers (unchanged from Milestone 2):
-5. **D8 / G3 (D-M2-10).**
+5. **D8 / G3 (D-M2-10).** 0007 provides commit-time verification and a fail-closed predicate (§13); the
+   read gate itself (0008+, a reader role, the predicate wired into it) and independent verification remain.
 6. **D5b (D-M2-09):** applied and verified on each production database; production preflight must
    fail closed without it.
 7. A production host able to perform D5b (`docs/b002-d5b-production-hardening.md`), and an
@@ -744,3 +752,94 @@ records. Exception: the purge deletes 6 before 5 under its exclusive rank-3 lock
 - Timing measured on the PostgreSQL 16.15 test image only; production must re-measure.
 - Production blockers unchanged: D8/G3 (D-M2-10), D5b (D-M2-09), D7 production gate composition
   (collector logging is not part of `assertProductionReady`). Retention is **not production-ready**.
+
+## 13. Verified commit authorization (M3-P3B, migration 0007) — IMPLEMENTED, pending independent acceptance
+
+Scope: synthetic evidence only; **no evidence-reading interface, no reader role, no evidence grant**.
+A completion receipt never authorizes anything by itself. Migrations 0001–0006 are unchanged.
+
+### 13.1 Why (G3, reproduced)
+On PostgreSQL 16.15 the collector can run `SET CONSTRAINTS si.trg_runs_publish_check IMMEDIATE`: T2's
+publication check then passes at the statement, the transaction is kept active, and COMMIT succeeds
+after the rights window has closed (slow test VR-2: committed after `expires_at`). PostgreSQL offers no
+commit-time hook to refuse it. The library protocol (deferred check) refuses the same late COMMIT, and
+`SET CONSTRAINTS ALL IMMEDIATE` cannot complete a non-empty run at all (VR-3). 0007 therefore
+**detects** such commits and makes their evidence permanently non-readable (decision F6).
+
+### 13.2 Verdict (computed by the database; never taken from a caller)
+For a COMPLETED run with evidence, `si_receipt_verdict` (granted to no role) evaluates, in order:
+1. `NO_EVIDENCE` (UNVERIFIABLE): no observation left (purged before verification).
+2. `IDENTITY_MISMATCH` (UNVERIFIABLE): the observations do not share exactly one transaction id, it
+   differs from the receipt's xmin, or it is a special id (< 3). Observations are never updated and
+   receipts can no longer be updated, so both carry T2's (sub)transaction id (VR-1, VR-5, VR-6).
+3. `XID_TOO_OLD` (UNVERIFIABLE): `age(xid)` above 100 million (`si_verification_max_xid_age`), far below
+   the freeze horizon at which commit timestamps are truncated and a raw 32-bit xmin could alias.
+4. `NO_COMMIT_TIMESTAMP` (UNVERIFIABLE): `pg_xact_commit_timestamp` returns NULL (truncated, committed
+   while tracking was off, or lost when tracking was turned off and on).
+5. `CLOCK_INCONSISTENT` (UNVERIFIABLE): the commit timestamp precedes T2's own clock reading
+   (`finished_at`) or follows the verification time — evidence of a backward clock step.
+6. `RIGHTS_NOT_ALLOWED` / `COMMITTED_BEFORE_WINDOW` / `COMMITTED_AFTER_WINDOW` (INVALID), else
+   `COMMITTED_IN_WINDOW` (VALID). The window is `[effective_from(v), least(si_window_end(v), source
+   retired_at))`; VALID requires `window_start ≤ commit_ts < window_end` (no extra margin, F3).
+With `track_commit_timestamp` off the verifier and the insert trigger refuse (`SI_COMMIT_TS_DISABLED`)
+and record nothing (VR-12). Every INSERT into `si.receipt_verifications` names a run only; the BEFORE
+INSERT trigger overwrites every other field (VR-8). Rows are append-only for every role; CHECKs tie the
+verdict to its fields.
+
+**Stability.** Later events cannot move a window end before their own recording time (no back-dated
+versions; controls record `greatest(now, previous)`), so a recorded VALID or INVALID stays correct —
+assuming a monotonic clock. A retirement time set in the past later, or any arbitrary clock rollback,
+is not covered; the read predicate re-checks the current state anyway.
+
+### 13.3 Receipts
+`publication_receipts.commit_ts` and `within_validity` are permanently NULL
+(`receipts_legacy_columns_unused`), and the receipt guard now refuses every UPDATE, DELETE and
+TRUNCATE for every role including `si_owner` (0002 allowed the owner to set both once, to any value —
+reproduced in M3-P3B). The receipt's xmin therefore stays the completion's.
+
+### 13.4 Verifier, status and failures
+- `si_verify_receipts(p_limit 1..500, default 100)`: SECURITY DEFINER, pinned `search_path`, EXECUTE for
+  `si_monitor` only; READ COMMITTED only; oldest pending runs first; idempotent (primary key +
+  `ON CONFLICT DO NOTHING`; a concurrent verifier waits for the first, then skips — VR-9); returns counts.
+  It takes **no source lock**: SUSPEND / TERMINATE and completions never wait for it (VR-15). Its only
+  row lock is the FK check's KEY SHARE on the run row (a concurrent purge of that run waits briefly).
+- `si_verification_status()`: pending count, VALID / INVALID / UNVERIFIABLE counts, oldest pending age,
+  the 60-second lag target (`si_verification_lag_target`, an operational objective, not a guarantee),
+  the largest pending xid age with a warning at half the limit, failures in the last 24 hours.
+- `si.verification_failures` + `si_record_verification_failure` (codes and SQLSTATE only).
+- Library `src/persistence/verification.ts`; CLI `cli.js verification run|status|failures`
+  (`status` exits 2 on lag or xid-age warning). Nothing is scheduled.
+
+### 13.5 Fail-closed readability predicate (for a future read path)
+`si_evidence_readable(run_id)` is SECURITY INVOKER and granted to **no role**; it reads nothing out. It
+is true only if the stored verdict is VALID **and, evaluated now,** the run is COMPLETED and RETAINED,
+the source is SYNTHETIC, not retired (nor retiring within the 60 s margin), not suspended, not
+terminated for the collected version, retention has not ended (60 s margin), the rights version in
+effect now allows evaluation and retention and is not expiring, and every network of the evidence is
+still a supported network (VR-11). It is false for pending, INVALID and UNVERIFIABLE runs.
+
+### 13.6 Also in 0007 and this milestone
+- Purge audit label: a stored deadline that T2 already shortened to a rights event is `RIGHTS_ENDED`
+  (RT-15 shows the expiry path end to end; a successor version never extends the stored bound).
+- D7 production gate: `assertProductionReady(client, { collector })` requires a live `si_collector`
+  session on the same database and checks its effective logging settings; the CLI's production paths
+  require `SI_COLLECTOR_DATABASE_URL`. Missing, wrong role, other database, unsafe settings (including
+  database-level overrides) or checks that cannot complete fail closed (PR-1…PR-5). The per-call check
+  in `completeRunWithEvidence` is unchanged.
+- `tests/mutations/step2-d5b.mjs` rebuilds `dist/` after restoring the source and proves the mutant is gone.
+
+### 13.7 Trust boundary, limitations and unverified assumptions
+- **Superuser** sessions can bypass every trigger (e.g. `session_replication_role`) and could rewrite
+  any record; `si_owner` / the migrator can replace functions (DDL). Both are outside the boundary; the
+  catalog fingerprint, privilege and migration-checksum tests detect unreviewed changes.
+- **Clock:** the verdict assumes a monotonic server clock; `CLOCK_INCONSISTENT` catches only rollbacks
+  visible between T2's reading and the commit timestamp. Arbitrary clock rollback is not solved.
+- **Wraparound:** aliasing after 2^32 transactions is prevented only by the age limit (verification must
+  happen within 100 million xids); not tested beyond about 200,000 xids.
+- **Restores:** physical restores keep identities and timestamps; a per-table logical restore yields
+  IDENTITY_MISMATCH; a single-transaction logical restore yields the restore time (only ever later, so
+  never a false VALID). Verification rows restore as data.
+- **Operations:** verification must run within the lag target and before the age limit;
+  `track_commit_timestamp` must never be turned off (it erases history). Nothing is scheduled.
+- **D8 is not resolved:** the read gate (reader role, bounded read function using this predicate) does
+  not exist; independent verification is still required (D-M2-10). D5b and production hosting are unchanged.

@@ -237,7 +237,7 @@ test('S4-9: no role reaches COMPLETED outside T2 - app roles lack privileges; th
   await assertUntouched(run);
 });
 
-test('S4-10: receipts need a COMPLETED run and are permanent; only the monitor columns are set once', async () => {
+test('S4-10: receipts need a COMPLETED run and are permanent; since 0007 no column can be set, not even the legacy monitor columns', async () => {
   const src = await source();
   const running = await begin(src, 'running');
   await rejects(assert, asOwner(c.admin, x => x.query(
@@ -247,9 +247,10 @@ test('S4-10: receipts need a COMPLETED run and are permanent; only the monitor c
   assert.equal((await completeRun(c.si_collector, run.run_id, run.lease_token)).outcome, 'COMPLETED');
   const own = sql => asOwner(c.admin, x => x.query(sql, [run.run_id]));
   const immutable = { code: CHECK, message: /^SI_RECEIPT_IMMUTABLE/ };
-  await own('UPDATE si.publication_receipts SET commit_ts = clock_timestamp() WHERE run_id = $1');
-  await own('UPDATE si.publication_receipts SET within_validity = true WHERE run_id = $1');
   for (const sql of ['UPDATE si.publication_receipts SET commit_ts = clock_timestamp() WHERE run_id = $1',
+                     'UPDATE si.publication_receipts SET within_validity = true WHERE run_id = $1',
+                     `UPDATE si.publication_receipts SET commit_ts = '2000-01-01', within_validity = true WHERE run_id = $1`,
+                     'UPDATE si.publication_receipts SET commit_ts = NULL WHERE run_id = $1',
                      'UPDATE si.publication_receipts SET within_validity = false WHERE run_id = $1',
                      'UPDATE si.publication_receipts SET receipt_at = clock_timestamp() WHERE run_id = $1',
                      'DELETE FROM si.publication_receipts WHERE run_id = $1']) {

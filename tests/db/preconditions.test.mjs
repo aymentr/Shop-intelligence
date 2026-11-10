@@ -109,13 +109,16 @@ test('D5b decision A: hardened disposable database passes shared readiness and p
   try {
     const sql = readFileSync(new URL('../../db/bootstrap/optional/advisory-lock-hardening.sql', import.meta.url), 'utf8');
     await client.query(sql); // disposable test database, pg_catalog owner only
-    await assertProductionReady(client);
+    const collector = await connect({ user: 'si_collector', database: hardened });
+    try { await assertProductionReady(client, { collector }); } finally { await collector.end(); }
   } finally { await client.end(); }
   const cli = fileURLToPath(new URL('../../dist/persistence/cli.js', import.meta.url));
   const url = `postgres://${cfg.adminUser}:${encodeURIComponent(cfg.adminPassword)}@${cfg.host}:${cfg.port}/${hardened}`;
-  const env = { ...process.env, SI_DATABASE_URL: url };
+  const curl = `postgres://si_collector:${encodeURIComponent(cfg.rolePassword)}@${cfg.host}:${cfg.port}/${hardened}`;
+  const env = { ...process.env, SI_DATABASE_URL: url, SI_COLLECTOR_DATABASE_URL: curl };
   delete env.SI_PRODUCTION;
   const r = spawnSync(process.execPath, [cli, 'preflight', '--production'], { encoding: 'utf8', env });
   assert.equal(r.status, 0, r.stdout + r.stderr);
-  assert.equal((r.stdout.match(/^ok /gm) ?? []).length, 9, r.stdout);
+  // 5 operational + 4 D5b + 7 collector logging (incl. session role) checks
+  assert.equal((r.stdout.match(/^ok /gm) ?? []).length, 16, r.stdout);
 });

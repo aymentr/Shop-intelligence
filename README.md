@@ -45,7 +45,8 @@ collection, no production deployment.
 | 0003 | request scope (scoped T1, FD7 option C) | M3-P1, accepted (scope foundation) |
 | 0004 | completion hardening (`si_complete_run(uuid, uuid, jsonb)`) | M3-P2A, accepted |
 | 0005 | atomic evidence persistence (`si.ads`, `si.observations`), collector logging prerequisite | M3-P2B, accepted as a development milestone; FD7 end-to-end scope enforcement accepted through P2B |
-| 0006 | retention enforcement and safe purge (`si_purge_due`, purge audit, retention status) | M3-P3A, implemented, **pending independent acceptance** |
+| 0006 | retention enforcement and safe purge (`si_purge_due`, purge audit, retention status) | M3-P3A, accepted |
+| 0007 | receipt verification (VALID / INVALID / UNVERIFIABLE), frozen legacy receipt columns, fail-closed readability predicate (granted to no role) | M3-P3B, implemented, **pending independent acceptance** |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
@@ -64,6 +65,17 @@ SI_DATABASE_URL=<si_retention login> node dist/persistence/cli.js retention purg
 SI_DATABASE_URL=<si_monitor login>   node dist/persistence/cli.js retention status | overdue | failures
 ```
 
+Receipt verification (0007): `si_verify_receipts` (executable only by `si_monitor`) classifies each
+completed run with evidence from PostgreSQL's own transaction id and commit timestamp; a receipt alone
+never authorizes anything, and no evidence can be read in this milestone.
+
+```bash
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js verification run [--limit N] | status | failures
+```
+
+Production mode (`SI_PRODUCTION=1`, `preflight --production`) also requires `SI_COLLECTOR_DATABASE_URL`:
+the gate checks a live collector session's effective logging settings and fails closed without it.
+
 Deleted rows stay in PostgreSQL storage until vacuumed, and in WAL, backups and replicas under
 their own retention: the purge is a logical deletion, not secure erasure. Retention is enforced for
 synthetic evidence in development only and is **not production-ready**.
@@ -71,7 +83,8 @@ synthetic evidence in development only and is **not production-ready**.
 Design and status: `docs/b002-m3-design.md` (Milestone 3, §12 for retention), `docs/b002-persistence.md`
 (foundation), `docs/b002-m2-final-acceptance.md` (Milestone 2 decisions).
 **Release invariant:** no production content-serving path may launch until the publication
-timing gap D8/G3 is resolved and independently tested (D-M2-10). D5b must be applied and verified
+timing gap D8/G3 is resolved and independently tested (D-M2-10); 0007 adds commit-time verification,
+not the read gate. D5b must be applied and verified
 on every production database (D-M2-09).
 
 ## Next gates

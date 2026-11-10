@@ -30,9 +30,10 @@ try {
 } finally { await tpl.end(); }
 
 const testDir = fileURLToPath(new URL('./', import.meta.url));
-// Optional: `node tests/db/run.mjs rights privileges` runs only those files.
+// Optional: `node tests/db/run.mjs rights privileges` runs only those files; an argument ending in
+// .mjs is a test file path (used by the slow CI job for tests/slow/*.test.mjs).
 const only = process.argv.slice(2);
-const files = only.length ? only.map(n => `${testDir}${n}.test.mjs`) : [`${testDir}*.test.mjs`];
+const files = only.length ? only.map(n => (n.endsWith('.mjs') ? n : `${testDir}${n}.test.mjs`)) : [`${testDir}*.test.mjs`];
 const res = spawnSync(process.execPath, ['--test', '--test-concurrency=1', ...files], {
   stdio: 'inherit',
   env: { ...process.env, SI_TEST_TEMPLATE: cfg.template }

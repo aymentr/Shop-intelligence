@@ -30,6 +30,12 @@ try {
   const restored = readFileSync(path, 'utf8') === original;
   console.log('Original source restored:', restored);
   if (!restored) throw new Error('Source restoration failed');
+  // The mutant was compiled into dist/: rebuild from the restored source, and prove it is gone.
+  const rebuild = spawnSync('npm', ['run', 'build'], { encoding: 'utf8', timeout: 60000 });
+  const compiled = readFileSync('dist/persistence/preconditions.js', 'utf8');
+  const clean = rebuild.status === 0 && !compiled.includes('si_mutated_collector') && compiled.includes("'si_collector'");
+  console.log('Compiled output rebuilt from the original source:', clean);
+  if (!clean) throw new Error('Compiled output still carries the mutant or failed to rebuild: ' + (rebuild.stderr ?? ''));
 }
 if (!killed) throw new Error('MUTANT_SURVIVED_OR_INCONCLUSIVE: expected MG10 to fail because collector exposure is hidden');
 console.log('MUTANT_KILLED: MG10 detected hidden explicit collector privilege');

@@ -9,7 +9,7 @@ import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, r
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
 const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
                 'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope', 'si.ads', 'si.observations',
-                'si.purge_log', 'si.purge_failures'];
+                'si.purge_log', 'si.purge_failures', 'si.receipt_verifications', 'si.verification_failures'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
@@ -41,11 +41,14 @@ const EXPECTED_EXECUTE = {
   si_window_end: ['si_collector'],
   si_publish_margin: ['si_collector'],
   si_purge_due: ['si_retention'], si_record_purge_failure: ['si_retention'],               // 0006 (retention)
-  si_retention_status: ['si_retention', 'si_monitor'], si_purge_failures: ['si_retention', 'si_monitor']
+  si_retention_status: ['si_retention', 'si_monitor'], si_purge_failures: ['si_retention', 'si_monitor'],
+  si_verify_receipts: ['si_monitor'], si_record_verification_failure: ['si_monitor'],                 // 0007 (verification)
+  si_verification_status: ['si_monitor'], si_verification_failures: ['si_monitor']
 };
 const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_purge_due',
                           'si_purge_failures', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
-                          'si_record_source_control', 'si_retention_status', 'trg_ad_has_observation', 'trg_observation_purge_check',
+                          'si_record_source_control', 'si_record_verification_failure', 'si_retention_status',
+                          'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_purge_check',
                           'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
                           'trg_runs_publish_check', 'trg_runs_purge_check'];
 const EXPECTED_VOLATILITY = {
@@ -72,7 +75,11 @@ const EXPECTED_VOLATILITY = {
   // 0006 retention
   si_effective_retention_end: 's', si_cleanup_due_by: 's', si_retention_end_reason: 's', trg_runs_retention: 'v',
   trg_purge_records_append_only: 'v', trg_runs_purge_check: 'v', trg_observation_purge_check: 'v', trg_purge_log_check: 'v',
-  si_purge_due: 'v', si_record_purge_failure: 'v', si_retention_status: 's', si_purge_failures: 's'
+  si_purge_due: 'v', si_record_purge_failure: 'v', si_retention_status: 's', si_purge_failures: 's',
+  // 0007 receipt verification
+  si_verification_max_xid_age: 'i', si_verification_lag_target: 'i', si_commit_ts: 's', si_receipt_verdict: 's',
+  trg_verification_insert: 'v', trg_verification_records_append_only: 'v', si_verify_receipts: 'v',
+  si_record_verification_failure: 'v', si_verification_status: 's', si_verification_failures: 's', si_evidence_readable: 's'
 };
 
 let db, c;

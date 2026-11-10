@@ -13,6 +13,12 @@
  *   node dist/persistence/cli.js retention status              content-free status (si_retention or si_monitor)
  *   node dist/persistence/cli.js retention overdue             sources past their cleanup deadline (exit 2 if any)
  *   node dist/persistence/cli.js retention failures [--limit N]   recorded purge failures (codes only)
+ *   node dist/persistence/cli.js verification run [--limit N]   one bounded receipt-verification batch (si_monitor)
+ *   node dist/persistence/cli.js verification status            pending / VALID / INVALID / UNVERIFIABLE, lag, xid age
+ *   node dist/persistence/cli.js verification failures [--limit N]   recorded verification failures (codes only)
+ *
+ * Production mode (SI_PRODUCTION=1, or preflight --production) also requires SI_COLLECTOR_DATABASE_URL:
+ * the gate checks a live collector session's effective logging settings and fails closed without it.
  *
  * Retention commands print only codes, ids, times and counts; a failure prints
  * "RETENTION_FAILED code=<code> sqlstate=<state> recorded=<bool>", never a database message.
@@ -28,6 +34,7 @@ import { migrateDown, migrateUp, migrationStatus } from './migrate.js';
 import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
 import { assertProductionReady } from './production-readiness.js';
 import { DEFAULT_PURGE_RUNS, overdueRetention, purgeDue, purgeFailures, RetentionFailed, retentionStatus } from './retention.js';
+import { DEFAULT_VERIFY_RUNS, verificationFailures, verificationStatus, VerificationFailed, verifyReceipts } from './verification.js';
 
 function arg(name: string): string | undefined {
   const i = process.argv.indexOf(name);
@@ -55,11 +62,34 @@ async function retention(client: pg.Client, sub: string | undefined): Promise<vo
   }
 }
 
+async function verification(client: pg.Client, sub: string | undefined): Promise<void> {
+  if (sub === 'run') {
+    console.log(JSON.stringify(await verifyReceipts(client, intArg('--limit', DEFAULT_VERIFY_RUNS))));
+  } else if (sub === 'status') {
+    const status = await verificationStatus(client);
+    console.log(JSON.stringify(status));
+    if (status.lagExceeded || status.xidAgeWarning) process.exitCode = 2;
+  } else if (sub === 'failures') {
+    console.log(JSON.stringify(await verificationFailures(client, intArg('--limit', 20))));
+  } else {
+    throw new Error('usage: cli.js verification run [--limit N] | status | failures [--limit N]');
+  }
+}
+
+/** A live collector session for the production gate, or null (the gate then fails closed). */
+async function collectorSession(): Promise<pg.Client | null> {
+  const curl = process.env.SI_COLLECTOR_DATABASE_URL;
+  if (!curl) return null;
+  const col = new pg.Client({ connectionString: curl, application_name: 'si-preflight-collector' });
+  try { await col.connect(); return col; } catch { await col.end().catch(() => {}); return null; }
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2];
   const url = process.env.SI_DATABASE_URL;
   if (!url) throw new Error('SI_DATABASE_URL is required');
-  const client = new pg.Client({ connectionString: url, application_name: command === 'retention' ? 'si-retention' : 'si-migrate' });
+  const client = new pg.Client({ connectionString: url,
+    application_name: command === 'retention' ? 'si-retention' : command === 'verification' ? 'si-verification' : 'si-migrate' });
   await client.connect();
   try {
     // Production CLI operations and explicit production preflight must fail closed
@@ -67,7 +97,8 @@ async function main(): Promise<void> {
     // Trusted deployment must set SI_PRODUCTION=1 for ALL production entry points.
     if (process.env.SI_PRODUCTION === '1' ||
         (command === 'preflight' && process.argv.includes('--production'))) {
-      await assertProductionReady(client);
+      const col = await collectorSession();
+      try { await assertProductionReady(client, { collector: col }); } finally { await col?.end().catch(() => {}); }
     }
     if (command === 'bootstrap') {
       const passwords: Partial<Record<LoginRole, string>> = {};
@@ -93,7 +124,7 @@ async function main(): Promise<void> {
     } else if (command === 'preflight') {
       const results = await checkOperationalPreconditions(client);
       if (process.argv.includes('--production')) results.push(...await checkProductionAdvisoryPermissions(client));
-      if (process.argv.includes('--collector')) {
+      if (process.argv.includes('--collector') || process.argv.includes('--production')) {
         const curl = process.env.SI_COLLECTOR_DATABASE_URL;
         if (!curl) throw new Error('preflight --collector requires SI_COLLECTOR_DATABASE_URL (an si_collector login)');
         const col = new pg.Client({ connectionString: curl, application_name: 'si-preflight-collector' });
@@ -104,8 +135,10 @@ async function main(): Promise<void> {
       if (results.some(p => !p.ok)) process.exitCode = 1;
     } else if (command === 'retention') {
       await retention(client, process.argv[3]);
+    } else if (command === 'verification') {
+      await verification(client, process.argv[3]);
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight [--production] [--collector] | retention <purge|status|overdue|failures>');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures>');
     }
   } finally {
     await client.end();
@@ -116,6 +149,11 @@ main().catch(err => {
   if (err instanceof RetentionFailed) {
     // Fixed fields only: never a PostgreSQL message, detail or evidence value.
     console.error(`RETENTION_FAILED code=${err.code} sqlstate=${err.sqlstate ?? 'none'} recorded=${err.recorded}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (err instanceof VerificationFailed) {
+    console.error(`VERIFICATION_FAILED code=${err.code} sqlstate=${err.sqlstate ?? 'none'} recorded=${err.recorded}`);
     process.exitCode = 1;
     return;
   }
