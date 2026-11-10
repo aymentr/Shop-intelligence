@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { asOwner, connect, control, createSources, expectWaiterError, expectWaiterOk, freshDatabase, holderCommit, lift, pid,
          recordRights, rejects, roles, waitUntilBlocked, waiter } from './helpers.mjs';
-import { completeRun, heartbeatRun, T2Refused } from '../../dist/persistence/runs.js';
+import { completeRun, heartbeatRun } from '../../dist/persistence/runs.js';
 
 const CHECK = '23514';
 const cleanups = [];
@@ -92,11 +92,15 @@ test('S4-2: a stale token, an expired lease, non-EMPTY counts or the wrong isola
   const run = await begin(src);
   await rejects(assert, rawT2(c.si_collector, run, '00000000-0000-0000-0000-000000000000'), { code: CHECK, message: /^SI_T2_NOT_OWNER/ });
   assert.deepEqual(await completeRun(c.si_collector, run.run_id, '00000000-0000-0000-0000-000000000000'), { outcome: 'NOT_OWNER' });
-  for (const args of [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, -1]]) {
-    await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1, $2, $3, $4, $5, $6)', [run.run_id, run.lease_token, ...args]),
+  // Migration 0004: collectors cannot supply counts at all, and a non-empty payload is refused before any lock.
+  for (const args of [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 5]]) {
+    await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, $3::int, $4::int, $5::int, $6::int)',
+      [run.run_id, run.lease_token, ...args]), { code: '42883' });
+  }
+  for (const payload of ['[{"network":"META"}]', '{}', 'null', '"x"']) {
+    await rejects(assert, c.si_collector.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, $3::jsonb)', [run.run_id, run.lease_token, payload]),
       { code: '22023', message: /^SI_BAD_ARGUMENT/ });
   }
-  await rejects(assert, completeRun(c.si_collector, run.run_id, run.lease_token, { conflictCount: -1 }), T2Refused);
   await c.si_collector.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
   await rejects(assert, c.si_collector.query(T2_SQL, [run.run_id, run.lease_token]), { code: '25000', message: /^SI_ISOLATION/ });
   await c.si_collector.query('ROLLBACK');

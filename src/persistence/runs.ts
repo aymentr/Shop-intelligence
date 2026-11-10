@@ -147,7 +147,7 @@ export async function reapExpiredRuns(client: ClientBase, limit = 100): Promise<
 /** T2 failure codes, in the order the database decides them (plan section 3.3). */
 export type T2FailureCode =
   | 'LEASE_EXPIRED' | 'RIGHTS_TERMINATED' | 'SOURCE_SUSPENDED' | 'SOURCE_RETIRED' | 'RIGHTS_CHANGED'
-  | 'RIGHTS_EXPIRING' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR';
+  | 'RIGHTS_EXPIRING' | 'VALIDATION_FAILED' | 'LOCK_TIMEOUT' | 'PERSISTENCE_ERROR';
 
 export type T2Result =
   | { outcome: 'COMPLETED'; runId: string; publishControlSeq: number; finishedAt: Date }
@@ -165,20 +165,19 @@ export class T2Refused extends Error {
 }
 
 const T2_CODES = new Set<T2FailureCode>(['LEASE_EXPIRED', 'RIGHTS_TERMINATED', 'SOURCE_SUSPENDED', 'SOURCE_RETIRED',
-  'RIGHTS_CHANGED', 'RIGHTS_EXPIRING', 'LOCK_TIMEOUT', 'PERSISTENCE_ERROR']);
+  'RIGHTS_CHANGED', 'RIGHTS_EXPIRING', 'VALIDATION_FAILED', 'LOCK_TIMEOUT', 'PERSISTENCE_ERROR']);
 
 /**
  * T2 (controlled protocol, D2'): sends exactly BEGIN, SELECT si.si_complete_run(...), COMMIT.
- * Milestone 2 completes EMPTY runs only. Any error, including one raised by the commit-time
+ * Completes EMPTY runs only: the payload is always the empty array and the database derives every
+ * count (migration 0004; non-empty completion is not enabled). A scoped run bound to a non-empty
+ * fixture is refused as VALIDATION_FAILED. Any error, including one raised by the commit-time
  * publication check, is followed by ROLLBACK and then T3 with the mapped code.
  */
-export async function completeRun(
-  client: ClientBase, runId: string, leaseToken: string, opts: { conflictCount?: number } = {}
-): Promise<T2Result> {
+export async function completeRun(client: ClientBase, runId: string, leaseToken: string): Promise<T2Result> {
   await client.query('BEGIN');
   try {
-    const res = await client.query('SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, 0, 0, 0, $3::int)',
-      [runId, leaseToken, opts.conflictCount ?? 0]);
+    const res = await client.query("SELECT * FROM si.si_complete_run($1::uuid, $2::uuid, '[]'::jsonb)", [runId, leaseToken]);
     await client.query('COMMIT');
     const r = res.rows[0];
     return { outcome: 'COMPLETED', runId: r.run_id, publishControlSeq: r.publish_control_seq, finishedAt: r.finished_at };
