@@ -44,12 +44,16 @@ src pg_dump -h 127.0.0.1 -U si_bootstrap -d si_template_test -Fc --create > "$tm
 echo 'DR-1 globals and database archive created; content and password hashes withheld'
 
 docker run -d --name "$name" \
-  -p 127.0.0.1:54330:5432 \
+  -p 127.0.0.1::5432 \
   --tmpfs /var/lib/postgresql/data:rw \
   -e POSTGRES_DB=postgres -e POSTGRES_USER=si_restore_admin \
   -e POSTGRES_PASSWORD=local-test-only \
   -e 'POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256 -E UTF8' \
   "$image" postgres -c track_commit_timestamp=on -c fsync=off >/dev/null
+# Docker assigns a free loopback host port: a fixed port inside the kernel's
+# ephemeral range can collide with a lingering client socket (CI run #113).
+target_port="$(docker port "$name" 5432/tcp | sed -n '1s/.*://p')"
+[[ "$target_port" =~ ^[0-9]+$ ]] || { echo 'DR-1 target port not assigned' >&2; exit 1; }
 ready=0
 for i in {1..40}; do
   if dst pg_isready -h 127.0.0.1 -U si_restore_admin -d postgres >/dev/null 2>&1; then ready=1; break; fi
@@ -153,10 +157,10 @@ fi
 echo 'DR-1 schema, migration objects, grants, default ACLs and D5b function ACLs MATCH'
 
 # Actual restored-cluster operational preflight and role privilege probes.
-SI_DATABASE_URL='postgresql://si_restore_admin:local-test-only@127.0.0.1:54330/si_template_test' \
+SI_DATABASE_URL="postgresql://si_restore_admin:local-test-only@127.0.0.1:${target_port}/si_template_test" \
   node dist/persistence/cli.js preflight --production
 echo 'DR-1 restored production-mode D5b/D7 preflight PASS (disposable target only)'
-SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT=54330 SI_TEST_ADMIN_USER=si_restore_admin \
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
   SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
   SI_TEST_TEMPLATE=si_template_test \
   node --test tests/db/privileges.test.mjs
