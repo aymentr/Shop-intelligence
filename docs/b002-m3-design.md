@@ -1,4 +1,4 @@
-# B-002 Milestone 3 — design contract (migration 0003)
+# B-002 Milestone 3 — design contract (migrations 0003 and later)
 
 **Status: PROPOSED DESIGN. Not implemented. Not verified. Not approved for implementation.**
 Baseline: `ccb87ed91954e11d4fa4c6c37b3a782357640595` (Milestone 2: conditional development
@@ -20,15 +20,24 @@ Every statement carries one of these labels, and none is upgraded by being writt
 | **UNVERIFIED** | An assumption about PostgreSQL or library behaviour; the named test must confirm it before implementation relies on it. |
 | **BLOCKED** | Cannot proceed until the stated condition is met. |
 
-No part of Milestone 3 is implemented. Every invariant in §5 and every test in §8 is PROPOSED.
+Implemented so far: **only the request-scope foundation** (migration 0003, §4.2.3), with tests SC-1…SC-14,
+pending founder acceptance. Everything else in Milestone 3 (ads, observations, non-empty T2) is
+PROPOSED and unimplemented; invariants in §5 and tests in §8 are PROPOSED unless marked otherwise.
 
 ## 1. Frozen scope (PROPOSED)
 
 In (migration 0003, SYNTHETIC sources only):
 - `si.ads` — per-source ad identity registry (no content).
 - `si.observations` — one kept record per identity per completed run.
-- `si.run_request_scope` — the request scope bound in the T1 transaction (§4.2).
-- `si_bind_request_scope` — the T1-transaction scope binder (**BLOCKED**, FD7).
+- `si.run_request_scope` — the request scope recorded by the scoped T1 (§4.2). **Implemented in 0003.**
+- `si_begin_run_scoped` — the scoped T1 wrapper (FD7 option C). **Implemented in 0003.**
+- v1 hash functions `si_canonical_json_v1`, `si_fixture_sha256_v1`, `si_request_sha256_v1`. **Implemented in 0003.**
+
+Migration numbering: the request-scope foundation is migration **0003** (Milestone 3 part 1). The
+remaining Milestone 3 objects (ads, observations, non-empty T2) follow in the next migration. The
+items the M2 plan allocated to "0004" (tombstones, retention, the read function, monitors, D8) move
+to the migration after that. This is a recorded numbering deviation from plan §1, not a change of
+scope.
 - Non-empty T2: `si_complete_run(uuid, uuid, jsonb)` replaces the counts-based signature.
 - Extended `trg_runs_publish_check`; insert-scoped integrity checks; replaceable append-only guards.
 - Library: `completeRun(..., rows)`, scope binding inside T1, strict diagnostics parsing.
@@ -50,7 +59,8 @@ content read or serving.
 | FD4 | APPROVED (proposed anchor) | `retain_until = least(finished_at + retention_days(v), si_retention_end(source, v) as of T2)` for the collected version `v`, as a static upper bound. Dynamic effective end enforced in 0004. |
 | FD5 | APPROVED, provisional | Cap 500 rows and 1 MiB (octets of the `jsonb` text form), subject to M3-T14. |
 | FD6 | APPROVED | FAILED runs keep every count at 0 and record bounded coded errors only. |
-| FD7 | **BLOCKED** | Same-transaction request-scope binding (§4.2) is conditionally approved **in principle**. Remains BLOCKED until the PostgreSQL verification in §4.2.3 and M3-T07/M3-T08 pass. Non-empty T2 must not be implemented before then. |
+| FD7 | **APPROVED — option C; IMPLEMENTED (0003), acceptance pending** | The `xmin` binder (option A) is rejected on PostgreSQL 16 evidence (§4.2.2). Option C, the scoped T1 wrapper (§4.2.3), is approved and implemented. FD7 is not marked VERIFIED until the founder accepts the M3-P1 evidence. Non-empty T2 remains unimplemented. |
+| FD11 | APPROVED | BD1 amendment: `si_begin_run_scoped` is added to the collector's SECURITY DEFINER allowlist (it starts runs, so R-PUB applies). `si_bind_request_scope` is withdrawn. Plain `si_begin_run` is unchanged; plain-T1 runs stay EMPTY-only. |
 | FD8 | APPROVED | Synthetic-only development; no content reads; no purge; no production authorization. |
 | FD9 | APPROVED, conditional | Canonical fixture hashing: preserve historical request-hash and retry compatibility; versioning policy in §4.4. |
 | FD10 | APPROVED, with verification requirements | Collector logging preconditions (§5.1). No claim of absolute protection from server logging; effective-session checks and negative leakage tests (M3-T19, M3-T21) are required. |
@@ -100,7 +110,7 @@ Guards are trigger functions, so that 0004 can replace them; they are never CHEC
 - Insert-scoped deferred checks, firing on INSERT only, so later purges never trigger them:
   - observation ⇒ its run is COMPLETED;
   - new ad ⇒ at least one observation inserted by the same transaction;
-  - scope ⇒ bound under the §4.2 rule.
+  - scope ⇒ recorded only by the scoped T1 for the RUNNING attempt it creates (§4.2.3; implemented in 0003).
 
 Lock ranks: `run_request_scope` is run-scoped (rank 4); `ads` rank 5; `observations` rank 6.
 
@@ -114,7 +124,7 @@ Lock ranks: `run_request_scope` is run-scoped (rank 4); `ads` rank 5; `observati
 2. Compute `fixtureSha256(rows)` and `requestSha256(adapterId = sourceId, evidenceKind, networks,
    fixtureSha256)` with the **unchanged** `src/persistence/request-hash.ts` (v1, §4.4). Refuse
    locally, before T1, if the rows exceed the cap or contain a NUL character.
-3. T1: `BEGIN` / `si_begin_run(...)` / `si_bind_request_scope(...)` (only if RUNNING) / `COMMIT`.
+3. T1: `BEGIN` / `si_begin_run_scoped(...)` / `COMMIT` (library `t1PreflightScoped`; implemented).
 4. T2: `BEGIN` / `SELECT * FROM si.si_complete_run($run, $token, $rows::jsonb)` / `COMMIT`, sending
    **exactly the rows that were hashed**.
 5. On any error at step 4: `ROLLBACK`, then T3 (§6.5).
@@ -122,86 +132,76 @@ Lock ranks: `run_request_scope` is run-scoped (rank 4); `ads` rank 5; `observati
 EMPTY runs: `rows = []`. T2 needs no scope, so Milestone 2 behaviour is preserved, including for
 runs started before 0003.
 
-### 4.2 Request-scope binding (FD7 — BLOCKED)
+### 4.2 Request-scope binding (FD7 — option C: IMPLEMENTED in migration 0003, acceptance pending)
 
-#### 4.2.1 What the baseline does and does not record (VERIFIED baseline)
+#### 4.2.1 What Milestone 2 does and does not record (VERIFIED baseline)
 - `si_begin_run` evaluates `p_networks` once, through `si_t1_rights_decision`
   (`0002_runs.up.sql:388` → `:203`). It does **not** store it: the INSERT at `:389` has no
   networks column.
-- T1 never compares `p_networks` with `request_sha256`. It cannot, because it does not receive
-  `fixtureSha256`.
-- **Consequence:** the exact network set that T1 authorized cannot be recovered or verified for any
-  run, past or future, without changing T1.
+- T1 never compares `p_networks` with `request_sha256`; it does not receive `fixtureSha256`.
+- **Consequence:** for runs started through plain `si_begin_run`, the exact network set T1
+  authorized cannot be recovered or verified.
 
-#### 4.2.2 Proposed binder
-`si_bind_request_scope(p_run_id uuid, p_lease_token uuid, p_evidence_kind text, p_networks text[], p_fixture_sha256 text)`,
-SECURITY DEFINER, EXECUTE for `si_collector` only (**BD1 amendment required**; not yet ratified).
-It refuses, writing nothing, unless all of these hold:
-1. READ COMMITTED; the run is RUNNING with this token; no scope row exists for it yet.
-2. **Same transaction:** the run row was inserted by the current transaction (mechanism §4.2.3).
-3. `p_evidence_kind = sources.evidence_kind`; `p_networks` is non-empty, 1-D, without NULLs or
-   duplicates, and `⊆ sources.supported_networks` — T1's own network rule, re-applied in T1's
-   transaction, while T1's advisory and `sources` KEY SHARE locks are still held.
-4. `sha256(convert_to('{"adapterId":' || to_json(run.source_id) || ',"evidenceKind":' ||
-   to_json(p_evidence_kind) || ',"fixtureSha256":"' || p_fixture_sha256 || '","networks":' ||
-   to_json(p_networks sorted COLLATE "C") || '}', 'UTF8')) = run.request_sha256`.
-   Every component is restricted to ASCII by existing CHECKs (source id, network enum, evidence
-   kind, hex digest), and keys are in code-point order.
-   **UNVERIFIED** that this reproduces `requestSha256` byte for byte; M3-T18 must prove it.
+#### 4.2.2 Rejected: separate binder with an `xmin` same-transaction check (option A)
+The earlier proposal (`si_bind_request_scope` with `run.xmin = pg_current_xact_id()::xid`) is
+**withdrawn**. M3-P1 experiments on PostgreSQL 16.15 showed `xmin` identifies the newest row
+**version**, not the creating transaction:
+- **False refusals:** a run inserted inside a savepoint (even after `RELEASE`) or inside a PL/pgSQL
+  `EXCEPTION` block carries the subtransaction's XID.
+- **Forgery:** a run created in an earlier transaction and heartbeated in the current one reports
+  `xmin = current XID`. The collector may call heartbeat, so it could make an old run look new.
 
-**What binding proves, and what it does not.**
-- **It proves:**
-  - the stored scope satisfies T1's network rule against the source state T1 decided on;
-  - the scope is bound to the run's immutable `request_sha256` (and therefore to `fixtureSha256`);
-  - the scope is written once, by a definer routine, and is append-only.
-- **It does not prove** that the stored scope equals the `p_networks` argument passed to
-  `si_begin_run`. A collector could pass different sets to the two calls. The stored scope is the one
-  enforced at T2, and it must independently satisfy T1's rule, so this gains the collector no
-  authority T1 would not grant for that set. But it is **not** a proof of the exact T1-authorized
-  set. Only changing T1 (alternative A-T1, §4.2.4) could provide that proof.
+Option B (replacing `si_begin_run` in 0003) was also rejected. It would overwrite the 0002 copy
+that seven anchors in six Step 2 CI mutation scripts mutate, so those mutants would silently survive.
 
-#### 4.2.3 Same-transaction mechanism — UNVERIFIED
+#### 4.2.3 Adopted: scoped T1 wrapper (option C — APPROVED by the founder)
+`si.si_begin_run_scoped(p_source_id, p_request_key, p_request_sha256, p_evidence_kind, p_networks text[], p_fixture_sha256)`
+(migration `0003_request_scope`):
+- SECURITY DEFINER, `search_path = pg_catalog, pg_temp`;
+- EXECUTE for `si_collector` only;
+- returns the same columns as `si_begin_run`;
+- one SQL statement, so the T1 attempt and its scope commit or roll back together, also under autocommit.
 
-Proposed check: `run.xmin = pg_current_xact_id()::xid`. **This is an unverified mechanism.**
-Open questions it must survive on PostgreSQL 16.15 (the CI image):
-1. **Cast:** `xid8 → xid` exists, and comparing a 32-bit `xmin` with it is correct and free of
-   wraparound ambiguity for a row created by the current transaction.
-2. **Subtransactions:** if the run row is inserted inside a subtransaction (a savepoint, or a PL/pgSQL
-   block with an EXCEPTION clause), `xmin` is the subtransaction's XID, not the top-level one, so
-   the check would refuse. That refusal is fail-closed but must be characterised.
-   `si_begin_run` has no EXCEPTION blocks (VERIFIED baseline), but a caller savepoint would still
-   create a subtransaction.
-3. **Row versions:** the same transaction might update the run row before binding (it shouldn't); an
-   update creates a new version whose `xmin` is still the current XID, so the check would not
-   distinguish "inserted" from "updated" in this transaction.
-4. **Visibility:** a run committed by another transaction never matches.
+1. **Validate, without lock or write:** source, both hashes (64 hex), evidence kind
+   `^[A-Z_]{1,40}$`, networks (non-empty, 1-D, no NULLs, `^[A-Z]{1,20}$`, no duplicates).
+   Otherwise `SI_BAD_ARGUMENT` (22023).
+2. **Hash check, without lock or write:**
+   `si.si_request_sha256_v1(source, evidence kind, networks, fixture) = p_request_sha256`.
+   Otherwise `SI_REQUEST_HASH_MISMATCH` (22023). A refusal consumes no attempt.
+3. **Call the unchanged `si.si_begin_run`** with the **same** `p_networks`. Its locks
+   (advisory → `sources` KEY SHARE → run), decision table, Q3 and REJECTED codes are unchanged.
+4. **Record the scope only if the outcome is RUNNING.** That is always a row `si_begin_run` has
+   just inserted: a live attempt raises `SI_RUN_IN_PROGRESS`, and a COMPLETED one returns
+   ALREADY_COMPLETED. The scope row holds the same network array (sorted `COLLATE "C"`), the
+   fixture hash and `hash_version = 1`.
 
-Verification plan (part of M3-T07):
-- binding in the T1 transaction succeeds;
-- binding in any later transaction is refused;
-- binding after a `SAVEPOINT` around T1, and inside one, is characterised and documented;
-- a scope cannot be bound for a run inserted by another concurrent transaction;
-- a direct owner INSERT of a run followed by a bind in the same transaction is characterised.
+`si.run_request_scope`:
+- **Binding:** one row per run (PK); composite FK `(run_id, source_id)` → `collection_runs`, so
+  the scope names exactly its run's source.
+- **Immutable:** UPDATE, DELETE and TRUNCATE refused for every role.
+- **Insert guard** (every inserter):
+  - admits only the wrapper's transaction-local binding marker for the run it has just created;
+  - requires the run to be RUNNING;
+  - requires sorted, unique networks.
 
-If the mechanism fails, alternatives in order of preference (each needs a founder decision):
-- **A-XS — scope-required commit check:** a deferred AFTER INSERT constraint trigger on
-  `collection_runs` requires every RUNNING run inserted by the transaction to have a scope row at
-  COMMIT. It needs no XID comparison, but it changes Milestone 2's T1 contract: every T1 caller,
-  including EMPTY-only callers and owner fixtures, must then bind.
-- **A-T1 — replace `si_begin_run` in 0003** (`CREATE OR REPLACE`, same signature) so that it stores
-  `p_networks` itself. This is the only option that proves the exact T1-authorized set. It
-  overwrites 0002's `si_begin_run`, so the Step 2 CI mutation scripts (which mutate 0002's copy)
-  must be retargeted, or their mutants would silently survive.
-- **A-LATE — drop the same-transaction requirement:** bind in any transaction before T2, re-checking
-  the rule against the state current at binding time. This is weaker: the rule is evaluated after
-  T1, not under T1's locks.
+  The marker is defence in depth against a direct **owner** INSERT. It is not a boundary against
+  the owner. Application roles have **no privilege** on the table at all.
 
-**Unblock condition for FD7:** the mechanism or an approved alternative is verified on PostgreSQL 16,
-and M3-T07 and M3-T08 pass.
+**What this proves.** For every scoped run, the stored network set **is exactly the argument T1
+evaluated** (the same variable within one invocation), it satisfied T1's rules, and it is bound,
+together with the fixture hash, to the run's immutable v1 `request_sha256`.
 
-Residual risk: the owner can change `supported_networks` by direct UPDATE (no application grant).
-Runs without a scope (started before 0003, or inserted directly by the owner without binding) can
-only complete EMPTY.
+**What it does not prove.** Anything about runs started through plain `si_begin_run`. Those
+record no scope and stay EMPTY-only. Plain T1 remains callable for Milestone 2 compatibility
+(founder decision).
+
+**Residual:** the owner can still change `sources.supported_networks` directly. Non-empty T2 must
+re-check the current networks, so narrowing fails closed.
+
+**FD7 status:** implemented in migration 0003; **not yet accepted.** Acceptance requires the M3-P1
+evidence (tests SC-1…SC-14 in `tests/db/m3-scope.test.mjs`, the existing suite, CI) and founder
+review. The checks that non-empty T2 performs against the scope (§4.3 phase C) are not
+implemented and remain part of M3-T08.
 
 ### 4.3 T2 `si_complete_run(p_run_id, p_lease_token, p_rows jsonb DEFAULT '[]')`
 
@@ -261,7 +261,9 @@ COMMIT — deferred, read-only checks:
     identical v1 hash, so T1 behaves exactly as in Milestone 2 (ALREADY_COMPLETED, a new attempt,
     or IDEMPOTENCY_KEY_REUSED as before).
   - Pre-0003 RUNNING runs have no scope, so they can only complete EMPTY.
-- **Database recomputation of v1 (PROPOSED, UNVERIFIED):** T2 rebuilds the canonical JSON of the
+- **Database recomputation of v1 (IMPLEMENTED in 0003 as `si_canonical_json_v1`, `si_fixture_sha256_v1`
+  and `si_request_sha256_v1`; parity tested by SC-1 on Node 22 / PostgreSQL 16.15; use by T2 still
+  PROPOSED):** the database rebuilds the canonical JSON of the
   submitted rows in SQL:
   - `normalize(value, NFC)` for strings and keys;
   - keys ordered `COLLATE "C"` (UTF-8 byte order, which equals code-point order);
@@ -291,9 +293,9 @@ COMMIT — deferred, read-only checks:
 | S4 | Atomicity: ads, observations, receipt and COMPLETED all commit or none do, including refusals at COMMIT | C |
 | S5 | Database-derived counts: `R = P + D + S`, `S = 0`, `C ≤ D`, `R = 0 ∨ D < R`; hence EMPTY ⇔ R = 0 and EMPTY ⇒ C = 0 | C |
 | S6 | Lock order: (1 advisory, in T1) → 3 → 4 → 5 (sorted) → 6; no deadlock between concurrent T2s | C |
-| S7 | Least privilege: no application-role privilege on the new tables; the definer allowlist grows only by `si_bind_request_scope` (BD1 amendment pending); T2 returns no content | C |
+| S7 | Least privilege: no application-role privilege on the new tables; the definer allowlist grows only by `si_begin_run_scoped` (BD1 amendment FD11); T2 returns no content | C |
 | S8 | Append-only for every role, with guards 0004 can replace | C |
-| S9 | Request scope bound in T1's transaction to the immutable `request_sha256` (FD7, **BLOCKED**; §4.2 says what this does and does not prove) | C |
+| S9 | Request scope recorded by the scoped T1 in the same statement as the attempt, equal to T1's network argument, and bound to the immutable `request_sha256` (FD7 option C; implemented, acceptance pending; §4.2.3 states the limits) | C |
 | S10 | Logging protections within the boundary of §5.1 | C |
 | S11 | Retention: `retain_until` is a static upper bound; the effective end is dynamic (0004); **not enforced in M3** | T |
 | S12 | No serving: no read function; a catalog check that no `si` function returns or outputs content columns; SYNTHETIC-only CHECK unchanged | C |
@@ -437,12 +439,12 @@ and no records. Malformed diagnostics are never trusted or logged.
 
 **0003 up** (one transaction; `src/persistence/migrate.ts` wraps each migration):
 1. Create the tables, guards and insert-scoped checks.
-2. Create `si_bind_request_scope`.
+2. (Done in 0003: `run_request_scope`, the v1 hash functions and `si_begin_run_scoped`.)
 3. `DROP FUNCTION si.si_complete_run(uuid,uuid,int,int,int,int)`, then
    `CREATE FUNCTION si.si_complete_run(uuid, uuid, jsonb DEFAULT '[]')`.
 4. `CREATE OR REPLACE` `trg_runs_publish_check` (same signature).
 5. `REVOKE ALL … FROM PUBLIC` on every new routine; `GRANT EXECUTE` only on
-   `si_complete_run(uuid,uuid,jsonb)` and `si_bind_request_scope(...)` to `si_collector`.
+   `si_complete_run(uuid,uuid,jsonb)` to `si_collector` (`si_begin_run_scoped` is already granted by 0003).
 
 Bootstrap: the two `ALTER ROLE si_collector SET log_parameter_max_length…` settings (§5.1).
 
@@ -451,7 +453,7 @@ Bootstrap: the two `ALTER ROLE si_collector SET log_parameter_max_length…` set
 - recreate the 0002 `si_complete_run` **byte for byte** from `0002_runs.up.sql` and re-grant it to
   `si_collector`;
 - `CREATE OR REPLACE` the 0002 `trg_runs_publish_check` body byte for byte;
-- drop the binder, checks, guards and tables.
+- drop the checks, guards and tables of that migration (0003's scope objects are reversed by 0003's own down file).
 
 Verified by catalog fingerprint: up → down equals the 0002-only catalog, and up → down → up is identical.
 
@@ -459,7 +461,7 @@ Verified by catalog fingerprint: up → down equals the 0002-only catalog, and u
 - exactly one `si_complete_run`, with identity arguments `p_run_id uuid, p_lease_token uuid, p_rows jsonb`;
 - the 6-argument integer call fails with `42883`;
 - `prosecdef`, pinned `search_path`, grantees exactly `{si_collector}`;
-- BD1 allowlist = Milestone 2 routines + `si_bind_request_scope`;
+- BD1 allowlist = Milestone 2 routines + `si_begin_run_scoped` (FD11);
 - the G1 exact privilege matrix covers the three new tables, with no application-role privilege;
 - no view or rule depends on `observations`;
 - no non-trigger `si` function exposes content columns.
@@ -468,9 +470,9 @@ Verified by catalog fingerprint: up → down equals the 0002-only catalog, and u
 - S4-2's 6-argument call is rewritten to assert `42883`;
 - the privilege and scope tests gain the new names;
 - 0001 and 0002 stay byte-identical (frozen-checksum test);
-- the Step 2 CI mutants remain valid only while `si_begin_run` is not replaced (see A-T1, §4.2.3).
+- the Step 2 CI mutants remain valid only while `si_begin_run` is not replaced (option C does not replace it; §4.2.2).
 
-## 8. Risk-based acceptance tests (PROPOSED — none executed)
+## 8. Risk-based acceptance tests (PROPOSED; M3-T07 and the scope-binding parts of M3-T08 and M3-T18 executed as SC-1…SC-14)
 
 Timing thresholds are acceptance gates measured on the CI PostgreSQL 16.15 image (median of 20
 runs; p95 reported). They are evidence for that host class only, not guarantees.
@@ -483,8 +485,8 @@ runs; p95 reported). They are evidence for that host class only, not guarantees.
 | M3-T04 | Conflicts under KEEP_FIRST; reordered payload | Lowest ordinal kept; C counted; a different order gives a different hash | High |
 | M3-T05 | Conflicts under FAIL_RUN | FAILED `DUPLICATE_CONFLICT`; ≤ 100 coded rows; zero ads, observations or receipts | High |
 | M3-T06 | Each row-level code; NUL; non-canonical URL; oversize payload | Exact code and SQLSTATE; nothing written; `SI_BAD_ARGUMENT` triggers no T3 | High |
-| M3-T07 | Scope binding: wrong hash; networks outside source; evidence-kind mismatch; bind after T1 commit; double bind; wrong token; **all §4.2.3 mechanism cases** | Each refused or characterised as documented; no scope row on refusal | **Critical (FD7)** |
-| M3-T08 | Row network ∉ bound scope; missing scope with R > 0; `REQUEST_HASH_MISMATCH` | FAILED `VALIDATION_FAILED`; nothing stored | **Critical (FD7)** |
+| M3-T07 | Scoped T1: hash-unbound networks, source, fixture or evidence kind; malformed and hostile input; T1 decisions; no attachment to an existing run; no second or modified scope; retries; concurrency; savepoints; autocommit atomicity; privileges and catalog | Each refused or as specified; no scope row on refusal; no attempt consumed by a refusal. **Executed: SC-2…SC-14 pass (M3-P1).** | **Critical (FD7)** |
+| M3-T08 | Row network ∉ bound scope; missing scope with R > 0; `REQUEST_HASH_MISMATCH` at T2 | FAILED `VALIDATION_FAILED`; nothing stored. **Not executable until non-empty T2 exists**; the scope-binding prerequisites are covered by SC-8/SC-9. | **Critical (FD7)** |
 | M3-T09 | Concurrent T2s with overlapping identities, both orders (two sessions, blocking proven) | Both complete or one fails cleanly; no 40P01; ads unique | High |
 | M3-T10 | Maximum-size T2 + concurrent SUSPEND | SUSPEND waits then records (never 55P03); the run is either COMPLETED with publish seq < suspend seq, or FAILED `SOURCE_SUSPENDED` with nothing stored | **Critical** |
 | M3-T11 | Maximum-size T2 + concurrent TERMINATE | As M3-T10, with `RIGHTS_TERMINATED` | **Critical** |
@@ -494,7 +496,7 @@ runs; p95 reported). They are evidence for that host class only, not guarantees.
 | M3-T15 | Diagnostics parser: malformed, oversize, extra keys, wrong lengths, missing | Fallback path; no records; nothing logged | Med |
 | M3-T16 | Catalog and privileges (§7 assertions) | All hold | High |
 | M3-T17 | Migration up/down/up fingerprints; 0001/0002 checksums | Identical | High |
-| M3-T18 | JS ↔ SQL parity: `requestSha256` reconstruction (§4.2.2); v1 fixture hash over a corpus (escapes, control characters, non-BMP, U+2028/2029, NFC edge cases, booleans, null, unknown keys); `ingestOffline` vs database counts on canonical fixtures; a retry of a pre-0003 request key | Equal, or the database fails closed with `REQUEST_HASH_MISMATCH` / `NON_CANONICAL` (never a silent difference); the retry hash is identical | **High (FD9)** |
+| M3-T18 | JS ↔ SQL parity: `requestSha256` reconstruction (§4.2.3, implemented; corpus in SC-1); v1 fixture hash over a corpus (escapes, control characters, non-BMP, U+2028/2029, NFC edge cases, booleans, null, unknown keys); `ingestOffline` vs database counts on canonical fixtures; a retry of a pre-0003 request key | Equal, or the database fails closed with `REQUEST_HASH_MISMATCH` / `NON_CANONICAL` (never a silent difference); the retry hash is identical | **High (FD9)** |
 | M3-T19 | Logging configuration: each §5.1 setting violated in turn, for the collector session (role and session level as applicable) | T2 refuses with `SI_UNSAFE_LOGGING` before any lock; D7 preflight run as `si_collector` fails | High (FD10) |
 | M3-T20 | Full existing suite, three passes plus CI; Step 2 mutant scripts | Green | High |
 | M3-T21 | **Leakage canary.** Disposable cluster with server logging captured; payloads carry a unique canary string; run successful, validation-failure, conflict, cap-refusal, CHECK-backstop (forced in a test-only path) and NUL cases; then switch on statement and duration logging to confirm T2 refuses | Canary absent from the server log and the library output in every protected case; any presence is a failure that blocks FD10 | High (FD10) |
@@ -525,9 +527,9 @@ One targeted mutant only: unsorted ad insertion, which M3-T09 must detect.
 ## 10. Remaining blockers
 
 Implementation blockers:
-1. **FD7 BLOCKED:** the §4.2.3 mechanism (or an approved alternative) must be verified on
-   PostgreSQL 16, and M3-T07 and M3-T08 must pass. The BD1 amendment for `si_bind_request_scope`
-   must be ratified. Non-empty T2 must not be implemented before then.
+1. **FD7 acceptance pending:** option C is implemented (0003) and its tests pass. The founder must
+   accept the M3-P1 evidence before FD7 is marked VERIFIED. The T2-side scope checks (M3-T08) are
+   verified only when non-empty T2 is implemented.
 2. **FD9 conditional:** M3-T18 must show v1 hash parity (or deterministic fail-closed behaviour)
    and retry compatibility.
 3. **FD10 conditional:** M3-T19 and M3-T21 must pass. No claim of absolute protection from server
@@ -547,8 +549,9 @@ Unverified historical requirements:
    retention semantics remain unverified (D-M2-05).
 
 ### Unverified design assumptions (summary)
-- the `xmin` same-transaction mechanism (§4.2.3);
-- SQL reproduction of `requestSha256` and of the v1 fixture hash (§4.2.2, §4.4);
+- (resolved) the `xmin` mechanism was tested and rejected (§4.2.2);
+- SQL v1 hash parity beyond the tested corpus, and on Node/PostgreSQL versions other than Node 22 /
+  PostgreSQL 16.15 (unreproducible inputs fail closed: non-ASCII keys, numbers);
 - that phase A pre-empts every table CHECK, and that PostgreSQL error text never carries payload
   under the §5.1 controls;
 - that the 500-row / 1 MiB cap meets the timing gates (§8, M3-T14);

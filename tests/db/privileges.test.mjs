@@ -8,7 +8,7 @@ import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, r
 
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
 const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
-                'si.collection_runs', 'si.publication_receipts', 'si.run_errors'];
+                'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
@@ -32,13 +32,14 @@ const EXPECTED_EXECUTE = {
   si_heartbeat_run: ['si_collector'], si_fail_run: ['si_collector'],                      // 0002 step 3 (heartbeat, T3)
   si_reap_expired_runs: ['si_collector'],                                                  // 0002 step 3 (reaper)
   si_complete_run: ['si_collector'],                                                       // 0002 step 4 (T2)
+  si_begin_run_scoped: ['si_collector'],                                                   // 0003 (scoped T1, FD7 option C)
   rights_valid_for_publish: ['si_collector'],
   si_source_suspended: ['si_collector'],
   si_retention_terminated: ['si_collector'],
   si_window_end: ['si_collector'],
   si_publish_margin: ['si_collector']
 };
-const EXPECTED_DEFINER = ['si_begin_run', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_reap_expired_runs',
+const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_reap_expired_runs',
                           'si_record_rights_version', 'si_record_source_control', 'trg_receipts_run_completed',
                           'trg_run_errors_count', 'trg_runs_publish_check'];
 const EXPECTED_VOLATILITY = {
@@ -55,7 +56,10 @@ const EXPECTED_VOLATILITY = {
   si_reap_expired_runs: 'v', trg_run_errors_append_only: 'v', trg_run_errors_count: 'v',
   // 0002 step 4
   si_t2_control_outcome: 's', si_complete_run: 'v', trg_runs_publish_check: 'v', trg_receipts_run_completed: 'v',
-  trg_receipts_guard: 'v'
+  trg_receipts_guard: 'v',
+  // 0003 request scope
+  si_canonical_json_v1: 's', si_fixture_sha256_v1: 's', si_request_sha256_v1: 's', trg_run_scope_insert: 'v',
+  trg_run_scope_append_only: 'v', si_begin_run_scoped: 'v'
 };
 
 let db, c;

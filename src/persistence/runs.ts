@@ -5,6 +5,8 @@
  *
  * Step 3 adds token-checked heartbeat, T3 failure with coded error records, and the
  * independent expired-run reaper. Step 4 adds the T2 protocol for EMPTY runs (completeRun).
+ * Milestone 3 part 1 adds the scoped T1 (t1PreflightScoped): the database verifies the v1 request
+ * hash and records the request scope a later non-empty completion will be checked against.
  */
 import type { ClientBase } from 'pg';
 
@@ -31,7 +33,7 @@ export interface T1Result {
 
 export type T1ErrorCode =
   | 'IDEMPOTENCY_KEY_REUSED' | 'RUN_IN_PROGRESS' | 'ATTEMPT_LIMIT_EXCEEDED' | 'SOURCE_SUSPENDED'
-  | 'UNKNOWN_SOURCE' | 'BAD_ARGUMENT' | 'ISOLATION';
+  | 'UNKNOWN_SOURCE' | 'BAD_ARGUMENT' | 'ISOLATION' | 'REQUEST_HASH_MISMATCH';
 
 /** A thrown T1 outcome: nothing was stored (2.1 failure-state table, Q3). */
 export class T1Refused extends Error {
@@ -48,7 +50,8 @@ const PREFIX: Record<string, T1ErrorCode> = {
   SI_SOURCE_SUSPENDED: 'SOURCE_SUSPENDED',
   SI_UNKNOWN_SOURCE: 'UNKNOWN_SOURCE',
   SI_BAD_ARGUMENT: 'BAD_ARGUMENT',
-  SI_ISOLATION: 'ISOLATION'
+  SI_ISOLATION: 'ISOLATION',
+  SI_REQUEST_HASH_MISMATCH: 'REQUEST_HASH_MISMATCH'
 };
 
 function mapError(err: unknown): unknown {
@@ -58,13 +61,10 @@ function mapError(err: unknown): unknown {
   return code ? new T1Refused(code, e.message ?? code, e.code) : err;
 }
 
-export async function t1Preflight(client: ClientBase, req: T1Request): Promise<T1Result> {
+async function runT1(client: ClientBase, sql: string, params: unknown[]): Promise<T1Result> {
   await client.query('BEGIN');
   try {
-    const res = await client.query(
-      'SELECT * FROM si.si_begin_run($1, $2, $3, $4, $5::text[])',
-      [req.sourceId, req.requestKey, req.requestSha256, req.evidenceKind, req.networks]
-    );
+    const res = await client.query(sql, params);
     await client.query('COMMIT');
     const r = res.rows[0];
     return {
@@ -76,6 +76,27 @@ export async function t1Preflight(client: ClientBase, req: T1Request): Promise<T
     try { await client.query('ROLLBACK'); } catch { /* connection may be gone */ }
     throw mapError(err);
   }
+}
+
+export async function t1Preflight(client: ClientBase, req: T1Request): Promise<T1Result> {
+  return runT1(client, 'SELECT * FROM si.si_begin_run($1, $2, $3, $4, $5::text[])',
+    [req.sourceId, req.requestKey, req.requestSha256, req.evidenceKind, req.networks]);
+}
+
+/** A scoped T1 request: `fixtureSha256` is the v1 fixture hash the request hash was computed from. */
+export interface ScopedT1Request extends T1Request {
+  fixtureSha256: string;
+}
+
+/**
+ * Scoped T1 (B-002 Milestone 3, FD7 option C): the same one-transaction protocol around
+ * si.si_begin_run_scoped. The database refuses with REQUEST_HASH_MISMATCH, before T1 and without
+ * consuming an attempt, unless requestSha256 is the v1 hash of (sourceId, evidenceKind, networks,
+ * fixtureSha256); a RUNNING attempt then carries exactly this network set as its request scope.
+ */
+export async function t1PreflightScoped(client: ClientBase, req: ScopedT1Request): Promise<T1Result> {
+  return runT1(client, 'SELECT * FROM si.si_begin_run_scoped($1, $2, $3, $4, $5::text[], $6)',
+    [req.sourceId, req.requestKey, req.requestSha256, req.evidenceKind, req.networks, req.fixtureSha256]);
 }
 
 /** Returns false when the run is absent, terminal, expired or the lease token is stale. */

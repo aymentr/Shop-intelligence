@@ -80,14 +80,14 @@ test('MG2: the migrator applies, reports and rolls back migrations; the result e
   const mig = await connect({ user: 'si_migrator', database: db });
   const admRef = await connect({ database: ref });
   t.after(async () => { await mig.end(); await admRef.end(); });
-  assert.deepEqual(await migrateUp(mig), [1, 2]);
-  assert.deepEqual((await migrationStatus(mig)).applied.map(a => [a.version, a.appliedBy]), [[1, 'si_migrator'], [2, 'si_migrator']]);
+  assert.deepEqual(await migrateUp(mig), [1, 2, 3]);
+  assert.deepEqual((await migrationStatus(mig)).applied.map(a => [a.version, a.appliedBy]), [[1, 'si_migrator'], [2, 'si_migrator'], [3, 'si_migrator']]);
   const adm = await connect({ database: db });
   t.after(() => adm.end());
   assert.equal(await schemaFingerprint(adm), await schemaFingerprint(admRef), 'identical catalog (owners, ACLs, functions)');
-  assert.deepEqual(await migrateDown(mig, { to: 1, allowDestructive: true }), [2]);
+  assert.deepEqual(await migrateDown(mig, { to: 1, allowDestructive: true }), [3, 2]);
   assert.deepEqual(await migrateDown(mig, { to: 0, allowDestructive: true }), [1]);
-  assert.deepEqual(await migrateUp(mig), [1, 2]);
+  assert.deepEqual(await migrateUp(mig), [1, 2, 3]);
   assert.equal(await schemaFingerprint(adm), await schemaFingerprint(admRef));
 });
 
@@ -147,10 +147,14 @@ test('MG6 (D5b dry run): hardening applied by the pg_catalog owner keeps migrati
   const col = await connect({ user: 'si_collector', database: db });
   const others = await Promise.all(['si_rights_admin', 'si_retention', 'si_monitor'].map(u => connect({ user: u, database: db })));
   t.after(async () => { for (const x of [mig, col, ...others]) await x.end(); });
-  assert.deepEqual(await migrateDown(mig, { to: 1, allowDestructive: true }), [2]);
-  assert.deepEqual(await migrateUp(mig), [2], 'the migrator still migrates');
+  assert.deepEqual(await migrateDown(mig, { to: 1, allowDestructive: true }), [3, 2]);
+  assert.deepEqual(await migrateUp(mig), [2, 3], 'the migrator still migrates');
   const r = (await col.query(`SELECT * FROM si.si_begin_run('synthetic-fixture', 'mg6', '${'a'.repeat(64)}', 'SYNTHETIC', '{META}')`)).rows[0];
   assert.equal(r.outcome, 'RUNNING', 'T1 still takes its request-key lock (inside the definer, as si_owner)');
+  const fx = 'b'.repeat(64);
+  const sha = (await adm.query(`SELECT si.si_request_sha256_v1('synthetic-fixture', 'SYNTHETIC', '{META}', $1) AS h`, [fx])).rows[0].h;
+  const scoped = (await col.query(`SELECT * FROM si.si_begin_run_scoped('synthetic-fixture', 'mg6s', $1, 'SYNTHETIC', '{META}', $2)`, [sha, fx])).rows[0];
+  assert.equal(scoped.outcome, 'RUNNING', 'the scoped T1 takes the same lock through si_begin_run');
   for (const x of [col, ...others]) {
     for (const call of ADVISORY_CALLS) await rejects(assert, x.query(`SELECT pg_catalog.${call}`), { code: DENIED });
   }
@@ -238,7 +242,7 @@ test('MG9 (D5b restore): hardened PostgreSQL dump restores effective privileges 
         AND p.proname ~ '^pg_(try_)?advisory'
         AND has_function_privilege(r.oid, p.oid, 'EXECUTE')`);
     assert.deepEqual(exposures.rows, [], 'no effective application-role advisory privilege');
-    assert.equal((await restored.query('SELECT count(*)::int AS n FROM si.schema_migrations')).rows[0].n, 2);
+    assert.equal((await restored.query('SELECT count(*)::int AS n FROM si.schema_migrations')).rows[0].n, 3);
   } finally { await restored.end(); }
 });
 
