@@ -6,7 +6,7 @@ A TypeScript **offline-only** evaluation harness for future multi-network advert
 
 - Strict parsing, network-scoped identities, deduplication, collection runs and basic diagnostic ratios.
 - Fail-closed rights for evaluation, retention, subscriber display, media mirroring and exports.
-- Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, UI, or commercially licensed ad dataset**. The B-002 PostgreSQL foundation persists source/rights/run metadata, but the offline ingestion harness is not connected to it end-to-end.
+- Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, UI, or commercially licensed ad dataset**. The B-002 PostgreSQL foundation persists rights, runs and synthetic evidence; the offline ingestion harness (`npm run demo`) is not connected to it end-to-end.
 - An `ALLOWED` flag is an internal gate, **not legal authorization**. Real permissions require independently documented source agreements.
 - Synthetic fixture links use `example.org` and are never fetched.
 - Runtime dependency: `pg`. Development dependencies include `typescript`, `@types/node`, and `@types/pg`; versions are pinned in `package.json` and locked in `package-lock.json`. Requires Node 22+.
@@ -28,31 +28,56 @@ source offline fixture → source adapter → strict normalization → run valid
                                         rights gate + diagnostics
 ```
 
-The offline adapter publishes or persists no data. B-002 separately persists rights, controls, and run metadata. If any record is invalid, the entire run is FAILED and the harness returns no trusted rows.
+The offline adapter publishes or persists no data. B-002 separately persists rights, controls, run metadata and synthetic evidence. If any record is invalid, the entire run is FAILED and the harness returns no trusted rows.
 
 CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 and 24, plus three consecutive PostgreSQL integration suites. Push triggers include `main`, `claude/**`, and `codex/**`; pull requests also trigger CI.
 
-## B-002 persistence (Milestone 1 complete; Milestone 2 in progress)
+## B-002 persistence (development milestones; not production-approved)
 
-PostgreSQL 16 foundation: roles, bootstrap, migration runner, migration 0001 (sources,
-versioned rights, evidence, and Amendment C source controls: suspension, irreversible
-retention termination, LIFT) and integration tests against a real database. Migration 0002 includes collection runs, publication receipts and errors; T1 authorizes and starts attempts. Lifecycle transitions and T2 publication are not yet implemented.
+PostgreSQL 16 foundation with roles, bootstrap, a migration runner and integration tests against a
+real, disposable database. Synthetic sources only; no read path, no content serving, no live
+collection, no production deployment.
+
+| Migration | Content | Status |
+|---|---|---|
+| 0001 | sources, versioned rights, rights evidence, Amendment C source controls | Milestone 1 |
+| 0002 | collection runs, receipts, run errors; T1, heartbeat, T3, reaper, EMPTY T2 | Milestone 2 (conditional development acceptance, D-M2-01) |
+| 0003 | request scope (scoped T1, FD7 option C) | M3-P1, accepted (scope foundation) |
+| 0004 | completion hardening (`si_complete_run(uuid, uuid, jsonb)`) | M3-P2A, accepted |
+| 0005 | atomic evidence persistence (`si.ads`, `si.observations`), collector logging prerequisite | M3-P2B, accepted as a development milestone; FD7 end-to-end scope enforcement accepted through P2B |
+| 0006 | retention enforcement and safe purge (`si_purge_due`, purge audit, retention status) | M3-P3A, implemented, **pending independent acceptance** |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
 npm run test:db
 ```
 
-See `docs/b002-persistence.md` for the architecture, deviations and limitations.
+Retention (0006): evidence of a completed run is kept until its effective end, the earlier of the
+stored deadline (`retain_until`) and the end set by later rights events or `TERMINATE_RETENTION`.
+After that, `si_purge_due` (executable only by `si_retention`) deletes the run's observations and
+the ad identities no remaining observation references, marks the run PURGED and writes a
+content-free audit record, all in one transaction. Source retirement alone does not end retention.
+Operators run it explicitly; nothing is scheduled:
 
-Milestone 2 (migration 0002, collection runs) is in progress: plan in `docs/b002-m2-plan.md`.
+```bash
+SI_DATABASE_URL=<si_retention login> node dist/persistence/cli.js retention purge [--limit N]   # one bounded batch
+SI_DATABASE_URL=<si_monitor login>   node dist/persistence/cli.js retention status | overdue | failures
+```
+
+Deleted rows stay in PostgreSQL storage until vacuumed, and in WAL, backups and replicas under
+their own retention: the purge is a logical deletion, not secure erasure. Retention is enforced for
+synthetic evidence in development only and is **not production-ready**.
+
+Design and status: `docs/b002-m3-design.md` (Milestone 3, §12 for retention), `docs/b002-persistence.md`
+(foundation), `docs/b002-m2-final-acceptance.md` (Milestone 2 decisions).
 **Release invariant:** no production content-serving path may launch until the publication
-timing gap D8 is resolved and independently tested.
+timing gap D8/G3 is resolved and independently tested (D-M2-10). D5b must be applied and verified
+on every production database (D-M2-09).
 
 ## Next gates
 
 1. Test rights semantics against actual platform/source agreements before enabling any live adapter.
-2. Add real PostgreSQL transactions, provenance persistence, and deletion enforcement.
+2. Close D8/G3 (commit-time verification and a fail-closed read gate) before any evidence read path.
 3. Obtain explicitly permitted API credentials and source-specific integration tests.
 4. Measure real record quality by country/network without claiming completeness.
 

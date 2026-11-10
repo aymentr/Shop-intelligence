@@ -8,7 +8,8 @@ import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, r
 
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
 const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
-                'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope', 'si.ads', 'si.observations'];
+                'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope', 'si.ads', 'si.observations',
+                'si.purge_log', 'si.purge_failures'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
@@ -21,7 +22,8 @@ const EXPECTED_TABLE = {
   si_rights_admin: { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
                      'si.collection_runs': ['SELECT'] },
   si_retention:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
-                     'si.collection_runs': ['SELECT'], 'si.publication_receipts': ['SELECT'], 'si.run_errors': ['SELECT'] },
+                     'si.collection_runs': ['SELECT'], 'si.publication_receipts': ['SELECT'], 'si.run_errors': ['SELECT'],
+                     'si.purge_log': ['SELECT'], 'si.purge_failures': ['SELECT'] },                  // 0006: content-free audit
   si_monitor:      { 'si.schema_migrations': ['SELECT'] }
 };
 // Expected EXECUTE grantees per function (owner excluded). Anything else in schema si: none.
@@ -37,11 +39,15 @@ const EXPECTED_EXECUTE = {
   si_source_suspended: ['si_collector'],
   si_retention_terminated: ['si_collector'],
   si_window_end: ['si_collector'],
-  si_publish_margin: ['si_collector']
+  si_publish_margin: ['si_collector'],
+  si_purge_due: ['si_retention'], si_record_purge_failure: ['si_retention'],               // 0006 (retention)
+  si_retention_status: ['si_retention', 'si_monitor'], si_purge_failures: ['si_retention', 'si_monitor']
 };
-const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_reap_expired_runs',
-                          'si_record_rights_version', 'si_record_source_control', 'trg_ad_has_observation',
-                          'trg_observation_run_completed', 'trg_receipts_run_completed', 'trg_run_errors_count', 'trg_runs_publish_check'];
+const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_purge_due',
+                          'si_purge_failures', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
+                          'si_record_source_control', 'si_retention_status', 'trg_ad_has_observation', 'trg_observation_purge_check',
+                          'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
+                          'trg_runs_publish_check', 'trg_runs_purge_check'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
   trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
@@ -62,7 +68,11 @@ const EXPECTED_VOLATILITY = {
   trg_run_scope_append_only: 'v', si_begin_run_scoped: 'v',
   // 0005 evidence
   si_t2_fingerprint: 's', si_t2_row_error: 's', trg_evidence_append_only: 'v', trg_observation_run_completed: 'v',
-  trg_ad_has_observation: 'v'
+  trg_ad_has_observation: 'v',
+  // 0006 retention
+  si_effective_retention_end: 's', si_cleanup_due_by: 's', si_retention_end_reason: 's', trg_runs_retention: 'v',
+  trg_purge_records_append_only: 'v', trg_runs_purge_check: 'v', trg_observation_purge_check: 'v', trg_purge_log_check: 'v',
+  si_purge_due: 'v', si_record_purge_failure: 'v', si_retention_status: 's', si_purge_failures: 's'
 };
 
 let db, c;

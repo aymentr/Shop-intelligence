@@ -1,6 +1,8 @@
 # B-002 Milestone 3 — design contract (migrations 0003 and later)
 
-**Status: PROPOSED DESIGN. Not implemented. Not verified. Not approved for implementation.**
+**Status: design contract with implementation record. Migrations 0003–0005 are accepted development
+milestones; migration 0006 (§12) is implemented and pending independent acceptance. Nothing here is
+production-approved.** (The original status, "proposed design", applied to the first revision.)
 Baseline: `ccb87ed91954e11d4fa4c6c37b3a782357640595` (Milestone 2: conditional development
 acceptance, D-M2-01; CI #109 green).
 Authority: `docs/b002-m2-plan.md` revision 2 and the Milestone 2 closure decisions D-M2-01…D-M2-10
@@ -20,16 +22,21 @@ Every statement carries one of these labels, and none is upgraded by being writt
 | **UNVERIFIED** | An assumption about PostgreSQL or library behaviour; the named test must confirm it before implementation relies on it. |
 | **BLOCKED** | Cannot proceed until the stated condition is met. |
 
-Implemented so far (each pending founder acceptance; none is production-approved):
+Implemented so far (none is production-approved):
 - **0003 — request scope** (M3-P1, §4.2.3): scoped T1, v1 hash reproduction, `run_request_scope`. Tests SC-1…SC-14.
+  **Accepted** as the FD7 scope foundation.
 - **0004 — completion hardening** (M3-P2A): counts-based T2 removed; `si_complete_run(uuid, uuid, jsonb)`;
-  scoped EMPTY must match the empty fixture. Tests CP-1…CP-8.
+  scoped EMPTY must match the empty fixture. Tests CP-1…CP-8. **Accepted** (baseline of M3-P2B).
 - **0005 — evidence persistence** (M3-P2B): `si.ads`, `si.observations`, non-empty T2 for SYNTHETIC
   sources, extended publication check; collector logging prerequisite (bootstrap, D7, library).
-  Tests EV-1…EV-15, DG-1…DG-2.
+  Tests EV-1…EV-15, DG-1…DG-2. **Accepted as a development milestone** (baseline `d33d06b`, CI #114);
+  FD7 end-to-end scope enforcement is accepted through it (EV-1…EV-3).
+- **0006 — retention enforcement and safe purge** (M3-P3A, §12): effective retention end, RETAINED →
+  PURGED state machine, data-based evidence guard, `si_purge_due`, content-free audit and status.
+  Tests RT-1…RT-14, RT-M (6 mutants), RL-1…RL-3, M1f. **Pending independent acceptance.**
 
-Not implemented: retention enforcement and purge, the read function, monitors, D8, suppression,
-`publication_gate`, live adapters. §10 lists what remains unverified.
+Not implemented: the read function, monitors (receipt `commit_ts` / `within_validity`), D8,
+suppression, `publication_gate`, deletion requests, live adapters. §10 and §12.6 list what remains unverified.
 
 ## 1. Frozen scope (PROPOSED)
 
@@ -63,14 +70,16 @@ content read or serving.
 | FD1 | APPROVED | `publication_gate` deferred to 0006+; lock rank 2 stays reserved. Recorded deviation from plan §1 line 42 (which allocates it to 0003). M3 invariant: no M3 path acquires any lock before rank 3 except T1's existing advisory lock. |
 | FD2 | APPROVED; IMPLEMENTED (0004 removes caller counts, 0005 derives them) | Deterministic database-derived counts; `EMPTY ⇒ C = 0` (§6.3). |
 | FD3 | APPROVED; IMPLEMENTED in 0004 (DROP + CREATE; verified: single overload, M1d byte-exact rollback) | Transactional replacement of the T2 signature, conditional on the dependency and privilege verification in §7. |
-| FD4 | APPROVED (proposed anchor) | `retain_until = least(finished_at + retention_days(v), si_retention_end(source, v) as of T2)` for the collected version `v`, as a static upper bound. Dynamic effective end enforced in 0006+. |
+| FD4 | APPROVED; IMPLEMENTED (0005 static bound, 0006 dynamic end) | `retain_until = least(finished_at + retention_days(v), si_retention_end(source, v) as of T2)` for the collected version `v`, as a static upper bound. The dynamic effective end is enforced by 0006 (§12.2). |
 | FD5 | APPROVED; IMPLEMENTED in 0005; timing gate EV-15 passes on PostgreSQL 16.15 (local and CI image) — not a production measurement | Cap 500 rows and 1 MiB (octets of the `jsonb` text form), subject to M3-T14. |
 | FD6 | APPROVED | FAILED runs keep every count at 0 and record bounded coded errors only. |
-| FD7 | **APPROVED — option C; IMPLEMENTED (0003), acceptance pending** | The `xmin` binder (option A) is rejected on PostgreSQL 16 evidence (§4.2.2). Option C, the scoped T1 wrapper (§4.2.3), is approved and implemented. FD7 is not marked VERIFIED until the founder accepts the M3-P1 evidence. Non-empty T2 remains unimplemented. |
+| FD7 | **APPROVED — option C; IMPLEMENTED (0003); ACCEPTED** | The `xmin` binder (option A) is rejected on PostgreSQL 16 evidence (§4.2.2). Option C, the scoped T1 wrapper (§4.2.3), is implemented and accepted as the scope foundation (M3-P1); end-to-end scope enforcement by the non-empty T2 (0005, EV-1…EV-3) is accepted through M3-P2B. |
 | FD11 | APPROVED | BD1 amendment: `si_begin_run_scoped` is added to the collector's SECURITY DEFINER allowlist (it starts runs, so R-PUB applies). `si_bind_request_scope` is withdrawn. Plain `si_begin_run` is unchanged; plain-T1 runs stay EMPTY-only. |
-| FD8 | APPROVED | Synthetic-only development; no content reads; no purge; no production authorization. |
+| FD8 | APPROVED; amended by FD12 | Synthetic-only development; no content reads; no production authorization. "No purge" is superseded by the M3-P3A authorization (FD12): purge only through `si_purge_due`, synthetic evidence only. |
 | FD9 | APPROVED; v1 frozen and reproduced in SQL (SC-1, EV-1); non-reproducible inputs fail closed | Canonical fixture hashing: preserve historical request-hash and retry compatibility; versioning policy in §4.4. |
 | FD10 | APPROVED; IMPLEMENTED in 0005 + bootstrap + D7 + library; canaries EV-11/EV-12 pass | Collector logging preconditions (§5.1). No claim of absolute protection from server logging; effective-session checks and negative leakage tests (M3-T19, M3-T21) are required. |
+| FD12 | APPROVED (M3-P3A authorization); IMPLEMENTED in 0006 | Retention decisions: retirement alone does not end retention; TERMINATE_RETENTION and applicable rights changes shorten the effective end; orphan identities are deleted completely, without tombstone digests; the stricter applicable cleanup deadline applies; evidence with unverifiable commit timestamps follows normal retention; no derived advertising evidence is kept beyond retention (§12.1). |
+| FD13 | **PROPOSED — BD1 amendment, pending acceptance** | Definer allowlist × grantees gains: `si_retention` → `si_purge_due`, `si_record_purge_failure`; `si_retention`, `si_monitor` → `si_retention_status`, `si_purge_failures`; `si_retention` SELECT on `si.purge_log`, `si.purge_failures`. No application role gains any privilege on `si.ads` or `si.observations` (privileges G1/SD1). |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -514,9 +523,8 @@ One targeted mutant only: unsorted ad insertion, which M3-T09 must detect.
 
 - `publication_gate` (rank 2) and its purpose (FD1).
 - Suppression semantics; S stays 0.
-- Purge and deletion: `deletion_requests`, the LIFT cleanup gate, and the RETAINED →
-  PARTIALLY_PURGED → PURGED transitions. `trg_runs_transition` already allows retention columns to
-  change on terminal rows; historical counts stay frozen.
+- Purge and deletion: whole-run purge (RETAINED → PURGED) is **implemented in 0006 (§12)**. Still
+  deferred: `deletion_requests` (per-identity deletion, hence PARTIALLY_PURGED), and the LIFT cleanup gate.
 - **Identity lifecycle:**
   - Milestone 3's guards are trigger functions that 0006+ replaces to admit only a definer purge routine.
   - Purge deletes observations first (FK `RESTRICT`), then deletes an ad identity when no
@@ -525,8 +533,8 @@ One targeted mutant only: unsorted ad insertion, which M3-T09 must detect.
     deletion or retention cleanup.
   - Whether 0006+ tombstones keep a non-reversible identity digest is a 0006+ decision.
 - **Dynamic retention:** effective end = `least(retain_until, si_retention_end(source, v))`,
-  evaluated at purge time and at read time (D8). Termination and retain revocation shorten it
-  immediately. `cleanup_within` bounds purge latency, never permission.
+  evaluated at purge time (**implemented in 0006**) and, later, at read time (D8). Termination and retain
+  revocation shorten it immediately. `cleanup_within` bounds purge latency, never permission.
 - The read function; monitors (receipt `commit_ts`, `within_validity`); D8; cross-source identity
   resolution (`si_resolve_identities`).
 - Non-SYNTHETIC evidence; staged-batch T2 if M3-T14 fails.
@@ -546,7 +554,8 @@ Production-release blockers (unchanged from Milestone 2):
    fail closed without it.
 7. A production host able to perform D5b (`docs/b002-d5b-production-hardening.md`), and an
    independent security review.
-8. Retention not enforced in Milestone 3 (FD8). Re-measure M3-T14 on the production host.
+8. Retention is enforced for synthetic evidence by 0006 (§12) but is not production-ready: no scheduler,
+   timing measured on the test image only, logical deletion only (§12.6). Re-measure M3-T14 and RT-13 on the production host.
 
 Unverified historical requirements:
 9. The 2.1, Amendment A–C and IA-1 texts are unavailable. Suppression, the gate and Amendment B
@@ -612,9 +621,126 @@ Unverified historical requirements:
 - Hash parity beyond the tested corpus and on other Node.js/PostgreSQL/Unicode versions (fails closed).
 - Logging protection covers only §5.1's boundary; a superuser, extensions or debug levels are outside it.
   The bootstrap settings require a superuser-capable bootstrap administrator.
-- Retention is not enforced; data past `retain_until` remains (synthetic only, unreadable).
+- (Superseded by 0006, §12) Retention was not enforced by 0005; data past `retain_until` remained.
 - `supported_networks` can still be changed by the owner directly (narrowing fails closed).
 
 ### 11.4 Production restrictions (unchanged)
 SYNTHETIC sources only; no read path; no content serving; D8/G3 (D-M2-10) and D5b (D-M2-09) remain
 production-release blockers; no production authorization of Milestone 3.
+
+## 12. Retention enforcement (M3-P3A, migration 0006) — IMPLEMENTED, pending independent acceptance
+
+Scope: synthetic evidence only; no read path, no customer display, no export, no live collection,
+no production scheduling or deployment. Migrations 0001–0005 are unchanged (checksums in CI).
+
+### 12.1 Decisions applied (FD12)
+- Source retirement alone does **not** end retention (`retired_at` is not a term of the end).
+- TERMINATE_RETENTION and applicable rights changes (retain revocation, expiry of the collected
+  version) shorten the effective end, through the unchanged 0001 `si_retention_end`.
+- Orphan ad identities are deleted completely; no tombstone or digest is kept.
+- Cleanup deadline: the stricter applicable `cleanup_within` (§12.2).
+- Evidence with unverifiable commit timestamps follows normal retention (D8 does not exist yet; no
+  early deletion and no extension).
+- No derived advertising evidence exists; none may outlive the evidence it derives from (a rule for
+  future migrations, not yet mechanized because nothing derived is stored).
+
+### 12.2 Contract as implemented
+- **Effective end** `E = si_effective_retention_end(source, v, retain_until) = least(retain_until,
+  si_retention_end(source, v))` for the collected version `v`, evaluated with `clock_timestamp()` when
+  used (purge, transition, status); never cached. Once reached, `E` cannot move later: rights versions
+  cannot be back-dated (`SI_BACKDATED_EFFECTIVE_FROM`) and controls are append-only.
+- **Cleanup deadline** `due_by = E + min(cleanup_within)` over the collected version and every later
+  version of the source in effect by `E` (`si_cleanup_due_by`). A latency target, never a permission;
+  a purge after `due_by` is recorded as `late`.
+- **State machine** (`trg_runs_retention`, BEFORE UPDATE, finished runs only): retention metadata
+  (`retention_state`, `retain_until`, `first_purged_at`, `purged_at`) is immutable except RETAINED →
+  PURGED with `retain_until` unchanged and `E <= clock_timestamp()`; both purge timestamps are
+  server-set. EMPTY, PURGED and NONE are final. `SI_RETENTION_NOT_DUE`, `SI_RETENTION_IMMUTABLE`.
+- **Evidence guard** (`trg_evidence_append_only`, same triggers as 0005, new body): an observation may
+  be deleted only when its run is PURGED; an ad identity only when no observation references it
+  (checked before the FK RESTRICT check, whose error detail would quote the key). UPDATE and TRUNCATE
+  stay refused for every role. Admission is data-based; no session variable or caller flag is consulted.
+- **Deferred checks (COMMIT):** a run that became PURGED holds no observations (`SI_PURGE_INCOMPLETE`)
+  and has its audit record (`SI_PURGE_UNAUDITED`); every audit record matches its PURGED run's
+  `published_count` and `purged_at` (`SI_PURGE_LOG_MISMATCH`); no deleted observation leaves its
+  identity without evidence (`SI_PURGE_ORPHAN_IDENTITY`).
+- **`si_purge_due(p_limit 1..20, default 10)`** — SECURITY DEFINER, pinned `search_path`, EXECUTE for
+  `si_retention` only; READ COMMITTED only (`SI_ISOLATION`). One source per transaction:
+  1. candidate sources ordered by earliest `E` (computed once per source and collected version);
+  2. rank 3: `sources FOR NO KEY UPDATE SKIP LOCKED` — conflicts with T2 (`FOR SHARE`), the rights and
+     control writers (`FOR UPDATE`) and another purge; compatible with T1 (`FOR KEY SHARE`). A held
+     source is skipped (no convoy); if every due source is held the result is `BUSY`;
+  3. due runs re-selected under the lock (fresh READ COMMITTED snapshot), locked in `run_id` order (rank 4);
+  4. runs moved to PURGED (the state machine re-verifies `E`); observations deleted (rank 6), checked
+     against `published_count`; then the identities they referenced locked in `ad_id` order (rank 5),
+     re-checked and deleted when unreferenced — rank 6 before rank 5 is the one documented exception
+     to the ascending order, safe because the rank-3 lock excludes the only other writer of a source's
+     evidence (T2), and required by FK RESTRICT;
+  5. one `si.purge_log` row per run in the same transaction; returns `outcome` (PURGED / NOTHING_DUE /
+     BUSY), the source id and counts only.
+- **Audit:** `si.purge_log` (ids, reason code `RETENTION_PERIOD` / `RIGHTS_ENDED` / `TERMINATED`, `E`,
+  `due_by`, `purged_at`, counts, `late`, `purged_by`) and `si.purge_failures` (code, SQLSTATE, who),
+  append-only for every role; no advertising content by construction (RT-12 catalog check).
+- **Monitoring:** `si_retention_status()` (per source: retained, due and overdue runs, next end,
+  oldest overdue deadline, purged and late purges) and `si_purge_failures(n)` — content-free, EXECUTE
+  for `si_retention` and `si_monitor`.
+- **Library / CLI:** `src/persistence/retention.ts` (`purgeDue`, `retentionStatus`, `overdueRetention`,
+  `purgeFailures`); `cli.js retention purge|status|overdue|failures`. Output is codes, ids, times and
+  counts; a failure is `RETENTION_FAILED code=… sqlstate=… recorded=…`, never database text. A failed
+  batch has rolled back; the failure code is then recorded in its own transaction. Nothing is scheduled.
+- **Privileges:** no application role gains any privilege on `si.ads` or `si.observations`; FD13 lists
+  the new grants.
+
+### 12.3 Pre-implementation verification (disposable PostgreSQL 16.15, compose image)
+- Lock compatibility on the source row: `NO KEY UPDATE` conflicts with `SHARE`, `UPDATE` and itself;
+  is compatible with `KEY SHARE`; `SKIP LOCKED` skips a held row.
+- A DEFERRABLE INITIALLY DEFERRED `AFTER DELETE` constraint trigger fires at COMMIT only, and not for INSERT.
+- The race the source lock prevents, reproduced on scratch tables: deleting an identity while a
+  concurrent insert references it fails with 23503 in **both** directions, and the error detail
+  quotes the key values (`Key (…)=(…) is not present / is still referenced`). RT-8 and the
+  missing-lock mutant reproduce it on the real objects.
+
+### 12.4 Acceptance-test mapping
+| Requirement | Test |
+|---|---|
+| Unexpired evidence cannot be deleted; metadata immutable | RT-1 |
+| Expired evidence purged through the authorized routine | RT-2 |
+| Revocation and TERMINATE_RETENTION shorten; future revocation does not yet | RT-3 |
+| Retirement alone does not shorten | RT-4 |
+| A purged run has zero observations; inconsistent purges cannot commit | RT-2, RT-5 |
+| Retained runs keep publication integrity | RT-6/RT-7, global invariants in every RT test |
+| Orphan identities removed; shared identities kept | RT-2, RT-6/RT-7 |
+| Concurrent completion and purge: no FK error, no leak (forced interleavings) | RT-8 |
+| Concurrent purgers: no double purge, no convoy | RT-9 |
+| Crash / abort mid-purge: nothing partial; failures recorded as codes | RT-10, RL-3 |
+| Unauthorized roles cannot purge or read evidence | RT-11, privileges G1/SD1 |
+| Audit, status, CLI output and logs content-free | RT-12 |
+| Emergency SUSPEND / TERMINATE wait ≤ 5 s against a maximum batch; purge timing | RT-13 |
+| up/down/up exact catalog | M1, M1f, RT-14, MG2, MG6 |
+| Existing M2/M3 regressions | full suite |
+| Targeted mutants (source lock, unconditional deletion, TERMINATE ignored, PURGED with evidence, identity recheck, leak) | RT-M (each with a clean baseline) |
+| Restored cluster | DR-1 runs RT-2, RT-11, RT-14 on the restored target |
+
+### 12.5 Lock order after 0006
+1 advisory (T1) → 3 sources (`KEY SHARE` T1, `SHARE` T2, `NO KEY UPDATE` purge, `UPDATE` rights and
+controls) → 4 runs (`run_id` order for multi-run locks) → 5 ads (sorted) → 6 observations → purge
+records. Exception: the purge deletes 6 before 5 under its exclusive rank-3 lock (§12.2).
+
+### 12.6 Limitations and unverified assumptions
+- **Logical deletion only.** Deleted rows remain in table storage until vacuumed, and in WAL,
+  base backups, replicas and any logical dumps under their own retention. Server logs are outside
+  the purge. This is not secure erasure and must not be described as such.
+- **Not scheduled.** Purges happen only when invoked; overdue evidence is reported (`retention
+  overdue` exits 2) but nothing invokes the purge automatically. A source that is continuously held
+  by completions or rights changes is skipped (`BUSY`) and can become overdue; the monitor reports it.
+- **Clock.** `E` is evaluated with the server clock; correctness assumes a sane, monotonic clock.
+- **Rights-expiry path** of `si_retention_end` is unchanged from 0001 and not exercised end-to-end
+  here (T1/T2 windows make a near-term expiry impractical in tests); revocation and termination are.
+- **Superusers** can bypass every trigger (for example `session_replication_role`), as the tests'
+  time-travel fixture does; the boundary covers application roles and `si_owner` code paths only.
+- **Scale.** Candidate selection reads all RETAINED runs (once per source and version for the
+  rights term); acceptable for the synthetic corpus, to be revisited before large volumes.
+- **Down migration** drops the purge audit tables (destructive; refused without `--allow-destructive`).
+- Timing measured on the PostgreSQL 16.15 test image only; production must re-measure.
+- Production blockers unchanged: D8/G3 (D-M2-10), D5b (D-M2-09), D7 production gate composition
+  (collector logging is not part of `assertProductionReady`). Retention is **not production-ready**.

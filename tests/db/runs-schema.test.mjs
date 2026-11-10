@@ -223,5 +223,6 @@ test('step-4 scope: T2, the publication check and the receipt guards exist', asy
                                       AND tgrelid IN ('si.collection_runs'::regclass, 'si.publication_receipts'::regclass, 'si.run_errors'::regclass)`)).rows[0].t;
   assert.deepEqual(trg?.slice().sort(), ['trg_receipts_guard', 'trg_receipts_no_truncate', 'trg_receipts_run_completed',
     'trg_run_errors_append_only', 'trg_run_errors_count', 'trg_run_errors_no_truncate', 'trg_runs_error_count', 'trg_runs_insert',
-    'trg_runs_no_delete', 'trg_runs_no_truncate', 'trg_runs_publish_check', 'trg_runs_transition'].sort());
+    'trg_runs_no_delete', 'trg_runs_no_truncate', 'trg_runs_publish_check', 'trg_runs_purge_check', 'trg_runs_retention',
+    'trg_runs_transition'].sort());
 });

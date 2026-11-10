@@ -141,7 +141,7 @@ export function classifyError(err) {
   return 'db-error';
 }
 export async function settle(promise) {
-  try { return { status: 'ok', value: await promise }; } catch (err) { return { status: classifyError(err), code: err.code, message: err.message }; }
+  try { return { status: 'ok', value: await promise }; } catch (err) { return { status: classifyError(err), code: err.code, message: err.message, detail: err.detail }; }
 }
 
 /**

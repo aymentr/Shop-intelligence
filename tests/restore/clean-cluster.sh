@@ -165,4 +165,10 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test tests/db/privileges.test.mjs
 echo 'DR-1 restored role privileges regression PASS'
+# Migration 0006 on the restored cluster: a purge, the purge privilege boundary and 0006 reversibility.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^RT-(2|11|14):' tests/db/m3-retention.test.mjs
+echo 'DR-1 restored retention purge, purge privileges and 0006 reversibility PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'
