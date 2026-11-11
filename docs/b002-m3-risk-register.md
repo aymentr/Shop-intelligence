@@ -27,7 +27,9 @@ Baseline a0b63183f3c0e16f187287a42d2ab6c9ab5d01fd. **Every risk below is open** 
 | R-21 | **Restored-copy intent reuse; unbounded intents; no grant attribution (S14, S16, S8)** | Medium | M3-AUD-02 | B | C6, C5, C4 | OPEN |
 | R-22 | **Client-side intelligence scan.** History and search read every readable record of a source (at most 5,000, then fail closed) | Low (synthetic) / Medium (B) | M4-P1 | B | M4-P2: server-side audited search primitive | OPEN |
 | R-23 | **Advertiser identity is the normalized name within one source.** No entity resolution or cross-source identity; look-alike names are separate | Medium | M4-P1 | B, C | Identity design with explicit evidence and authorization | OPEN |
-| R-24 | **Source status exposes collection metadata to granted readers (FD20)** | Low | M4-P1 | — | Founder decision FD20 | PROPOSED |
+| R-24 | **Source status exposes collection metadata to granted readers (FD20)** | Low | M4-P1 | — | Founder decision FD20 | ACCEPTED for synthetic development only (FD20 approved); to be re-decided before real evidence |
+| R-25 | **Availability reasons and changes visible to granted readers (FD21).** A granted reader learns why a source is unavailable (fixed codes) and that availability changed. Unknown and ungranted sources learn nothing | Low | M4-P1.1 | — | Founder decision FD21 | PROPOSED |
+| R-26 | **Fail-closed gate liveness on stray WAL.** The first gated request on a fresh database, or any request racing unrelated unflushed WAL while the idle WAL writer hibernates, is refused `INTENT_NOT_DURABLE`. The library retries (about 1 s). Under a prolonged WAL-writer interval, single-attempt callers (AUD-5/6/7 by design) fail closed | Low (synthetic) / Medium (B: latency) | M4-P1-ACCEPT-01 D4; M4-P1.1 D2 measurement | B | Measure on the pilot host; consider a gate that excludes WAL it can attribute to the request | OPEN (documented constraint) |
 
 ## Priority order for pilot B
 

@@ -4,7 +4,11 @@
  * Everything here is computed deterministically from what the verified read boundary releases:
  *   - evidence pages from si_read_evidence (each page: its own committed, crash-durable request intent);
  *   - content-free source status from si_read_source_status (migration 0011; its own request intent, the
- *     period bound into the audited scope).
+ *     period bound into the audited scope);
+ *   - content-free source availability from si_read_source_availability (migration 0012; its own request intent).
+ *     Every evidence scan checks availability before its first page and after its last: an unavailable source is
+ *     a typed failure (SOURCE_UNAVAILABLE with fixed reason codes), never an empty result, and a change of
+ *     availability during the scan fails the request (AVAILABILITY_CHANGED) instead of returning a truncated one.
  * There is no other database access: no table, no view, no unrestricted query. Every source is authorized
  * separately by the database; results are never merged across sources (an advertiser identity is the
  * normalized name WITHIN one source). Ages are measured against the database clock (status.as_of).
@@ -25,10 +29,25 @@ export const MAX_SCAN_RECORDS = 5000;
 export const MAX_SEARCH_RESULTS = 50;
 export const MAX_SOURCES_PER_REQUEST = 10;
 
-export type IntelligenceFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'SCAN_LIMIT' | 'SOURCE_UNAVAILABLE';
-/** Fixed message only. Read refusals from the database surface as ReadFailed (reader.ts). */
+export type IntelligenceFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'SCAN_LIMIT' | 'SOURCE_UNAVAILABLE' | 'AVAILABILITY_CHANGED';
+/** Why a granted reader may not read a source now (migration 0012), in this fixed order. */
+export const UNAVAILABILITY_REASONS = ['RETIRED', 'TERMINATED', 'SUSPENDED', 'RIGHTS_RESTRICTED', 'RETENTION_RESTRICTED',
+                                       'NOT_SYNTHETIC', 'UNAVAILABLE'] as const;
+export type UnavailabilityReason = typeof UNAVAILABILITY_REASONS[number];
+/**
+ * Fixed message only. Read refusals from the database surface as ReadFailed (reader.ts); in particular an unknown
+ * or ungranted source is ReadFailed NOT_AUTHORIZED, never SOURCE_UNAVAILABLE and never an empty result.
+ * SOURCE_UNAVAILABLE carries the source and its fixed reason codes; AVAILABILITY_CHANGED carries the source.
+ */
 export class IntelligenceFailed extends Error {
-  constructor(readonly code: IntelligenceFailureCode) { super(`INTELLIGENCE_FAILED: ${code}`); this.name = 'IntelligenceFailed'; }
+  readonly sourceId: string | null;
+  readonly reasons: readonly UnavailabilityReason[];
+  constructor(readonly code: IntelligenceFailureCode, detail: { sourceId?: string; reasons?: readonly UnavailabilityReason[] } = {}) {
+    super(`INTELLIGENCE_FAILED: ${code}`);
+    this.name = 'IntelligenceFailed';
+    this.sourceId = detail.sourceId ?? null;
+    this.reasons = Object.freeze([...(detail.reasons ?? [])]);
+  }
 }
 
 const SOURCE_ID = /^[a-z0-9][a-z0-9-]{1,62}$/;
@@ -56,11 +75,16 @@ const inPeriod = (r: EvidenceRecord, p?: Period): boolean => {
 // ------------------------------------------------------------------------------------------------
 // Evidence scan through the verified read boundary.
 
-export interface EvidenceScan { sourceId: string; records: EvidenceRecord[]; pages: number }
+/** The source was available, with no availability-relevant change, from `checkedFrom` to `asOf` (database clock). */
+export interface AvailableSource { sourceId: string; state: 'AVAILABLE'; checkedFrom: string; asOf: string }
+export interface EvidenceScan { sourceId: string; records: EvidenceRecord[]; pages: number; availability: AvailableSource }
 
 /**
  * Every evidence record of one source that is readable NOW, in the read's deterministic order
  * (collectedAt, runId, ordinal). One request intent per page. Fails closed above MAX_SCAN_RECORDS.
+ * Availability is checked before the first page and after the last (one request intent each): unavailable at
+ * either end -> SOURCE_UNAVAILABLE with reasons; available at both ends but with a different state token ->
+ * AVAILABILITY_CHANGED (pages read in between may have been empty because of the change).
  * `onPage` is called after each non-empty page (tests use it to interleave concurrent changes).
  */
 export async function scanEvidence(client: ClientBase, sourceId: string,
@@ -68,6 +92,8 @@ export async function scanEvidence(client: ClientBase, sourceId: string,
   if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId)) throw new IntelligenceFailed('BAD_ARGUMENT');
   const limit = opts.pageSize ?? MAX_READ_RECORDS, max = opts.maxRecords ?? MAX_SCAN_RECORDS;
   if (!Number.isInteger(max) || max < 1 || max > MAX_SCAN_RECORDS) throw new IntelligenceFailed('BAD_ARGUMENT');
+  const before = await sourceAvailability(client, sourceId);
+  if (!before.available) throw new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId, reasons: before.reasons });
   const records: EvidenceRecord[] = [];
   const seen = new Set<string>();
   let cursor: string | null = null, pages = 0;
@@ -85,7 +111,56 @@ export async function scanEvidence(client: ClientBase, sourceId: string,
     cursor = page.nextCursor;
     if (opts.onPage) await opts.onPage(page.records.length);
   }
-  return { sourceId, records, pages };
+  const after = await sourceAvailability(client, sourceId);
+  if (!after.available) throw new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId, reasons: after.reasons });
+  if (after.stateToken !== before.stateToken) throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });
+  return { sourceId, records, pages, availability: { sourceId, state: 'AVAILABLE', checkedFrom: before.asOf, asOf: after.asOf } };
+}
+
+// ------------------------------------------------------------------------------------------------
+// Source availability (migration 0012).
+
+export interface SourceAvailability {
+  sourceId: string; asOf: string; available: boolean; reasons: UnavailabilityReason[];
+  /** Opaque; equal tokens mean no availability-relevant change was committed in between. */
+  stateToken: string;
+}
+export const availabilityCursor = (sourceId: string): string => `v1|${sourceId}|availability`;
+
+/** One content-free, audited request (its own committed, crash-durable intent), with the library's bounded fresh-intent
+ *  retry on INTENT_NOT_DURABLE only. `onError` may map a database error to a typed failure first. */
+async function auditedCall(client: ClientBase, sourceId: string, cursor: string, sql: string, params: unknown[],
+  onError: (message: string) => Error | null = () => null): Promise<Record<string, unknown> | undefined> {
+  for (let attempt = 1; ; attempt++) {
+    const intentId = await beginRead(client, sourceId, { cursor, limit: 1 });
+    try {
+      return (await client.query(sql, [sourceId, intentId, ...params])).rows[0];
+    } catch (err) {
+      const m = (err as { message?: unknown })?.message;
+      const mapped = typeof m === 'string' ? onError(m) : null;
+      if (mapped) throw mapped;
+      const code = (err as { code?: unknown })?.code;
+      const failure = new ReadFailed(classifyReadError(err), typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null, intentId);
+      if (failure.code === 'INTENT_NOT_DURABLE' && attempt < NOT_DURABLE_ATTEMPTS) continue;
+      throw failure;
+    }
+  }
+}
+
+/**
+ * Whether one source may be read now, and if not, why (fixed codes). Only a granted reader gets an answer: an unknown
+ * or ungranted source is ReadFailed NOT_AUTHORIZED, exactly like an evidence page.
+ */
+export async function sourceAvailability(client: ClientBase, sourceId: string): Promise<SourceAvailability> {
+  if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId)) throw new IntelligenceFailed('BAD_ARGUMENT');
+  const row = await auditedCall(client, sourceId, availabilityCursor(sourceId), 'SELECT * FROM si.si_read_source_availability($1, $2::uuid)', []);
+  const reasons = row?.reasons, token = row?.state_token, asOf = iso(row?.as_of);
+  if (!row || row.source_id !== sourceId || typeof row.available !== 'boolean' || !Array.isArray(reasons) || typeof token !== 'string' ||
+      !/^[0-9a-f]{32}$/.test(token) || !asOf || !reasons.every(r => (UNAVAILABILITY_REASONS as readonly unknown[]).includes(r)) ||
+      row.available !== (reasons.length === 0)) {
+    throw new ReadFailed('INTERNAL', null);                                  // fail closed on anything unexpected
+  }
+  return { sourceId, asOf, available: row.available, reasons: reasons as UnavailabilityReason[], stateToken: token };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -108,6 +183,7 @@ export interface AdvertiserHistory {
   runsWithEvidence: number;                                                   // distinct runs containing it
   networks: string[];
   endOfActivity: 'UNKNOWN';                                                   // absence of observations proves nothing
+  availability: AvailableSource;                                              // explicit: zero observations from an AVAILABLE source
   sourceVerification: SourceStatus | null;                                    // run-level verdicts for the period (if requested)
   notes: string[];
 }
@@ -145,6 +221,7 @@ export async function advertiserHistory(client: ClientBase, sourceId: string, ad
     runsWithEvidence: new Set(mine.map(r => r.runId)).size,
     networks: [...new Set(mine.map(r => r.network))].sort(),
     endOfActivity: 'UNKNOWN',
+    availability: scan.availability,
     sourceVerification: status,
     notes: [NOTE_ABSENCE, NOTE_SCOPE]
   };
@@ -158,7 +235,8 @@ export interface AdvertiserHit {
   sourceId: string; normalizedName: string; names: string[]; observations: number; distinctAds: number;
   runsWithEvidence: number; firstObservedAt: string; lastObservedAt: string; networks: string[];
 }
-export interface SearchPage { hits: AdvertiserHit[]; nextCursor: string | null; scannedPages: number }
+/** `sources`: every requested source, each AVAILABLE throughout its scan (otherwise the whole search fails, typed). */
+export interface SearchPage { hits: AdvertiserHit[]; nextCursor: string | null; scannedPages: number; sources: AvailableSource[] }
 
 function searchKey(q: { sources: string[]; query: string; period: Period | undefined; networks: string[] }): string {
   const canon = JSON.stringify({ s: q.sources, q: q.query, f: q.period?.from.toISOString() ?? null, t: q.period?.to.toISOString() ?? null, n: q.networks });
@@ -199,9 +277,11 @@ export async function searchAdvertisers(client: ClientBase, q: SearchQuery,
   const after = q.cursor ? decodeCursor(q.cursor, key) : null;
   const groups = new Map<string, { sourceId: string; normalizedName: string; recs: EvidenceRecord[] }>();
   let scannedPages = 0;
-  for (const sourceId of sources) {                                           // each source: its own authorization
+  const checked: AvailableSource[] = [];
+  for (const sourceId of sources) {                                           // each source: its own authorization and availability
     const scan = await scanEvidence(client, sourceId, opts);
     scannedPages += scan.pages;
+    checked.push(scan.availability);
     for (const r of scan.records) {
       const nn = normalizeAdvertiser(r.advertiserName);
       if (!nn.includes(query) || !inPeriod(r, period) || (networks.length > 0 && !networks.includes(r.network))) continue;
@@ -222,7 +302,7 @@ export async function searchAdvertisers(client: ClientBase, q: SearchQuery,
   const rest = after ? all.filter(h => cmp([h.normalizedName, h.sourceId], after) > 0) : all;
   const hits = rest.slice(0, limit);
   const last = hits[hits.length - 1];
-  return { hits, nextCursor: rest.length > limit && last ? encodeCursor(key, [last.normalizedName, last.sourceId]) : null, scannedPages };
+  return { hits, nextCursor: rest.length > limit && last ? encodeCursor(key, [last.normalizedName, last.sourceId]) : null, scannedPages, sources: checked };
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -246,22 +326,17 @@ export async function sourceStatus(client: ClientBase, sourceId: string, period:
   if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId)) throw new IntelligenceFailed('BAD_ARGUMENT');
   const p = checkPeriod(period);
   if (!p) throw new IntelligenceFailed('BAD_ARGUMENT');
-  const cursor = statusCursor(sourceId, p);
+  const UNAVAILABLE = new Error('SOURCE_UNAVAILABLE');                          // marker: resolved to reasons below
   let row: Record<string, unknown> | undefined;
-  for (let attempt = 1; ; attempt++) {
-    const intentId = await beginRead(client, sourceId, { cursor, limit: 1 });
-    try {
-      row = (await client.query('SELECT * FROM si.si_read_source_status($1, $2::uuid, $3::timestamptz, $4::timestamptz)',
-        [sourceId, intentId, p.from.toISOString(), p.to.toISOString()])).rows[0];
-      break;
-    } catch (err) {
-      const m = (err as { message?: unknown })?.message;
-      if (typeof m === 'string' && m.startsWith('SI_READ_SOURCE_UNAVAILABLE:')) throw new IntelligenceFailed('SOURCE_UNAVAILABLE');
-      const code = (err as { code?: unknown })?.code;
-      const failure = new ReadFailed(classifyReadError(err), typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null, intentId);
-      if (failure.code === 'INTENT_NOT_DURABLE' && attempt < NOT_DURABLE_ATTEMPTS) continue;
-      throw failure;
-    }
+  try {
+    row = await auditedCall(client, sourceId, statusCursor(sourceId, p),
+      'SELECT * FROM si.si_read_source_status($1, $2::uuid, $3::timestamptz, $4::timestamptz)', [p.from.toISOString(), p.to.toISOString()],
+      m => (m.startsWith('SI_READ_SOURCE_UNAVAILABLE:') ? UNAVAILABLE : null));
+  } catch (err) {
+    if (err !== UNAVAILABLE) throw err;
+    const a = await sourceAvailability(client, sourceId);                     // why (a separate audited request)
+    if (a.available) throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });
+    throw new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId, reasons: a.reasons });
   }
   if (!row) throw new ReadFailed('INTERNAL', null);
   const n = (k: string) => Number(row?.[k] ?? 0);

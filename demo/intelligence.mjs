@@ -1,12 +1,13 @@
-// Shop Intelligence — M4-P1: synthetic advertiser intelligence demonstration.
+// Shop Intelligence — M4-P1 (M4-P1.1): synthetic advertiser intelligence demonstration.
 //
 // SYNTHETIC DATA ONLY. Every advertiser, advertisement and timestamp below is invented for this demonstration.
 // Nothing here represents live market conditions, real advertisers or real campaigns, and nothing is
 // displayed to a customer, exported or mirrored. There is no network collection.
 //
-// Drives the REAL implementation (migrations 0001-0011, persistence library in dist/) against a disposable
-// PostgreSQL 16.15 container started by demo/run.sh (DEMO_PROGRAM=demo/intelligence.mjs). The reader uses
-// only si_begin_read + si_read_evidence + si_read_source_status, through src/persistence/intelligence.ts.
+// Drives the REAL implementation (migrations 0001-0012, persistence library in dist/) against a disposable
+// PostgreSQL 16.15 container started by demo/run.sh (DEMO_PROGRAM=demo/intelligence.mjs). The reader uses only
+// si_begin_read + si_read_evidence + si_read_source_status + si_read_source_availability, through
+// src/persistence/intelligence.ts.
 //
 // Fixtures that no product path can perform (each named in the report):
 //   - "time shift": the demo superuser sets finished runs' timestamps to historical instants
@@ -68,13 +69,13 @@ const HISTORY = [
   [-1, []]                                                                   // the collector ran yesterday and found nothing
 ];
 try {
-  await scenario('E1', 'Disposable PostgreSQL 16 with migrations 0001-0011 and a dedicated reader', async () => {
+  await scenario('E1', 'Disposable PostgreSQL 16 with migrations 0001-0012 and a dedicated reader', async () => {
     const root = await conn('si_bootstrap', 'postgres');
     await bootstrapCluster(root, { passwords: Object.fromEntries(LOGIN_ROLES.map(r => [r, ROLE_PW])) });
     await provisionReaderPrincipal(root, READER, ROLE_PW);
     await root.query(`DROP DATABASE IF EXISTS ${DB}`); await root.query(`CREATE DATABASE ${DB}`);
     A = await conn('si_bootstrap'); await bootstrapDatabase(A);
-    assert.deepEqual(await migrateUp(await conn('si_migrator')), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    assert.deepEqual(await migrateUp(await conn('si_migrator')), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
     report.schema_version = codeSchemaVersion();
     [col, ra, mon, rd] = await Promise.all(['si_collector', 'si_rights_admin', 'si_monitor', READER].map(u => conn(u)));
     await A.query('BEGIN'); await A.query('SET LOCAL ROLE si_owner');
@@ -146,14 +147,15 @@ try {
     assert.equal(empty.verificationCompleteness.state, 'UNKNOWN', 'insufficient evidence is UNKNOWN, never zero or a guess');
   });
 
-  await scenario('X1', 'A source suspension immediately blocks further reads', async () => {
+  await scenario('X1', 'A source suspension immediately blocks further reads, explicitly (not an empty history)', async () => {
     await ra.query(`SELECT * FROM si.si_record_source_control($1, 'SUSPEND', 'demo suspension', NULL, NULL, NULL, NULL, NULL)`, [SRC]);
-    const h = await advertiserHistory(rd, SRC, NW);
-    assert.equal(h.observations.length, 0, 'no evidence released after SUSPEND');
-    let code = null;
-    try { await freshness(rd, SRC, period); } catch (e) { code = e instanceof IntelligenceFailed || e instanceof ReadFailed ? e.code : 'other'; }
-    assert.equal(code, 'SOURCE_UNAVAILABLE');
-    report.insights.after_suspension = { history_observations: h.observations.length, status: code };
+    const outcome = async p => { try { await p; return { code: 'OK', reasons: [] }; }
+      catch (e) { return e instanceof IntelligenceFailed ? { code: e.code, reasons: [...e.reasons] } : { code: e instanceof ReadFailed ? e.code : 'other', reasons: [] }; } };
+    const history = await outcome(advertiserHistory(rd, SRC, NW));
+    const search = await outcome(searchAdvertisers(rd, { sources: [SRC], query: 'synthetic' }));
+    const status = await outcome(freshness(rd, SRC, period));
+    for (const o of [history, search, status]) assert.deepEqual(o, { code: 'SOURCE_UNAVAILABLE', reasons: ['SUSPENDED'] }, 'typed, with its reason; nothing released');
+    report.insights.after_suspension = { history, search, status };
   });
 
   await scenario('U1', 'Every request left a committed, consumed request record (audit)', async () => {

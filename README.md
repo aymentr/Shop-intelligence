@@ -50,7 +50,8 @@ serving), no live collection, no production deployment.
 | 0008 | controlled internal retrieval: `si_reader` principals, per-source grants, bounded `si_read_evidence` | M3-P3C, accepted |
 | 0009 | read request audit: a committed, scoped read intent (`si_begin_read`) before any evidence; replaces the 0008 read entry point | M3-AUD-01, conditionally accepted for synthetic use by M3-AUD-02 |
 | 0010 | crash-durable read intent: no evidence until the intent's commit is flushed to WAL (bounded, fail closed) | M3-AUD-03, conditionally accepted by M3-AUD-04 |
-| 0011 | reader source status: content-free per-source, per-period run and verdict counts for freshness and reliability, gated like an evidence page | M4-P1, pending acceptance |
+| 0011 | reader source status: content-free per-source, per-period run and verdict counts for freshness and reliability, gated like an evidence page | M4-P1, conditionally accepted for synthetic development by M4-P1-ACCEPT-01 (FD20 approved, synthetic only) |
+| 0012 | reader source availability: available or not, fixed reason codes and a state token, so that history and search never present an unavailable source as empty | M4-P1.1 (D1), pending independent acceptance (FD21 proposed) |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
@@ -90,6 +91,8 @@ IMPLEMENTED — a caller rollback still erases the record that rows were release
 Synthetic advertiser intelligence (M4-P1, `docs/b002-m4-intelligence.md`): `src/persistence/intelligence.ts` provides
 advertiser history, deterministic search and freshness/reliability indicators over the verified read boundary
 (evidence pages plus the 0011 source status), per explicitly authorized source, with explicit UNKNOWN states.
+Since M4-P1.1 (0012 source availability), an unavailable source is a typed failure with a fixed reason
+(suspended, terminated, retired, rights or retention restricted), never an empty history or search result.
 `npm run demo:intelligence` demonstrates it on synthetic data only (not live market conditions).
 
 Lifecycle demonstration (M3-P3D): `npm run demo:lifecycle` runs the real implementation end to end —

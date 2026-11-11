@@ -2,7 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { normalizeAdvertiser, statusCursor, freshnessFromStatus, searchAdvertisers, advertiserHistory, sourceStatus, scanEvidence,
-         IntelligenceFailed } from '../dist/persistence/intelligence.js';
+         IntelligenceFailed, sourceAvailability, availabilityCursor, UNAVAILABILITY_REASONS } from '../dist/persistence/intelligence.js';
 
 const spy = () => { const sent = []; return { sent, query: async sql => { sent.push(sql); throw new Error('no database in this test'); } }; };
 const base = { sourceId: 's-1', periodFrom: '2026-10-01T00:00:00.000Z', periodTo: '2026-10-11T00:00:00.000Z', asOf: '2026-10-12T00:00:00.000Z',
@@ -44,5 +44,26 @@ test('IL-3: bad arguments are refused before any statement', async () => {
     const c = spy();
     await assert.rejects(f(c), e => e instanceof IntelligenceFailed && e.code === 'BAD_ARGUMENT');
     assert.equal(c.sent.length, 0);
+  }
+});
+
+test('IL-4 (M4-P1.1 D1): availability scope, typed failure with fixed reasons, and fail-closed row validation', async () => {
+  assert.equal(availabilityCursor('s-1'), 'v1|s-1|availability');
+  assert.deepEqual([...UNAVAILABILITY_REASONS], ['RETIRED', 'TERMINATED', 'SUSPENDED', 'RIGHTS_RESTRICTED', 'RETENTION_RESTRICTED', 'NOT_SYNTHETIC', 'UNAVAILABLE']);
+  const e = new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId: 's-1', reasons: ['SUSPENDED'] });
+  assert.deepEqual([e.message, e.code, e.sourceId, [...e.reasons]], ['INTELLIGENCE_FAILED: SOURCE_UNAVAILABLE', 'SOURCE_UNAVAILABLE', 's-1', ['SUSPENDED']]);
+  assert.ok(Object.isFrozen(e.reasons), 'reasons cannot be altered by a caller');
+  assert.deepEqual([new IntelligenceFailed('BAD_ARGUMENT').sourceId, [...new IntelligenceFailed('BAD_ARGUMENT').reasons]], [null, []]);
+  const c = spy();
+  await assert.rejects(sourceAvailability(c, 'BAD ID'), err => err instanceof IntelligenceFailed && err.code === 'BAD_ARGUMENT');
+  assert.deepEqual(c.sent, [], 'refused before any statement');
+  // A row that is inconsistent or carries an unknown reason fails closed (INTERNAL), never "available".
+  const rowClient = row => ({ query: async sql => (/si_begin_read/.test(sql) ? { rows: [{ id: '00000000-0000-0000-0000-000000000001' }] } : { rows: [row] }) });
+  const good = { source_id: 's-1', as_of: new Date('2026-10-12T00:00:00Z'), available: true, reasons: [], state_token: 'a'.repeat(32) };
+  assert.deepEqual(await sourceAvailability(rowClient(good), 's-1'),
+    { sourceId: 's-1', asOf: '2026-10-12T00:00:00.000Z', available: true, reasons: [], stateToken: 'a'.repeat(32) });
+  for (const bad of [{ ...good, reasons: ['SUSPENDED'] }, { ...good, available: false }, { ...good, available: false, reasons: ['MAINTENANCE'] },
+                     { ...good, state_token: 'x' }, { ...good, source_id: 's-2' }, { ...good, as_of: null }]) {
+    await assert.rejects(sourceAvailability(rowClient(bad), 's-1'), err => err?.name === 'ReadFailed' && err.code === 'INTERNAL', JSON.stringify(bad));
   }
 });

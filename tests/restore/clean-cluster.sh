@@ -205,10 +205,11 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^AUD-13a:' tests/crash/m3-durability-fixtures.test.mjs
 echo 'DR-1 restored crash-durable read intent gate (ordinary reads, explicit transactions, savepoints) PASS'
-# Migration 0011 on the restored cluster: synthetic advertiser intelligence over the verified read boundary.
+# Migrations 0011 and 0012 on the restored cluster: synthetic advertiser intelligence over the verified read
+# boundary, including explicit source availability (M4-P1.1 D1).
 SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
   SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
   SI_TEST_TEMPLATE=si_template_test \
-  node --test --test-name-pattern='^INT-(1|3|17)/?[^0-9]' tests/db/m4-intelligence.test.mjs
-echo 'DR-1 restored advertiser history, cross-source isolation and request audit of intelligence reads PASS'
+  node --test --test-name-pattern='^INT-(1|3|17|20)/?[^0-9]' tests/db/m4-intelligence.test.mjs
+echo 'DR-1 restored advertiser history, cross-source isolation, request audit and explicit source availability of intelligence reads PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

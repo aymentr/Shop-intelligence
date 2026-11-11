@@ -1,6 +1,8 @@
 // B-002 M4-P1: synthetic advertiser intelligence (history, search, freshness) over the verified read boundary.
-// Real disposable PostgreSQL 16, synthetic sources only. Every value comes from si_read_evidence pages or the
-// content-free si_read_source_status (migration 0011); no test reads evidence tables as a reader.
+// Real disposable PostgreSQL 16, synthetic sources only. Every value comes from si_read_evidence pages, the
+// content-free si_read_source_status (migration 0011) or si_read_source_availability (migration 0012, M4-P1.1 D1);
+// no test reads evidence tables as a reader. M4-P1.1: INT-20..INT-22 (explicit availability) and exact-outcome
+// mutant baselines (D3).
 //
 // Fixtures a product path cannot perform (labelled where used): the test superuser sets runs' finished_at to
 // absolute, millisecond-precision historical times under session_replication_role = replica ("time shift": the
@@ -8,6 +10,7 @@
 // a retention deadline; mutated copies of the status function (database) or of the library (temporary copy).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync, mkdtempSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +23,7 @@ import * as INTEL from '../../dist/persistence/intelligence.js';
 
 const DIST = fileURLToPath(new URL('../../dist/persistence/', import.meta.url));
 const MIG11 = readFileSync(new URL('../../db/migrations/0011_reader_status.up.sql', import.meta.url), 'utf8');
+const MIG12 = readFileSync(new URL('../../db/migrations/0012_reader_availability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 let n = 0;
 
@@ -67,6 +71,32 @@ const day = k => new Date(Date.UTC(2026, 9, 1) + k * DAY);                    //
 const period = (a, b) => ({ from: day(a), to: day(b) });
 const reader = x => x.connect('si_reader_alice');
 const NOT_AUTH = e => e instanceof ReadFailed && e.code === 'NOT_AUTHORIZED';
+/** Exactly SOURCE_UNAVAILABLE for this source with exactly these reasons (never a generic refusal). */
+const UNAVAILABLE = (src, reasons) => e => e instanceof INTEL.IntelligenceFailed && e.code === 'SOURCE_UNAVAILABLE' && e.sourceId === src &&
+  JSON.stringify(e.reasons) === JSON.stringify(reasons);
+const CHANGED = src => e => e instanceof INTEL.IntelligenceFailed && e.code === 'AVAILABILITY_CHANGED' && e.sourceId === src;
+/**
+ * The exact outcome of a library call, as one string (works for mutated library copies too, by class name):
+ *   ok:<n>  |  INTEL:<code>[:<reason,...>]  |  READ:<code>  |  OTHER:<message>
+ */
+async function libOutcome(promise, count = v => v?.observations?.length ?? v?.hits?.length ?? v?.records?.length ?? 0) {
+  try { return `ok:${count(await promise)}`; } catch (e) {
+    if (e?.name === 'IntelligenceFailed') return `INTEL:${e.code}${e.reasons?.length ? `:${e.reasons.join(',')}` : ''}`;
+    if (e?.name === 'ReadFailed') return `READ:${e.code}`;
+    return `OTHER:${e?.message}`;
+  }
+}
+/** The exact outcome of a raw SQL call (settled): ok:<rows> | SI_<CODE> | SQLSTATE:<code>. */
+const sqlOutcome = r => (r.status === 'ok' ? `ok:${r.value.rows.length}` : (String(r.message).match(/^SI_[A-Z_]+/)?.[0] ?? `SQLSTATE:${r.code}`));
+/** A client that runs `after(n)` right after every evidence page of n rows: a deterministic interleaving point. */
+function interleaved(client, after) {
+  return { query: async (...args) => {
+    const r = await client.query(...args);
+    if (typeof args[0] === 'string' && args[0].includes('si.si_read_evidence(')) await after(r.rows.length);
+    return r;
+  } };
+}
+const retire = (x, src, sqlTime) => x.si_rights_admin.query(`UPDATE si.sources SET retired_at = ${sqlTime} WHERE source_id = $1`, [src]);
 
 // ------------------------------------------------------------------------------------------------
 test('INT-1/INT-18: authorized advertiser history with provenance; first/last observed; distinct ads; runs; end of activity UNKNOWN', async t => {
@@ -121,7 +151,7 @@ test('INT-3: cross-source isolation — explicit sources only, each authorized s
   await assert.rejects(INTEL.searchAdvertisers(alice, { sources: [a, c], query: 'shared' }), NOT_AUTH, 'one unauthorized source fails the whole request (no partial result)');
 });
 
-test('INT-5/INT-6: suspension and termination block reads immediately; status is refused', async t => {
+test('INT-5/INT-6: suspension and termination block reads immediately: history, search and status fail typed, never empty', async t => {
   const x = await fresh(t);
   const s = await source(x), term = await source(x);
   await collect(x, s, [AD('Northwind Synthetic', 's1')]); await collect(x, term, [AD('Northwind Synthetic', 't1')]);
@@ -129,12 +159,14 @@ test('INT-5/INT-6: suspension and termination block reads immediately; status is
   assert.equal((await INTEL.advertiserHistory(alice, s, 'northwind synthetic')).observations.length, 1);
   await control(x.si_rights_admin, s, 'SUSPEND');
   await control(x.si_rights_admin, term, 'TERMINATE_RETENTION');
-  for (const src of [s, term]) {
-    assert.equal((await INTEL.advertiserHistory(alice, src, 'northwind synthetic')).observations.length, 0, `${src}: nothing readable`);
-    await assert.rejects(INTEL.freshness(alice, src, period(-400, -40)), e => e instanceof INTEL.IntelligenceFailed && e.code === 'SOURCE_UNAVAILABLE');
+  for (const [src, why] of [[s, ['SUSPENDED']], [term, ['TERMINATED']]]) {
+    await assert.rejects(INTEL.advertiserHistory(alice, src, 'northwind synthetic'), UNAVAILABLE(src, why), `${src}: history is not an empty result`);
+    await assert.rejects(INTEL.searchAdvertisers(alice, { sources: [src], query: 'north' }), UNAVAILABLE(src, why), `${src}: search is not an empty result`);
+    await assert.rejects(INTEL.freshness(alice, src, period(-400, -40)), UNAVAILABLE(src, why));
   }
   await lift(x.si_rights_admin, s);
-  assert.equal((await INTEL.advertiserHistory(alice, s, 'northwind synthetic')).observations.length, 1, 'LIFT restores');
+  const h = await INTEL.advertiserHistory(alice, s, 'northwind synthetic');
+  assert.deepEqual([h.observations.length, h.availability.state], [1, 'AVAILABLE'], 'LIFT restores');
 });
 
 test('INT-7/INT-8/INT-9: retention expiry, INVALID and UNVERIFIABLE receipts are excluded and counted', async t => {
@@ -206,7 +238,8 @@ test('INT-12: stable, deterministic pagination; cursors are bound to the query a
   assert.deepEqual(pages, ['alpha synthetic', 'bravo synthetic', 'charlie synthetic', 'delta synthetic', 'echo synthetic']);
   assert.deepEqual(pages, all, 'pages concatenate to the full ordered result');
   const first = await INTEL.searchAdvertisers(alice, q);
-  assert.deepEqual(first, await INTEL.searchAdvertisers(alice, q), 'repeatable');
+  const again = await INTEL.searchAdvertisers(alice, q);
+  assert.deepEqual([first.hits, first.nextCursor], [again.hits, again.nextCursor], 'repeatable (availability times differ by design)');
   await assert.rejects(INTEL.searchAdvertisers(alice, { ...q, query: 'alpha', cursor: first.nextCursor }), e => e.code === 'BAD_CURSOR', 'bound to the query');
   await assert.rejects(INTEL.searchAdvertisers(alice, { ...q, cursor: 'garbage' }), e => e.code === 'BAD_CURSOR');
   await revokeReader(x.si_rights_admin, 'si_reader_alice', src, 'revoked');
@@ -281,9 +314,17 @@ test('INT-17: request audit — one committed intent per page and per status; ca
                                                          count(*) FILTER (WHERE pg_xact_status(created_xid) = 'committed')::int AS k FROM si.read_intents`)).rows[0];
   const h = await INTEL.advertiserHistory(alice, src, 'Northwind Synthetic', { pageSize: 2, period: period(-300, 60), withStatus: true });
   assert.equal(h.observations.length, 3);
-  assert.deepEqual(await count(), { n: 4, c: 4, k: 4 }, '3 evidence pages (2 + 1 + empty) + 1 status: each its own committed, consumed request');
-  const status = (await x.admin.query(`SELECT cursor_sha256, read_limit FROM si.read_intents WHERE rows_returned = 1 AND bytes_returned > 0 AND read_limit = 1`)).rows;
-  assert.equal(status.length, 1);
+  const audit = await count();
+  assert.equal(audit.c, 6, '2 availability checks (before and after) + 3 evidence pages (2 + 1 + empty) + 1 status: each its own consumed request');
+  assert.equal(audit.k, audit.n, 'every request record is committed');
+  // An unconsumed extra intent can only come from the bounded fresh-intent retry on INTENT_NOT_DURABLE (unrelated
+  // unflushed WAL, e.g. catalog pruning in a freshly cloned database): at most two retries per request.
+  assert.ok(audit.n >= 6 && audit.n <= 18, `intents: ${audit.n}`);
+  const digest = c => createHash('sha256').update(c, 'utf8').digest('hex');
+  const scoped = async c => (await x.admin.query(`SELECT count(*)::int AS n FROM si.read_intents WHERE cursor_sha256 = $1 AND read_limit = 1
+                                                    AND state = 'CONSUMED' AND rows_returned = 1 AND bytes_returned > 0`, [digest(c)])).rows[0].n;
+  assert.equal(await scoped(INTEL.statusCursor(src, period(-300, 60))), 1, 'one status request, its period in the audited scope');
+  assert.equal(await scoped(INTEL.availabilityCursor(src)), 2, 'two availability requests');
   // Inside a caller transaction nothing is released at all.
   await alice.query('BEGIN');
   const err = await INTEL.advertiserHistory(alice, src, 'Northwind Synthetic').catch(e => e);
@@ -296,6 +337,11 @@ test('INT-17: request audit — one committed intent per page and per status; ca
   const pageIntent = await beginRead(alice, src, { limit: 1 });
   await rejects(assert, alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, pageIntent, p.from, p.to]), { code: '42501', message: /^SI_READ_INTENT_INVALID/ });
   await rejects(assert, alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, statusIntent, p.from, day(11)]), { code: '42501', message: /^SI_READ_INTENT_INVALID/ }, 'another period');
+  const availIntent = await beginRead(alice, src, { cursor: INTEL.availabilityCursor(src), limit: 1 });
+  await rejects(assert, alice.query('SELECT * FROM si.si_read_evidence($1, $2, $3, 1)', [src, availIntent, INTEL.availabilityCursor(src)]), { code: '22023', message: /^SI_READ_BAD_CURSOR/ });
+  await rejects(assert, alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, availIntent, p.from, p.to]), { code: '42501', message: /^SI_READ_INTENT_INVALID/ });
+  await rejects(assert, alice.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, pageIntent]), { code: '42501', message: /^SI_READ_INTENT_INVALID/ });
+  await rejects(assert, alice.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, statusIntent]), { code: '42501', message: /^SI_READ_INTENT_INVALID/ });
   // A successful raw call, with the same bounded fresh-intent retry the library uses on INTENT_NOT_DURABLE
   // (unrelated unflushed WAL, e.g. catalog pruning, can make a first call fail closed).
   let used = statusIntent, ok = null;
@@ -308,108 +354,293 @@ test('INT-17: request audit — one committed intent per page and per status; ca
 });
 
 // ------------------------------------------------------------------------------------------------
-// Negative-control mutants. Database: copies of the 0011 status function; library: a mutated temporary copy.
+// M4-P1.1 D1: explicit source availability (migration 0012). An unavailable source is a typed failure with fixed
+// reasons; an available source with no matching evidence is an explicit AVAILABLE empty result; authorization
+// failures stay NOT_AUTHORIZED and reveal nothing about availability.
+test('INT-20: every unavailability reason is explicit and distinct from an available source with no matching evidence', async t => {
+  const x = await fresh(t);
+  const alice = await reader(x);
+  const empty = await source(x);                                             // available, no evidence at all
+  await collect(x, empty, [AD('Contoso Synthetic', 'e1')]);                  // available, evidence of another advertiser
+  const h = await INTEL.advertiserHistory(alice, empty, 'Northwind Synthetic');
+  assert.deepEqual([h.observations.length, h.availability.state, h.availability.sourceId], [0, 'AVAILABLE', empty], 'explicit: available, nothing matches');
+  assert.ok(Date.parse(h.availability.checkedFrom) <= Date.parse(h.availability.asOf));
+  const sr = await INTEL.searchAdvertisers(alice, { sources: [empty], query: 'northwind' });
+  assert.deepEqual([sr.hits.length, sr.sources.map(a => [a.sourceId, a.state])], [0, [[empty, 'AVAILABLE']]]);
+  assert.deepEqual(await INTEL.sourceAvailability(alice, empty).then(a => [a.available, a.reasons]), [true, []]);
+
+  const cases = [];
+  const mk = async (label, reasons, make) => { const src = await source(x); await collect(x, src, [AD('Northwind Synthetic', `${label}1`)]); await make(src); cases.push([label, src, reasons]); };
+  await mk('suspended', ['SUSPENDED'], src => control(x.si_rights_admin, src, 'SUSPEND'));
+  await mk('terminated', ['TERMINATED'], src => control(x.si_rights_admin, src, 'TERMINATE_RETENTION'));
+  await mk('retired', ['RETIRED'], src => retire(x, src, "clock_timestamp() + interval '30 seconds'"));       // retiring within the margin
+  await mk('rightsdenied', ['RIGHTS_RESTRICTED'], src => recordRights(x.si_rights_admin, src, { evaluation: 'DENIED', change_reason: 'evaluation withdrawn' }));
+  await mk('rightsexpiring', ['RIGHTS_RESTRICTED'], src => recordRights(x.si_rights_admin, src, { expires_at_sql: "clock_timestamp() + interval '30 seconds'", change_reason: 'expiring' }));
+  await mk('retentiondenied', ['RETENTION_RESTRICTED'], src => recordRights(x.si_rights_admin, src, { retain: 'DENIED', retention_days: null, change_reason: 'retention withdrawn' }));
+  await mk('suspretired', ['RETIRED', 'SUSPENDED'], async src => { await control(x.si_rights_admin, src, 'SUSPEND'); await retire(x, src, "clock_timestamp() + interval '30 seconds'"); });
+  for (const [label, src, reasons] of cases) {
+    const a = await INTEL.sourceAvailability(alice, src);
+    assert.deepEqual([a.available, a.reasons], [false, reasons], `${label}: availability`);
+    await assert.rejects(INTEL.advertiserHistory(alice, src, 'Northwind Synthetic'), UNAVAILABLE(src, reasons), `${label}: history`);
+    await assert.rejects(INTEL.searchAdvertisers(alice, { sources: [empty, src], query: 'north' }), UNAVAILABLE(src, reasons), `${label}: search (no partial result)`);
+    await assert.rejects(INTEL.scanEvidence(alice, src), UNAVAILABLE(src, reasons), `${label}: scan`);
+    await assert.rejects(INTEL.freshness(alice, src, period(0, 30)), UNAVAILABLE(src, reasons), `${label}: freshness`);
+  }
+  // Not authorized is never "unavailable" and never empty, and reveals nothing: an unknown source, an ungranted
+  // available source, an ungranted suspended source and a revoked one all fail identically.
+  const ungranted = await source(x, { grant: false }), ungrantedSuspended = await source(x, { grant: false });
+  await control(x.si_rights_admin, ungrantedSuspended, 'SUSPEND');
+  const revoked = cases[0][1];
+  await revokeReader(x.si_rights_admin, 'si_reader_alice', revoked, 'revoked while suspended');
+  for (const src of ['m4-no-such-source', ungranted, ungrantedSuspended, revoked]) {
+    const outcomes = [await libOutcome(INTEL.advertiserHistory(alice, src, 'Northwind Synthetic')),
+                      await libOutcome(INTEL.searchAdvertisers(alice, { sources: [src], query: 'north' })),
+                      await libOutcome(INTEL.sourceAvailability(alice, src)),
+                      await libOutcome(INTEL.freshness(alice, src, period(0, 30)))];
+    assert.deepEqual(outcomes, Array(4).fill('READ:NOT_AUTHORIZED'), `${src}: identical refusal`);
+    const raw = await settle(alice.query('SELECT * FROM si.si_read_source_availability($1, gen_random_uuid())', [src]));
+    assert.deepEqual([raw.code, sqlOutcome(raw)], ['42501', 'SI_READ_INTENT_INVALID'], `${src}: no intent, no answer`);
+  }
+  // Only the dedicated reader may ask at all.
+  for (const role of ['si_collector', 'si_monitor', 'si_retention', 'si_rights_admin']) {
+    await rejects(assert, x[role].query('SELECT * FROM si.si_read_source_availability($1, gen_random_uuid())', [empty]), { code: '42501' });
+  }
+  // Recovery: LIFT restores availability.
+  await grantReader(x.si_rights_admin, 'si_reader_alice', revoked, 'granted again');
+  await lift(x.si_rights_admin, revoked);
+  assert.equal((await INTEL.advertiserHistory(alice, revoked, 'Northwind Synthetic')).observations.length, 1);
+});
+
+test('INT-21: availability changes during a multi-page scan never produce a misleading successful result', async t => {
+  const x = await fresh(t);
+  const alice = await reader(x);
+  const three = async () => { const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `m${n}-${i}`))); return src; };
+  const scan = (src, after) => INTEL.advertiserHistory(interleaved(alice, after), src, 'Northwind Synthetic', { pageSize: 1 });
+  const once = fn => { let done = false; return async k => { if (!done && (await fn(k)) !== false) done = true; }; };
+  // Suspended after the first page and still suspended: SOURCE_UNAVAILABLE (pages after it were empty).
+  const a = await three();
+  await assert.rejects(scan(a, once(k => k === 1 && control(x.si_rights_admin, a, 'SUSPEND'))), UNAVAILABLE(a, ['SUSPENDED']));
+  // Suspended after the first page, lifted right after the (therefore empty) second page: the scan would otherwise
+  // end early with 1 of 3 records and report success. It fails AVAILABILITY_CHANGED.
+  const b = await three();
+  let step = 0;
+  await assert.rejects(scan(b, async k => {
+    if (step === 0 && k === 1) { step = 1; await control(x.si_rights_admin, b, 'SUSPEND'); }
+    else if (step === 1 && k === 0) { step = 2; await lift(x.si_rights_admin, b); }
+  }), CHANGED(b));
+  assert.equal(step, 2, 'the interleaving happened as described');
+  // The same with a retirement moved into the margin and back (retired_at A -> B -> A: only the row version shows it).
+  const c = await three();
+  step = 0;
+  await assert.rejects(scan(c, async k => {
+    if (step === 0 && k === 1) { step = 1; await retire(x, c, "clock_timestamp() + interval '30 seconds'"); }
+    else if (step === 1 && k === 0) { step = 2; await retire(x, c, 'NULL'); }
+  }), CHANGED(c));
+  assert.equal(step, 2);
+  // Terminated mid-scan; rights withdrawn mid-scan; retention withdrawn mid-scan: typed, never truncated success.
+  const d = await three(), e = await three(), f = await three();
+  await assert.rejects(scan(d, once(k => k === 1 && control(x.si_rights_admin, d, 'TERMINATE_RETENTION'))), UNAVAILABLE(d, ['TERMINATED']));
+  await assert.rejects(scan(e, once(k => k === 1 && recordRights(x.si_rights_admin, e, { evaluation: 'DENIED', change_reason: 'withdrawn' }))), UNAVAILABLE(e, ['RIGHTS_RESTRICTED']));
+  await assert.rejects(scan(f, once(k => k === 1 && recordRights(x.si_rights_admin, f, { retain: 'DENIED', retention_days: null, change_reason: 'withdrawn' }))), UNAVAILABLE(f, ['RETENTION_RESTRICTED']));
+  // Grant revoked mid-scan: NOT_AUTHORIZED (the next page is refused), never an empty or partial result.
+  const g = await three();
+  await assert.rejects(scan(g, once(k => k === 1 && revokeReader(x.si_rights_admin, 'si_reader_alice', g, 'revoked mid-scan'))), NOT_AUTH);
+  // A source that stays available: concurrent collection does not change availability (INT-16 still holds).
+  const ok = await three();
+  const h = await scan(ok, once(async k => { if (k !== 1) return false; await collect(x, ok, [AD('Northwind Synthetic', 'late')]); }));
+  assert.ok(h.observations.length >= 3 && h.availability.state === 'AVAILABLE');
+  // Search over two sources, one suspended mid-way through its own scan: the whole search fails, typed.
+  const s1 = await three(), s2 = await three();
+  await assert.rejects(INTEL.searchAdvertisers(interleaved(alice, once(k => k === 1 && control(x.si_rights_admin, s2, 'SUSPEND'))),
+    { sources: [s1, s2], query: 'north' }, { pageSize: 1 }), UNAVAILABLE(s2, ['SUSPENDED']));
+});
+
+test('INT-22: the availability answer is content-free, audited, and its token changes exactly with availability-relevant state', async t => {
+  const x = await fresh(t);
+  const alice = await reader(x);
+  const src = await source(x);
+  await collect(x, src, [AD('Northwind Synthetic', 'k1')]);
+  const a1 = await INTEL.sourceAvailability(alice, src);
+  assert.deepEqual(Object.keys(a1).sort(), ['asOf', 'available', 'reasons', 'sourceId', 'stateToken']);
+  assert.match(a1.stateToken, /^[0-9a-f]{32}$/);
+  await collect(x, src, [AD('Northwind Synthetic', 'k2')]);                  // evidence changes; availability does not
+  await x.si_monitor.query('SELECT * FROM si.si_verify_receipts(10)');
+  assert.equal((await INTEL.sourceAvailability(alice, src)).stateToken, a1.stateToken, 'collection and verification do not change the token');
+  await control(x.si_rights_admin, src, 'SUSPEND'); await lift(x.si_rights_admin, src);
+  const a2 = await INTEL.sourceAvailability(alice, src);
+  assert.deepEqual([a2.available, a2.stateToken !== a1.stateToken], [true, true], 'a suspension and its lift change the token');
+  await recordRights(x.si_rights_admin, src, { change_reason: 'renewed' });
+  const a3 = await INTEL.sourceAvailability(alice, src);
+  assert.deepEqual([a3.available, a3.stateToken !== a2.stateToken], [true, true], 'a new rights version changes the token');
+  const raw = (await x.admin.query(`SELECT count(*)::int AS n FROM si.reader_access_log WHERE source_id = $1 AND rows_returned = 1`, [src])).rows[0].n;
+  assert.equal(raw, 4, 'every answer (four) has a completion record');
+});
+
+// ------------------------------------------------------------------------------------------------
+// Negative-control mutants. Database: copies of the 0011 status / 0012 availability functions; library: a mutated
+// temporary copy. M4-P1.1 (D3): every scenario returns its EXACT outcome (libOutcome / sqlOutcome / a value), and
+// both the baseline and the mutant must produce exactly the expected one. An unrelated refusal, an unexpected
+// success, or a durability refusal that outlasts the bounded retry fails the test; nothing generic counts as clean.
 function fnText(mig, start, end) { const s = mig.indexOf(start); return mig.slice(s, mig.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`); return text.replace(from, to); }
 const STATUS_FN = fnText(MIG11, 'CREATE FUNCTION si.si_read_source_status', 'END $read_source_status$;');
+const AVAIL_FN = fnText(MIG12, 'CREATE FUNCTION si.si_read_source_availability', 'END $read_source_availability$;');
 /** A raw call made the way the library makes it: a fail-closed INTENT_NOT_DURABLE (unrelated unflushed WAL) is retried
- *  with a fresh intent, at most 3 attempts; `attempt` sets up and returns the settled result of one attempt. */
+ *  with a fresh intent, at most 3 attempts; `attempt` sets up and returns the settled result of one attempt. Nothing
+ *  else is retried, and a third NOT_DURABLE is returned as the outcome (so it fails the exact assertion). */
 async function withFreshIntentRetry(attempt) {
   let r;
   for (let i = 0; i < 3; i++) { r = await attempt(); if (!(r.status !== 'ok' && /^SI_READ_INTENT_NOT_DURABLE/.test(String(r.message)))) break; }
   return r;
 }
-async function scnStatusGrant(x) {                                           // detected = a principal whose grant was revoked gets status
-  const src = await source(x);                                               // si_begin_read also checks the grant, so take the intent first
-  const alice = await reader(x), p = period(0, 10);
-  const r = await withFreshIntentRetry(async () => {
-    const id = await beginRead(alice, src, { cursor: INTEL.statusCursor(src, p), limit: 1 });
-    await revokeReader(x.si_rights_admin, 'si_reader_alice', src, 'revoked between intent and status');
-    const out = await settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, id, p.from, p.to]));
+/** Revoke between taking the intent and the call (si_begin_read also checks the grant). */
+async function revokedBetween(x, src, cursor, call) {
+  const alice = await reader(x);
+  return sqlOutcome(await withFreshIntentRetry(async () => {
+    const id = await beginRead(alice, src, { cursor, limit: 1 });
+    await revokeReader(x.si_rights_admin, 'si_reader_alice', src, 'revoked between intent and call');
+    const out = await settle(call(alice, id));
     await grantReader(x.si_rights_admin, 'si_reader_alice', src, 'granted again for the next attempt');
     return out;
-  });
-  return r.status === 'ok';
+  }));
 }
-async function scnStatusSuspended(x) {                                       // detected = status of a suspended source is served
+async function scnStatusGrant(x) {                                           // mutant: a principal whose grant was revoked gets status
+  const src = await source(x), p = period(0, 10);
+  return revokedBetween(x, src, INTEL.statusCursor(src, p), (c, id) => c.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, id, p.from, p.to]));
+}
+async function scnStatusSuspended(x) {                                       // mutant: status of a suspended source is served
   const src = await source(x); await control(x.si_rights_admin, src, 'SUSPEND');
-  return (await settle(INTEL.sourceStatus(await reader(x), src, period(0, 10)))).status === 'ok';
+  return libOutcome(INTEL.sourceStatus(await reader(x), src, period(0, 10)), () => 1);
 }
-async function scnStatusLatestVerified(x) {                                  // detected = latest "verified" evidence names an INVALID run
+async function scnStatusLatestVerified(x) {                                  // mutant: latest "verified" evidence names an INVALID run
   const src = await source(x);
   const ok = await collect(x, src, [AD('N S', 'v1')]); const bad = await collect(x, src, [AD('N S', 'v2')], { verify: false });
   await replica(x, `INSERT INTO si.receipt_verifications (run_id, source_id, rights_version_id, verdict, reason, commit_xid, commit_ts, window_start, window_end, verified_at, verified_by)
     SELECT r.run_id, r.source_id, r.rights_version_id, 'INVALID', 'COMMITTED_AFTER_WINDOW', 3, r.finished_at, r.finished_at - interval '1 hour', r.finished_at, clock_timestamp(), 'fixture'
       FROM si.collection_runs r WHERE r.run_id = $1`, [bad]);
   await at(x, ok, day(1).toISOString()); await at(x, bad, day(2).toISOString());
-  return (await INTEL.sourceStatus(await reader(x), src, period(0, 10))).latestVerifiedEvidenceAt === day(2).toISOString();
+  return `value:${(await INTEL.sourceStatus(await reader(x), src, period(0, 10))).latestVerifiedEvidenceAt}`;
 }
-async function scnStatusIntent(x) {                                          // detected = an evidence-page intent (another scope) releases status
+async function scnStatusIntent(x) {                                          // mutant: an evidence-page intent (another scope) releases status
   const src = await source(x);
   const alice = await reader(x);
-  const r = await withFreshIntentRetry(async () =>
-    settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, await beginRead(alice, src, { limit: 1 }), day(0), day(10)])));
-  return r.status === 'ok';
+  return sqlOutcome(await withFreshIntentRetry(async () =>
+    settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, await beginRead(alice, src, { limit: 1 }), day(0), day(10)]))));
+}
+async function scnAvailGrant(x) {                                            // mutant: a revoked principal learns availability
+  const src = await source(x);
+  return revokedBetween(x, src, INTEL.availabilityCursor(src), (c, id) => c.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, id]));
+}
+async function scnAvailIntent(x) {                                           // mutant: a status intent (another scope) releases availability
+  const src = await source(x), p = period(0, 10);
+  const alice = await reader(x);
+  return sqlOutcome(await withFreshIntentRetry(async () =>
+    settle(alice.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, await beginRead(alice, src, { cursor: INTEL.statusCursor(src, p), limit: 1 })]))));
+}
+async function scnAvailReason(x) {                                           // mutant: a suspension is reported without its reason
+  const src = await source(x); await control(x.si_rights_admin, src, 'SUSPEND');
+  return libOutcome(INTEL.advertiserHistory(await reader(x), src, 'Northwind Synthetic'));
+}
+async function scnAvailRowVersion(x, L = INTEL) {                            // mutant: retirement moved into the margin and back mid-scan goes unnoticed
+  const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `rv${n}-${i}`)));
+  let step = 0;
+  return libOutcome(L.advertiserHistory(interleaved(await reader(x), async k => {
+    if (step === 0 && k === 1) { step = 1; await retire(x, src, "clock_timestamp() + interval '30 seconds'"); }
+    else if (step === 1 && k === 0) { step = 2; await retire(x, src, 'NULL'); }
+  }), src, 'Northwind Synthetic', { pageSize: 1 }));
 }
 const DB_MUTANTS = [
-  { name: 'status grant check omitted', scenario: scnStatusGrant,
+  { name: 'status grant check omitted', scenario: scnStatusGrant, baseline: 'SI_READ_NOT_AUTHORIZED', mutant: 'ok:1',
     sql: mutate(STATUS_FN, 'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g') },
-  { name: 'status availability check omitted', scenario: scnStatusSuspended, sql: mutate(STATUS_FN, '    IF available IS NOT TRUE THEN', '    IF false THEN') },
+  { name: 'status availability check omitted', scenario: scnStatusSuspended, baseline: 'INTEL:SOURCE_UNAVAILABLE:SUSPENDED', mutant: 'ok:1',
+    sql: mutate(STATUS_FN, '    IF available IS NOT TRUE THEN', '    IF false THEN') },
   { name: 'latest verified evidence not restricted to readable runs', scenario: scnStatusLatestVerified,
+    baseline: `value:${day(1).toISOString()}`, mutant: `value:${day(2).toISOString()}`,
     sql: mutate(STATUS_FN, "           max(finished_at) FILTER (WHERE readable),", "           max(finished_at) FILTER (WHERE status = 'COMPLETED' AND published_count > 0),") },
-  { name: 'status intent claim omitted', scenario: scnStatusIntent, sql: mutate(STATUS_FN, '  PERFORM si.si_claim_read_intent(who, p_source_id, p_intent_id, cur, 1);', '') }
+  { name: 'status intent claim omitted', scenario: scnStatusIntent, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok:1',
+    sql: mutate(STATUS_FN, '  PERFORM si.si_claim_read_intent(who, p_source_id, p_intent_id, cur, 1);', '') },
+  { name: 'availability grant check omitted', scenario: scnAvailGrant, baseline: 'SI_READ_NOT_AUTHORIZED', mutant: 'ok:1',
+    sql: mutate(AVAIL_FN, 'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g') },
+  { name: 'availability intent claim omitted', scenario: scnAvailIntent, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok:1',
+    sql: mutate(AVAIL_FN, '  PERFORM si.si_claim_read_intent(who, p_source_id, p_intent_id, cur, 1);', '') },
+  { name: 'availability SUSPENDED reason omitted', scenario: scnAvailReason, baseline: 'INTEL:SOURCE_UNAVAILABLE:SUSPENDED', mutant: 'INTEL:SOURCE_UNAVAILABLE:UNAVAILABLE',
+    sql: mutate(AVAIL_FN, "      CASE WHEN cs.last_kind = 'SUSPEND' THEN 'SUSPENDED' END,", '') },
+  { name: 'availability token ignores the source row version', scenario: scnAvailRowVersion, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:1',
+    sql: mutate(AVAIL_FN, "p_source_id, cs.row_version,", 'p_source_id,') }
 ];
 for (const m of DB_MUTANTS) {
-  test(`INT-M db (${m.name}): the baseline passes the scenario and the mutant is detected`, async t => {
+  test(`INT-M db (${m.name}): the baseline gives exactly its refusal or value, the mutant exactly the defect`, async t => {
     const base = await m.scenario(await fresh(t, 'm4mb'));
     const x = await fresh(t, 'm4mm');
     await asOwner(x.admin, a => a.query(m.sql));
     const killed = await m.scenario(x);
-    console.log(`# INT-M db ${m.name}: baseline ${base ? 'DETECTED (unexpected)' : 'clean'}, mutant ${killed ? 'KILLED' : 'SURVIVED'}`);
-    assert.equal(base, false); assert.equal(killed, true);
+    console.log(`# INT-M db ${m.name}: baseline ${base}, mutant ${killed}`);
+    assert.equal(base, m.baseline, `${m.name}: baseline outcome`);
+    assert.equal(killed, m.mutant, `${m.name}: mutant outcome (killed for the intended reason)`);
   });
 }
 
-/** A mutated copy of the compiled library in a temporary directory (reader.js copied next to it). */
-async function mutatedLibrary(t, from, to) {
+/** A mutated copy of the compiled library in a temporary directory (reader.js copied next to it); one or more edits. */
+async function mutatedLibrary(t, edits) {
   const dir = mkdtempSync(join(tmpdir(), 'si-intel-mutant-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   copyFileSync(join(DIST, 'reader.js'), join(dir, 'reader.js'));
-  writeFileSync(join(dir, 'intelligence.js'), mutate(readFileSync(join(DIST, 'intelligence.js'), 'utf8'), from, to));
+  let text = readFileSync(join(DIST, 'intelligence.js'), 'utf8');
+  for (const [from, to] of edits) text = mutate(text, from, to);
+  writeFileSync(join(dir, 'intelligence.js'), text);
   return import(pathToFileURL(join(dir, 'intelligence.js')).href);
 }
-async function lscnDistinct(L, x) {                                          // detected = distinct ads counts observations
+async function lscnDistinct(L, x) {                                          // mutant: distinct ads counts observations
   const src = await source(x); await collect(x, src, [AD('Northwind Synthetic', 'd1')]); await collect(x, src, [AD('Northwind Synthetic', 'd1')]);
-  return (await L.advertiserHistory(await reader(x), src, 'Northwind Synthetic')).distinctAds !== 1;
+  return `value:${(await L.advertiserHistory(await reader(x), src, 'Northwind Synthetic')).distinctAds}`;
 }
-async function lscnBoundary(L, x) {                                          // detected = a record exactly at `to` is included
+async function lscnBoundary(L, x) {                                          // mutant: a record exactly at `to` is included
   const src = await source(x); const r = await collect(x, src, [AD('Northwind Synthetic', 'edge')]); await at(x, r, day(14).toISOString());
-  return (await L.advertiserHistory(await reader(x), src, 'Northwind Synthetic', { period: period(10, 14) })).observations.length !== 0;
+  return libOutcome(L.advertiserHistory(await reader(x), src, 'Northwind Synthetic', { period: period(10, 14) }));
 }
-async function lscnMerge(L, x) {                                             // detected = one advertiser hit merges two sources
+async function lscnMerge(L, x) {                                             // mutant: one advertiser hit merges two sources
   const a = await source(x), b = await source(x);
   await collect(x, a, [AD('Shared Synthetic', 'a1')]); await collect(x, b, [AD('Shared Synthetic', 'b1')]);
-  return (await L.searchAdvertisers(await reader(x), { sources: [a, b], query: 'shared' })).hits.length !== 2;
+  return libOutcome(L.searchAdvertisers(await reader(x), { sources: [a, b], query: 'shared' }));
 }
-async function lscnIdentity(L, x) {                                          // detected = history of "Acme" includes "Acme Labs"
+async function lscnIdentity(L, x) {                                          // mutant: history of "Acme" includes "Acme Labs"
   const src = await source(x); await collect(x, src, [AD('Acme Synthetic', 'a'), AD('Acme Synthetic Labs', 'b')]);
-  return (await L.advertiserHistory(await reader(x), src, 'Acme Synthetic')).observations.length !== 1;
+  return libOutcome(L.advertiserHistory(await reader(x), src, 'Acme Synthetic'));
+}
+async function lscnUnavailableEmpty(L, x) {                                  // mutant (D1 itself): a suspended source reads as empty history
+  const src = await source(x); await collect(x, src, [AD('Northwind Synthetic', 'u1')]); await control(x.si_rights_admin, src, 'SUSPEND');
+  return libOutcome(L.advertiserHistory(await reader(x), src, 'Northwind Synthetic'));
+}
+async function lscnSuspendLift(L, x) {                                       // mutant: suspend + lift during the scan returns a truncated success
+  const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `sl${n}-${i}`)));
+  let step = 0;
+  return libOutcome(L.advertiserHistory(interleaved(await reader(x), async k => {
+    if (step === 0 && k === 1) { step = 1; await control(x.si_rights_admin, src, 'SUSPEND'); }
+    else if (step === 1 && k === 0) { step = 2; await lift(x.si_rights_admin, src); }
+  }), src, 'Northwind Synthetic', { pageSize: 1 }));
 }
 const LIB_MUTANTS = [
-  { name: 'distinct ads counted as observations', scenario: lscnDistinct,
-    from: 'distinctAds: new Set(mine.map(r => `${r.network}\\u0000${r.nativeAdId}`)).size,', to: 'distinctAds: mine.length,' },
-  { name: 'period end inclusive', scenario: lscnBoundary, from: 'return t >= p.from.getTime() && t < p.to.getTime();', to: 'return t >= p.from.getTime() && t <= p.to.getTime();' },
-  { name: 'search merges sources', scenario: lscnMerge, from: 'const k = `${sourceId}\\u0000${nn}`;', to: 'const k = nn;' },
-  { name: 'history identity by substring', scenario: lscnIdentity,
-    from: 'const mine = scan.records.filter(r => normalizeAdvertiser(r.advertiserName) === want && inPeriod(r, period));',
-    to: 'const mine = scan.records.filter(r => normalizeAdvertiser(r.advertiserName).includes(want) && inPeriod(r, period));' }
+  { name: 'distinct ads counted as observations', scenario: lscnDistinct, baseline: 'value:1', mutant: 'value:2',
+    edits: [['distinctAds: new Set(mine.map(r => `${r.network}\\u0000${r.nativeAdId}`)).size,', 'distinctAds: mine.length,']] },
+  { name: 'period end inclusive', scenario: lscnBoundary, baseline: 'ok:0', mutant: 'ok:1',
+    edits: [['return t >= p.from.getTime() && t < p.to.getTime();', 'return t >= p.from.getTime() && t <= p.to.getTime();']] },
+  { name: 'search merges sources', scenario: lscnMerge, baseline: 'ok:2', mutant: 'ok:1', edits: [['const k = `${sourceId}\\u0000${nn}`;', 'const k = nn;']] },
+  { name: 'history identity by substring', scenario: lscnIdentity, baseline: 'ok:1', mutant: 'ok:2',
+    edits: [['const mine = scan.records.filter(r => normalizeAdvertiser(r.advertiserName) === want && inPeriod(r, period));',
+             'const mine = scan.records.filter(r => normalizeAdvertiser(r.advertiserName).includes(want) && inPeriod(r, period));']] },
+  { name: 'scan availability checks omitted (D1)', scenario: lscnUnavailableEmpty, baseline: 'INTEL:SOURCE_UNAVAILABLE:SUSPENDED', mutant: 'ok:0',
+    edits: [["    if (!before.available)\n        throw new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId, reasons: before.reasons });\n", ''],
+            ["    if (!after.available)\n        throw new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId, reasons: after.reasons });\n", '']] },
+  { name: 'scan state-token comparison omitted', scenario: lscnSuspendLift, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:1',
+    edits: [["    if (after.stateToken !== before.stateToken)\n        throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });\n", '']] }
 ];
 for (const m of LIB_MUTANTS) {
-  test(`INT-M lib (${m.name}): the baseline passes the scenario and the mutant is detected`, async t => {
+  test(`INT-M lib (${m.name}): the baseline gives exactly the correct outcome, the mutant exactly the defect`, async t => {
     const base = await m.scenario(INTEL, await fresh(t, 'm4lb'));
-    const L = await mutatedLibrary(t, m.from, m.to);
+    const L = await mutatedLibrary(t, m.edits);
     const killed = await m.scenario(L, await fresh(t, 'm4lm'));
-    console.log(`# INT-M lib ${m.name}: baseline ${base ? 'DETECTED (unexpected)' : 'clean'}, mutant ${killed ? 'KILLED' : 'SURVIVED'}`);
-    assert.equal(base, false); assert.equal(killed, true);
+    console.log(`# INT-M lib ${m.name}: baseline ${base}, mutant ${killed}`);
+    assert.equal(base, m.baseline, `${m.name}: baseline outcome`);
+    assert.equal(killed, m.mutant, `${m.name}: mutant outcome (killed for the intended reason)`);
   });
 }

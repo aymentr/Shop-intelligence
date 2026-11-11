@@ -26,7 +26,12 @@ const tpl = await connect({ database: cfg.template });
 try {
   await bootstrapDatabase(tpl);
   const applied = await migrateUp(tpl);
-  console.log(`template ${cfg.template}: migrations applied ${applied.join(', ')}`);
+  // M4-P1.1 (D2 measurement): leave no dead tuples in the template. Every test database is a clone of it; dead
+  // catalog tuples left by the migrations (GRANT/REVOKE rewrite pg_proc/pg_type rows) would be pruned on first
+  // access in every clone, and that pruning WAL — inserted before the read gate takes its target and not flushed
+  // by anyone while the idle WAL writer hibernates — makes the clone's first gated reads fail closed (NOT_DURABLE).
+  await tpl.query('VACUUM (FREEZE, ANALYZE)');
+  console.log(`template ${cfg.template}: migrations applied ${applied.join(', ')}; vacuumed`);
 } finally { await tpl.end(); }
 
 const testDir = fileURLToPath(new URL('./', import.meta.url));

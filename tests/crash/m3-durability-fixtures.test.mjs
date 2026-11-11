@@ -10,17 +10,37 @@
 //     power failure is NOT exercised here;
 //   - mutated or instrumented copies of the read function in a disposable database.
 // Runs in the isolated durability CI step (with tests/crash/m3-durability-crash.test.mjs): AUD-12b and AUD-13c
-// widen the WAL writer interval (superuser fixture), and the WAL writer can keep the long interval briefly after a
-// reset, which would make unrelated later reads in the regular suite fail closed.
+// widen the WAL writer interval (superuser fixture). Since M4-P1.1 (D2) the fixture returns only once the requested
+// writer behaviour is measured (writerDelay in tests/db/durability-fixtures.mjs), so a test that follows a restore,
+// such as AUD-13a after AUD-12b, starts with the default writer verifiably back; AUD-FX checks exactly that.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { asOwner, connect, control, pid, settle } from '../db/helpers.mjs';
 import { readEvidence, revokeReader } from '../../dist/persistence/reader.js';
 import { MIG10, provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
-         fnText, mutate, READ_FN, WAIT, PAUSE_AT, withPause } from '../db/durability-fixtures.mjs';
+         fnText, mutate, READ_FN, WAIT, PAUSE_AT, withPause, strayWalFlushMs, warm } from '../db/durability-fixtures.mjs';
 
 test.before(provisionReaders);
+
+/** n ordinary library reads, each classified exactly: fast (no refusal) or refused-then-retried (extra intents). */
+async function timedReads(x, a, src, n, records) {
+  const intents = async () => (await x.admin.query('SELECT count(*)::int AS n FROM si.read_intents')).rows[0].n;
+  const times = [], refused = [];
+  for (let i = 0; i < n; i++) {
+    const n0 = await intents();
+    const t0 = performance.now(); const p = await readEvidence(a, src); const ms = performance.now() - t0;
+    assert.equal(p.records.length, records);
+    const extra = (await intents()) - n0 - 1;                                 // intents beyond the one consumed = fail-closed refusals, retried
+    if (extra > 0) refused.push({ i, extra, ms: Math.round(ms) }); else times.push(ms);
+  }
+  return { times: times.sort((p, q) => p - q), refused };
+}
+/** The AUD-13a latency property, with the documented fail-closed liveness exception counted exactly (see AUD-13a). */
+function assertOrdinaryReadsDoNotWait({ times, refused }, label) {
+  assert.ok(times.every(ms => ms < 500), `${label}: every read without a refusal is fast (max ${times[times.length - 1]?.toFixed(0)} ms)`);
+  assert.ok(refused.length <= 2 && refused.every(r => r.extra === 1), `${label}: at most two isolated single retries: ${JSON.stringify(refused)}`);
+}
 
 test('AUD-12b: flush timeout and uncertainty fail closed; a timed-out intent stays on record and reads once flushed', async t => {
   const x = await fresh(t);
@@ -56,8 +76,10 @@ test('AUD-12b: flush timeout and uncertainty fail closed; a timed-out intent sta
 });
 
 test('AUD-12c: the commit is observed before the WAL target is taken (concurrent creating transaction)', async t => {
+  await writerDelay(null);                                                    // required environment: the default writer, verified
   const x = await fresh(t);
   const { src } = await ready(x);
+  await warm(x, src);                                                         // single-attempt reads below: absorb first-touch pruning
   const a = await x.c('si_reader_alice'), b = await x.c('si_reader_alice');
   // The id is known before its transaction commits (another session of the same login): refused, never released.
   await a.query('BEGIN');
@@ -69,15 +91,44 @@ test('AUD-12c: the commit is observed before the WAL target is taken (concurrent
 });
 
 // ------------------------------------------------------------------------------------------------
-test('AUD-13a: ordinary reads, explicit transactions and savepoints', async t => {
+// AUD-FX (M4-P1.1, D2): the writer fixture establishes what it claims, both ways, under adverse timing (no pause at
+// all between the restore and the next reads), repeatedly. Ordinary reads right after each restore never wait.
+test('AUD-FX: the WAL-writer fixture is verified both ways; reads right after a restore do not wait in the gate', async t => {
   const x = await fresh(t);
   const { src } = await ready(x, 3);
+  await warm(x, src);
   const a = await x.c('si_reader_alice');
-  const times = [];
-  for (let i = 0; i < 50; i++) { const t0 = performance.now(); const p = await readEvidence(a, src); times.push(performance.now() - t0); assert.equal(p.records.length, 3); }
-  times.sort((p, q) => p - q);
-  console.log(`# AUD-13a ordinary two-step reads: median ${times[25].toFixed(1)} ms, max ${times[49].toFixed(1)} ms (50 reads, no refusal)`);
-  assert.ok(times[49] < 500, 'ordinary synchronous reads do not wait for the gate');
+  const k = await connect();
+  t.after(() => k.end().catch(() => {}));
+  const worst = [];
+  for (let cycle = 0; cycle < 3; cycle++) {
+    await writerDelay('10s');
+    try {
+      assert.ok(await strayWalFlushMs(k, 500) >= 500, 'widened: stray WAL stays unflushed');
+      const id = await asyncIntent(a, src);
+      assert.equal(outcome(await settle(a.query(READ, [src, id, null, 100]))), 'SI_READ_INTENT_NOT_DURABLE', 'widened: an asynchronous intent fails closed');
+    } finally { await writerDelay(null); }
+    const r = await timedReads(x, a, src, 20, 3);                            // no pause at all after the restore
+    worst.push(`${r.times[r.times.length - 1].toFixed(1)} ms, ${r.refused.length} refused`);
+    assertOrdinaryReadsDoNotWait(r, `cycle ${cycle}: right after the verified restore`);
+  }
+  console.log(`# AUD-FX ordinary reads right after each verified restore (worst, refusals): ${worst.join(' / ')}`);
+});
+
+test('AUD-13a: ordinary reads, explicit transactions and savepoints', async t => {
+  await writerDelay(null);                                                    // required environment: the default writer, verified
+  const x = await fresh(t);
+  const { src } = await ready(x, 3);
+  await warm(x, src);                                                         // absorb first-touch pruning of the fresh database
+  const a = await x.c('si_reader_alice');
+  const { times, refused: refusedReads } = await timedReads(x, a, src, 50, 3);
+  console.log(`# AUD-13a ordinary two-step reads: median ${times[Math.floor(times.length / 2)].toFixed(1)} ms, max ${times[times.length - 1].toFixed(1)} ms ` +
+              `(${times.length} reads without refusal; refused-then-retried: ${JSON.stringify(refusedReads)})`);
+  // A read whose own intent committed synchronously never waits for it. The only permitted exception is the documented
+  // fail-closed liveness case: unrelated stray WAL (on-access pruning of read_intents pages as consumed rows accumulate)
+  // that a hibernating WAL writer has not flushed; it costs one bounded retry, is rare after the warm-up (0 in 1500
+  // measured), and is counted exactly here rather than hidden in a wall-clock maximum.
+  assertOrdinaryReadsDoNotWait({ times, refused: refusedReads }, 'AUD-13a');
   // Inside an explicit transaction and a savepoint, a committed intent reads; one created in the transaction does not.
   const id = await intent(a, src);
   await a.query('BEGIN'); await a.query('SAVEPOINT s');
