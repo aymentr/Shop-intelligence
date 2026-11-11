@@ -47,7 +47,7 @@ serving), no live collection, no production deployment.
 | 0005 | atomic evidence persistence (`si.ads`, `si.observations`), collector logging prerequisite | M3-P2B, accepted as a development milestone; FD7 end-to-end scope enforcement accepted through P2B |
 | 0006 | retention enforcement and safe purge (`si_purge_due`, purge audit, retention status) | M3-P3A, accepted |
 | 0007 | receipt verification (VALID / INVALID / UNVERIFIABLE), frozen legacy receipt columns, fail-closed readability predicate | M3-P3B, accepted |
-| 0008 | controlled internal retrieval: `si_reader` principals, per-source grants, bounded `si_read_evidence` | M3-P3C, implemented, **pending independent acceptance** |
+| 0008 | controlled internal retrieval: `si_reader` principals, per-source grants, bounded `si_read_evidence` | M3-P3C, accepted |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
@@ -78,6 +78,11 @@ Internal retrieval (0008): a dedicated principal (`si_reader_<name>`, provisione
 `provisionReaderPrincipal`) with a per-source grant (`si_grant_reader`, by `si_rights_admin`) can read
 bounded pages of VALID, currently authorized synthetic evidence through `readEvidence`
 (src/persistence/reader.ts). Destination and creative URLs are not returned; nothing is customer-facing.
+
+Lifecycle demonstration (M3-P3D): `npm run demo:lifecycle` runs the real implementation end to end —
+synthetic collection, verification, internal read, revocation, retention and purge, plus negative
+controls — against a fresh disposable PostgreSQL 16.15 container and writes a content-free report.
+See `docs/b002-m3-demo.md` (what is real, what is synthetic, and what remains unverified).
 
 Production mode (`SI_PRODUCTION=1`, `preflight --production`) also requires `SI_COLLECTOR_DATABASE_URL`:
 the gate checks a live collector session's effective logging settings and fails closed without it.

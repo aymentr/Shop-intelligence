@@ -1,7 +1,8 @@
 # B-002 Milestone 3 — design contract (migrations 0003 and later)
 
-**Status: design contract with implementation record. Migrations 0003–0007 are accepted development
-milestones; migration 0008 (§14) is implemented and pending independent acceptance. Nothing here is
+**Status: design contract with implementation record. Migrations 0003–0008 are accepted development
+milestones; the end-to-end synthetic lifecycle demonstration (M3-P3D, `docs/b002-m3-demo.md`) is
+pending independent acceptance. Nothing here is
 production-approved; D8/G3 is not production-resolved.** (The original status, "proposed design", applied to the first revision.)
 Baseline: `ccb87ed91954e11d4fa4c6c37b3a782357640595` (Milestone 2: conditional development
 acceptance, D-M2-01; CI #109 green).
@@ -43,7 +44,8 @@ Implemented so far (none is production-approved):
   principals, per-source internal grants (`si.reader_grants`), the bounded `si_read_evidence` (VALID
   verdict and current authorization for every record, source lock released when the read ends),
   content-free access log. Internal synthetic evaluation only. Tests RD-1…RD-14, RC-1…RC-9, RD-M (5
-  mutants), SR-0, RL-1…RL-3 (reader), M1h. **Pending independent acceptance.**
+  mutants), SR-0, RL-1…RL-3 (reader), M1h. **Accepted** (baseline `4c17ceb`, CI #117).
+- **M3-P3D — lifecycle demonstration** (no migration): `demo/` and `docs/b002-m3-demo.md`. **Pending independent acceptance.**
 
 Not implemented: customer-facing display or export of any kind, suppression, `publication_gate`,
 deletion requests, live adapters. §10, §12.6, §13.7 and §14.9 list what remains unverified.
@@ -93,7 +95,7 @@ content read or serving.
 | FD14 | APPROVED (M3-P3B security proof decisions); IMPLEMENTED in 0007 | Verdicts in a new append-only table, legacy receipt columns frozen (F1); verifier executed by `si_monitor` only (F2); VALID ⇔ `window_start ≤ commit_ts < window_end` with no extra margin (F3); INVALID / UNVERIFIABLE evidence follows normal retention (F4, FD12); slow CI job for real deadlines (F5); the `SET CONSTRAINTS … IMMEDIATE` vector is detected, not prevented (F6); RIGHTS_ENDED label fix (F7); D7 gate requires the collector login (F8); `step2-d5b.mjs` rebuild fix (F9). |
 | FD15 | **ACCEPTED with M3-P3B** — BD1 amendment | Definer allowlist × grantees gains: `si_monitor` → `si_verify_receipts`, `si_record_verification_failure`, `si_verification_status`, `si_verification_failures`. No table grant on `si.receipt_verifications` / `si.verification_failures`; `si_evidence_readable`, `si_receipt_verdict`, `si_commit_ts` granted to no role. |
 | FD16 | APPROVED (M3-P3C mission); IMPLEMENTED in 0008 | **Internal reader grant** — a concept separate from source-content display rights: an explicit, revocable, per-principal, per-source permission for internal synthetic evaluation (`purpose = INTERNAL_SYNTHETIC_EVALUATION`). It never implies `subscriber_display`, `export` or `media_mirror`, which stay DENIED/UNKNOWN by constraint and unchanged. Destination and creative URLs are excluded initially. |
-| FD17 | **PROPOSED — BD1 amendment, pending acceptance** | `si_reader` (NOLOGIN group of `si_reader_<name>` principals) → EXECUTE `si_read_evidence` only; `si_rights_admin` → `si_grant_reader`, `si_revoke_reader`, SELECT `si.reader_grants`; `si_monitor` → SELECT `si.reader_grants`, `si.reader_access_log`. No evidence-table privilege for any role. |
+| FD17 | **ACCEPTED with M3-P3C** — BD1 amendment | `si_reader` (NOLOGIN group of `si_reader_<name>` principals) → EXECUTE `si_read_evidence` only; `si_rights_admin` → `si_grant_reader`, `si_revoke_reader`, SELECT `si.reader_grants`; `si_monitor` → SELECT `si.reader_grants`, `si.reader_access_log`. No evidence-table privilege for any role. |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -943,3 +945,10 @@ id; independent verification of D8/G3 (D-M2-10); D5b and production hosting.
 - Verification lag delays readability (a run is unreadable until VALID is committed).
 - Timing measured on the PostgreSQL 16.15 test image only. D5b, production hosting and independent
   verification of D8/G3 remain release blockers.
+
+## 15. Synthetic lifecycle demonstration (M3-P3D)
+
+See `docs/b002-m3-demo.md`: the real implementation, end to end, against a fresh disposable PostgreSQL
+16.15 container, with negative controls and the demonstration's own mutants; no schema change. Finding:
+the reader access log is transactional (A1); a production-safe audit design (committed intent before
+data) is proposed there and needs a separate decision.

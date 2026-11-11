@@ -4,3 +4,4 @@ dist/
 .env.*
 *.log
 coverage/
+demo-report*.json

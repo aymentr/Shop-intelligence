@@ -75,6 +75,36 @@ jobs:
         if: always()
         run: docker compose down -v
 
+  lifecycle-demo:
+    # M3-P3D: the complete synthetic evidence lifecycle against a fresh disposable PostgreSQL 16.15
+    # container, three independent times (matrix), plus the demonstration's own negative controls.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Synthetic lifecycle demonstration (fresh disposable database, real-deadline scenario included)
+        run: DEMO_REPORT="$RUNNER_TEMP/demo-report-${{ matrix.run }}.json" bash demo/run.sh
+      - name: Demonstration negative controls (grant, retention, verdict checks disabled; must fail)
+        if: matrix.run == 1
+        run: bash demo/run-mutants.sh
+      - name: Content-free demonstration report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-report-${{ matrix.run }}
+          path: ${{ runner.temp }}/demo-report-${{ matrix.run }}.json
+          if-no-files-found: warn
+
   slow-deadline:
     # Real rights deadlines (about 8 minutes) and a server with commit timestamps disabled (M3-P3B).
     runs-on: ubuntu-latest
