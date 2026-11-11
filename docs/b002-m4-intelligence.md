@@ -111,7 +111,7 @@ The status function exposes **content-free collection metadata**: counts and tim
 
 ## 5. Tests and negative controls
 
-`tests/db/m4-intelligence.test.mjs` contains INT-1 to INT-19, covering the 18 required behaviours plus the durability and session gate on status:
+`tests/db/m4-intelligence.test.mjs` contains INT-1 to INT-18, covering the 18 required behaviours. INT-19, the durability and session gate on status, uses the `wal_writer_delay` fixture, so it runs in the isolated durability CI step (`tests/crash/m4-status-durability.test.mjs`). The mutant scenarios' raw calls use the library's bounded fresh-intent retry on `INTENT_NOT_DURABLE`:
 
 | Requirement | Test |
 |---|---|

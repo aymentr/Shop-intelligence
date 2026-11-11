@@ -9,15 +9,16 @@
 //     fsync = off, which does not matter for a PostgreSQL crash (written WAL is in the OS) but means an OS or
 //     power failure is NOT exercised here;
 //   - mutated or instrumented copies of the read function in a disposable database.
-// The crash-based tests (AUD-12a and four mutants) are in tests/crash/m3-durability-crash.test.mjs, a separate CI step,
-// so that crash recovery and its aftermath (autovacuum, checkpoint) never overlap the regular suite.
+// Runs in the isolated durability CI step (with tests/crash/m3-durability-crash.test.mjs): AUD-12b and AUD-13c
+// widen the WAL writer interval (superuser fixture), and the WAL writer can keep the long interval briefly after a
+// reset, which would make unrelated later reads in the regular suite fail closed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { asOwner, connect, control, pid, settle } from './helpers.mjs';
-import { readEvidence, revokeReader } from './../../dist/persistence/reader.js';
+import { asOwner, connect, control, pid, settle } from '../db/helpers.mjs';
+import { readEvidence, revokeReader } from '../../dist/persistence/reader.js';
 import { MIG10, provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
-         fnText, mutate, READ_FN, WAIT, PAUSE_AT, withPause } from './durability-fixtures.mjs';
+         fnText, mutate, READ_FN, WAIT, PAUSE_AT, withPause } from '../db/durability-fixtures.mjs';
 
 test.before(provisionReaders);
 

@@ -203,7 +203,7 @@ echo 'DR-1 restored read audit (request record survives rollback), intent bindin
 SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
   SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
   SI_TEST_TEMPLATE=si_template_test \
-  node --test --test-name-pattern='^AUD-13a:' tests/db/m3-durability.test.mjs
+  node --test --test-name-pattern='^AUD-13a:' tests/crash/m3-durability-fixtures.test.mjs
 echo 'DR-1 restored crash-durable read intent gate (ordinary reads, explicit transactions, savepoints) PASS'
 # Migration 0011 on the restored cluster: synthetic advertiser intelligence over the verified read boundary.
 SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \

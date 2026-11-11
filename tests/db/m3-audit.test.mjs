@@ -278,11 +278,18 @@ test('AUD-7: concurrent requests — exactly one committed consumption per inten
   await a1.query('ROLLBACK');                                                    // the abort is flushed by the WAL writer
   assert.equal((await third).value?.length, 2, 'after the first consumer rolled back, the waiting retry consumes the intent');
   // Many sessions race on one intent in autocommit: exactly one releases evidence.
-  const id3 = await intent(a1, src);
   const racers = await Promise.all(Array.from({ length: 6 }, () => x.connect('si_reader_alice')));
-  const results = await Promise.all(racers.map(c => settle(readWith(c, src, id3))));
-  assert.equal(results.filter(r => r.status === 'ok').length, 1, 'exactly one winner');
-  assert.ok(results.filter(r => r.status !== 'ok').every(r => /^SI_READ_INTENT_USED|^SI_READ_BUSY/.test(r.message)));
+  // Safety on every attempt: never more than one release per intent. If a fail-closed INTENT_NOT_DURABLE (unrelated
+  // unflushed WAL, since 0010) leaves no winner, the race is repeated with a fresh intent (at most 3 attempts).
+  let winners = 0;
+  for (let attempt = 0; attempt < 3 && winners === 0; attempt++) {
+    const id3 = await intent(a1, src);
+    const results = await Promise.all(racers.map(c => settle(readWith(c, src, id3))));
+    winners = results.filter(r => r.status === 'ok').length;
+    assert.ok(winners <= 1, 'never more than one release per intent');
+    assert.ok(results.filter(r => r.status !== 'ok').every(r => /^SI_READ_INTENT_USED|^SI_READ_BUSY|^SI_READ_INTENT_NOT_DURABLE/.test(r.message)));
+  }
+  assert.equal(winners, 1, 'exactly one winner');
   // Independent intents of the same login read concurrently.
   const many = await Promise.all(racers.map(async c => (await readEvidence(c, src)).records.length));
   assert.deepEqual(many, [2, 2, 2, 2, 2, 2]);

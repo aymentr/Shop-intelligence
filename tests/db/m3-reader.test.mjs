@@ -77,9 +77,14 @@ const grant = (x, p, src) => grantReader(x.si_rights_admin, p, src, 'internal sy
 const BEGIN_READ = 'SELECT si.si_begin_read($1, $2, $3) AS id';
 const READ = 'SELECT * FROM si.si_read_evidence($1, $2, $3, $4)';
 const intent = async (c, src, cursor = null, limit = 100) => (await c.query(BEGIN_READ, [src, cursor, limit])).rows[0].id;
+// Like the library, a fail-closed SI_READ_INTENT_NOT_DURABLE (unrelated unflushed WAL) is retried with a fresh intent,
+// at most 3 attempts; every other outcome, and the last refusal, is returned or thrown unchanged.
 const read = async (c, src, cursor = null, limit = 100, via = c) => {
-  const id = await intent(via, src, cursor, limit);
-  return (await c.query(READ, [src, id, cursor, limit])).rows;
+  for (let attempt = 1; ; attempt++) {
+    const id = await intent(via, src, cursor, limit);
+    try { return (await c.query(READ, [src, id, cursor, limit])).rows; }
+    catch (e) { if (attempt < 3 && /^SI_READ_INTENT_NOT_DURABLE/.test(String(e.message))) continue; throw e; }
+  }
 };
 async function replica(x, sql, params) {
   await x.admin.query('BEGIN');

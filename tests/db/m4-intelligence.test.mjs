@@ -269,6 +269,9 @@ test('INT-16: concurrent collection during a scan — no duplicate or missing re
   assert.ok(again.records.some(r => r.nativeAdId === 'late'), 'the new run is visible to the next request');
 });
 
+// INT-19 (the status function's durability gate) uses the wal_writer_delay fixture and runs in the isolated
+// durability step: tests/crash/m4-status-durability.test.mjs.
+
 test('INT-17: request audit — one committed intent per page and per status; caller rollback; scopes cannot be swapped', async t => {
   const x = await fresh(t);
   const src = await source(x);
@@ -304,40 +307,29 @@ test('INT-17: request audit — one committed intent per page and per status; ca
   await rejects(assert, alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, used, p.from, p.to]), { code: '55000', message: /^SI_READ_INTENT_USED/ });
 });
 
-test('INT-19: the status function carries the crash-durability gate and the session checks', async t => {
-  const x = await fresh(t);
-  const src = await source(x);
-  const alice = await reader(x);
-  const p = period(0, 10);
-  const k = await connect();
-  try { await k.query(`ALTER SYSTEM SET wal_writer_delay = '10s'`); await k.query('SELECT pg_reload_conf()'); } finally { await k.end(); }
-  try {
-    await new Promise(r => setTimeout(r, 300));
-    await alice.query('BEGIN');
-    const id = (await alice.query('SELECT si.si_begin_read($1, $2, 1) AS id', [src, INTEL.statusCursor(src, p)])).rows[0].id;
-    await alice.query('SET LOCAL synchronous_commit = off');
-    await alice.query('COMMIT');
-    await rejects(assert, alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, id, p.from, p.to]), { code: '55000', message: /^SI_READ_INTENT_NOT_DURABLE/ });
-  } finally { const k2 = await connect(); await k2.query('ALTER SYSTEM RESET wal_writer_delay'); await k2.query('SELECT pg_reload_conf()'); await k2.end(); }
-  await alice.query('SET synchronous_commit = off');
-  await rejects(assert, alice.query('SELECT * FROM si.si_read_source_status($1, gen_random_uuid(), $2, $3)', [src, p.from, p.to]), { code: '55000', message: /^SI_READ_UNSAFE_SESSION: synchronous_commit$/ });
-  await alice.query('RESET synchronous_commit');
-});
-
 // ------------------------------------------------------------------------------------------------
 // Negative-control mutants. Database: copies of the 0011 status function; library: a mutated temporary copy.
 function fnText(mig, start, end) { const s = mig.indexOf(start); return mig.slice(s, mig.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`); return text.replace(from, to); }
 const STATUS_FN = fnText(MIG11, 'CREATE FUNCTION si.si_read_source_status', 'END $read_source_status$;');
+/** A raw call made the way the library makes it: a fail-closed INTENT_NOT_DURABLE (unrelated unflushed WAL) is retried
+ *  with a fresh intent, at most 3 attempts; `attempt` sets up and returns the settled result of one attempt. */
+async function withFreshIntentRetry(attempt) {
+  let r;
+  for (let i = 0; i < 3; i++) { r = await attempt(); if (!(r.status !== 'ok' && /^SI_READ_INTENT_NOT_DURABLE/.test(String(r.message)))) break; }
+  return r;
+}
 async function scnStatusGrant(x) {                                           // detected = a principal whose grant was revoked gets status
   const src = await source(x);                                               // si_begin_read also checks the grant, so take the intent first
   const alice = await reader(x), p = period(0, 10);
-  // Warm-up: the first identity check after provisioning can prune catalog pages (WAL nobody flushes), which the
-  // durability gate correctly refuses; the library retries, this raw call would not.
-  await INTEL.sourceStatus(alice, src, p);
-  const id = await beginRead(alice, src, { cursor: INTEL.statusCursor(src, p), limit: 1 });
-  await revokeReader(x.si_rights_admin, 'si_reader_alice', src, 'revoked between intent and status');
-  return (await settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, id, p.from, p.to]))).status === 'ok';
+  const r = await withFreshIntentRetry(async () => {
+    const id = await beginRead(alice, src, { cursor: INTEL.statusCursor(src, p), limit: 1 });
+    await revokeReader(x.si_rights_admin, 'si_reader_alice', src, 'revoked between intent and status');
+    const out = await settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, id, p.from, p.to]));
+    await grantReader(x.si_rights_admin, 'si_reader_alice', src, 'granted again for the next attempt');
+    return out;
+  });
+  return r.status === 'ok';
 }
 async function scnStatusSuspended(x) {                                       // detected = status of a suspended source is served
   const src = await source(x); await control(x.si_rights_admin, src, 'SUSPEND');
@@ -355,8 +347,9 @@ async function scnStatusLatestVerified(x) {                                  // 
 async function scnStatusIntent(x) {                                          // detected = an evidence-page intent (another scope) releases status
   const src = await source(x);
   const alice = await reader(x);
-  const pageIntent = await beginRead(alice, src, { limit: 1 });
-  return (await settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, pageIntent, day(0), day(10)]))).status === 'ok';
+  const r = await withFreshIntentRetry(async () =>
+    settle(alice.query('SELECT * FROM si.si_read_source_status($1, $2, $3, $4)', [src, await beginRead(alice, src, { limit: 1 }), day(0), day(10)])));
+  return r.status === 'ok';
 }
 const DB_MUTANTS = [
   { name: 'status grant check omitted', scenario: scnStatusGrant,

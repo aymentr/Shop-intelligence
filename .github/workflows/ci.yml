@@ -46,8 +46,8 @@ jobs:
             echo "PostgreSQL acceptance pass ${pass}/3"
             npm run test:db || exit 1
           done
-      - name: Crash durability of read intents (AUD-12a and crash-detected mutants; restarts PostgreSQL)
-        run: node tests/db/run.mjs tests/crash/m3-durability-crash.test.mjs
+      - name: Crash durability of read intents (AUD-12a, crash-detected mutants, INT-19; restarts PostgreSQL)
+        run: node tests/db/run.mjs tests/crash/m3-durability-crash.test.mjs tests/crash/m3-durability-fixtures.test.mjs tests/crash/m4-status-durability.test.mjs
       - name: Targeted D5b mutant execution (expected regression failure)
         run: node tests/mutations/step2-d5b.mjs
       - name: Targeted role-bootstrap mutant execution (expected regression failure)
