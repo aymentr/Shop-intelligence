@@ -98,6 +98,7 @@ content read or serving.
 | FD17 | **ACCEPTED with M3-P3C** — BD1 amendment | `si_reader` (NOLOGIN group of `si_reader_<name>` principals) → EXECUTE `si_read_evidence` only; `si_rights_admin` → `si_grant_reader`, `si_revoke_reader`, SELECT `si.reader_grants`; `si_monitor` → SELECT `si.reader_grants`, `si.reader_access_log`. No evidence-table privilege for any role. |
 | FD18 | **PROPOSED (M3-AUD-01) — pending founder decision; implemented on branch `claude/b002-m3-aud-01` for review** | Durable read audit (`docs/b002-m3-audit.md`): (a) the audit standard is "committed request recorded before release; delivery unknown", not a count of deliveries; (b) intent lifetime 60 s, single use once consumed; (c) the intent is bound to login and exact scope (source, cursor digest, limit); (d) breaking signature change: `si_read_evidence(text, text, int)` is removed and replaced by `si_read_evidence(text, uuid, text, int)`; (e) no out-of-band log copy and no log shipping yet; (f) BD1 amendment: `si_reader` → EXECUTE `si_begin_read`; `si_monitor` → SELECT `si.read_intents`. No evidence-table privilege for any role. |
 | FD19 | **PROPOSED (M3-AUD-03) — pending founder decision; implemented on branch `claude/b002-m3-aud-03` for review** | Crash-durable read intent (`docs/b002-m3-audit.md` §2): (a) no evidence is released until WAL is flushed past the intent's commit record (target taken after `pg_xact_status` = committed, flush compared with it); (b) bounded wait of 1 s, then `SI_READ_INTENT_NOT_DURABLE`, fail closed; (c) the intent id carries its creating transaction id (server-set), bound by `created_xid`; (d) read sessions with `synchronous_commit = off` are refused; (e) the audit is a REQUEST audit only: disclosure audit and exactly-once delivery NOT GUARANTEED, rollback-resistant release accounting NOT IMPLEMENTED. No new privilege. |
+| FD20 | **PROPOSED (M4-P1) — pending founder decision; implemented on branch `claude/b002-m4-p1` for review** | BD1 amendment: `si_reader` → EXECUTE `si_read_source_status` (and USAGE on `si.source_status_row`). It is a content-free, per-source, per-period status of collection runs and verdicts for granted readers, gated by the same committed, crash-durable request intent as evidence pages (period bound in the audited scope), the source lock and current availability. No table or evidence privilege for any role (`docs/b002-m4-intelligence.md` §2, §4). |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -984,4 +985,12 @@ The proof from PostgreSQL 16's commit order, and its conditions (fsync on, prima
 REQUEST AUDIT: records an authorized request, subject to those durability conditions. DISCLOSURE AUDIT: NOT GUARANTEED. Exactly-once delivery: NOT GUARANTEED. Rollback-resistant release accounting: NOT IMPLEMENTED.
 
 Decisions: FD19 (PROPOSED).
+
+## 18. Synthetic advertiser intelligence (M4-P1, migration 0011) — IMPLEMENTED, pending founder acceptance
+
+See `docs/b002-m4-intelligence.md`. Advertiser history and deterministic search are computed in `src/persistence/intelligence.ts` from evidence pages released by `si_read_evidence`. Freshness and reliability come from the new content-free `si_read_source_status`, which is gated like an evidence page. `si_read_evidence` is unchanged.
+
+Synthetic data only. No customer display or export. No cross-source merging. No inference of ad activity, performance or spend.
+
+Decision: FD20 (PROPOSED).
 

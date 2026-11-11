@@ -99,6 +99,9 @@ jobs:
       - name: Demonstration negative controls (grant, retention, verdict checks disabled; must fail)
         if: matrix.run == 1
         run: bash demo/run-mutants.sh
+      - name: Synthetic advertiser intelligence demonstration (M4-P1; synthetic data, not live market conditions)
+        if: matrix.run == 1
+        run: DEMO_PROGRAM=demo/intelligence.mjs DEMO_REPORT="$RUNNER_TEMP/intelligence-report.json" bash demo/run.sh
       - name: Content-free demonstration report
         if: always()
         uses: actions/upload-artifact@v4

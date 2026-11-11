@@ -5,6 +5,7 @@
 #   DEMO_SKIP_DEADLINE=1 bash demo/run.sh    quick run without the real-deadline INVALID scenario
 #   DEMO_MUTANT=grant|retention|verdict ...  negative control: the demonstration must FAIL
 # The report (counts, codes, timings only) is written to $DEMO_REPORT (default: ./demo-report.json).
+#   DEMO_PROGRAM=demo/intelligence.mjs bash demo/run.sh   M4-P1 synthetic advertiser intelligence demonstration
 # No production credentials: the superuser and role passwords are random per run and never printed.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -26,4 +27,4 @@ done
 echo "DEMO environment: PostgreSQL $(docker exec -e PGPASSWORD="$admin_pw" "$name" psql -h 127.0.0.1 -U si_bootstrap -d postgres -Atc 'SHOW server_version'), container ${name} (removed on exit)"
 DEMO_PGPORT="$port" DEMO_ADMIN_PASSWORD="$admin_pw" DEMO_CONTAINER="$name" \
   DEMO_REPORT="${DEMO_REPORT:-$PWD/demo-report.json}" DEMO_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
-  node demo/lifecycle.mjs
+  node "${DEMO_PROGRAM:-demo/lifecycle.mjs}"

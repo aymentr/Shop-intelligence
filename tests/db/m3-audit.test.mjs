@@ -295,7 +295,9 @@ test('AUD-8: no reader entry point returns evidence without a committed intent; 
   const { src } = await ready(x, 1);
   const fns = (await x.admin.query(`SELECT p.oid::regprocedure::text AS f, p.prorettype::regtype::text AS r FROM pg_proc p
                                      WHERE p.pronamespace = 'si'::regnamespace AND has_function_privilege('si_reader', p.oid, 'EXECUTE') ORDER BY 1`)).rows;
-  assert.deepEqual(fns, [{ f: 'si.si_begin_read(text,text,integer)', r: 'uuid' }, { f: 'si.si_read_evidence(text,uuid,text,integer)', r: 'si.evidence_read_row' }]);
+  // 0011 adds the content-free source status (it returns no evidence row type; it is gated by the same intent).
+  assert.deepEqual(fns, [{ f: 'si.si_begin_read(text,text,integer)', r: 'uuid' }, { f: 'si.si_read_evidence(text,uuid,text,integer)', r: 'si.evidence_read_row' },
+                         { f: 'si.si_read_source_status(text,uuid,timestamp with time zone,timestamp with time zone)', r: 'si.source_status_row' }]);
   const evidenceReturning = (await x.admin.query(`SELECT p.oid::regprocedure::text AS f FROM pg_proc p
                                                   WHERE p.prorettype = 'si.evidence_read_row'::regtype`)).rows.map(r => r.f);
   assert.deepEqual(evidenceReturning, ['si.si_read_evidence(text,uuid,text,integer)'], 'the 0008 three-argument read no longer exists');
@@ -377,11 +379,11 @@ test('AUD-11: down 0009 with intents and completion rows present restores the ex
   const ref = await freshDatabase(t, 'm3aud8', { migrate: false });
   const refc = await connect({ database: ref }); t.after(() => refc.end());
   await migrateUp(refc, { to: 8 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 8, allowDestructive: true }), [10, 9]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 8, allowDestructive: true }), [11, 10, 9]);
   const norm = f => f.replaceAll('"relacl":"{si_owner=arwdDxt/si_owner}"', '"relacl":null');    // equivalent ACL spelling after restore (DR-1)
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(await schemaFingerprint(refc)), 'exact 0008 catalog with 0009 data present before down');
   assert.equal((await x.admin.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n, 1, 'completion rows are kept (without the intent column)');
-  assert.deepEqual(await migrateUp(x.admin), [9, 10]);
+  assert.deepEqual(await migrateUp(x.admin), [9, 10, 11]);
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(at9));
   assert.equal((await readEvidence(await x.connect('si_reader_alice'), src)).records.length, 2, 'reads work after the round trip');
 });

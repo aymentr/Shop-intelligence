@@ -14,7 +14,8 @@
     "db:migrate": "node dist/persistence/cli.js up",
     "db:status": "node dist/persistence/cli.js status",
     "demo": "npm run build && node demo.mjs",
-    "demo:lifecycle": "npm run build && bash demo/run.sh"
+    "demo:lifecycle": "npm run build && bash demo/run.sh",
+    "demo:intelligence": "npm run build && DEMO_PROGRAM=demo/intelligence.mjs bash demo/run.sh"
   },
   "engines": {
     "node": ">=22"

@@ -49,7 +49,8 @@ serving), no live collection, no production deployment.
 | 0007 | receipt verification (VALID / INVALID / UNVERIFIABLE), frozen legacy receipt columns, fail-closed readability predicate | M3-P3B, accepted |
 | 0008 | controlled internal retrieval: `si_reader` principals, per-source grants, bounded `si_read_evidence` | M3-P3C, accepted |
 | 0009 | read request audit: a committed, scoped read intent (`si_begin_read`) before any evidence; replaces the 0008 read entry point | M3-AUD-01, conditionally accepted for synthetic use by M3-AUD-02 |
-| 0010 | crash-durable read intent: no evidence until the intent's commit is flushed to WAL (bounded, fail closed) | M3-AUD-03, pending acceptance |
+| 0010 | crash-durable read intent: no evidence until the intent's commit is flushed to WAL (bounded, fail closed) | M3-AUD-03, conditionally accepted by M3-AUD-04 |
+| 0011 | reader source status: content-free per-source, per-period run and verdict counts for freshness and reliability, gated like an evidence page | M4-P1, pending acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
@@ -85,6 +86,11 @@ no evidence is released until that commit is flushed to WAL. This is a REQUEST A
 request is recorded, subject to the durability conditions in `docs/b002-m3-audit.md` §2.3). DISCLOSURE
 AUDIT: NOT GUARANTEED. Exactly-once delivery: NOT GUARANTEED. Rollback-resistant release accounting: NOT
 IMPLEMENTED — a caller rollback still erases the record that rows were released.
+
+Synthetic advertiser intelligence (M4-P1, `docs/b002-m4-intelligence.md`): `src/persistence/intelligence.ts` provides
+advertiser history, deterministic search and freshness/reliability indicators over the verified read boundary
+(evidence pages plus the 0011 source status), per explicitly authorized source, with explicit UNKNOWN states.
+`npm run demo:intelligence` demonstrates it on synthetic data only (not live market conditions).
 
 Lifecycle demonstration (M3-P3D): `npm run demo:lifecycle` runs the real implementation end to end —
 synthetic collection, verification, internal read, revocation, retention and purge, plus negative

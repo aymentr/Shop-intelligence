@@ -25,6 +25,9 @@ Baseline a0b63183f3c0e16f187287a42d2ab6c9ab5d01fd. **Every risk below is open** 
 | R-19 | **Request record lost after release (S13, M3-AUD-02).** Under 0009 an asynchronously committed intent could be lost in a crash after rows were delivered | High | M3-AUD-02 S13; reproduced in M3-AUD-03 | A, B | 0010 durability gate (`docs/b002-m3-audit.md` §2) | IMPLEMENTED, pending independent acceptance; holds only with fsync on, on a primary, without a synchronous standby |
 | R-20 | **Release not recorded under rollback, repeated reuse and content drift (S3–S6, S12)** | High for B | M3-AUD-02 | B, C | Out-of-band release record (C2) or a trusted service only; direct reader credentials prohibited for untrusted clients | OPEN (not addressed by 0010) |
 | R-21 | **Restored-copy intent reuse; unbounded intents; no grant attribution (S14, S16, S8)** | Medium | M3-AUD-02 | B | C6, C5, C4 | OPEN |
+| R-22 | **Client-side intelligence scan.** History and search read every readable record of a source (at most 5,000, then fail closed) | Low (synthetic) / Medium (B) | M4-P1 | B | M4-P2: server-side audited search primitive | OPEN |
+| R-23 | **Advertiser identity is the normalized name within one source.** No entity resolution or cross-source identity; look-alike names are separate | Medium | M4-P1 | B, C | Identity design with explicit evidence and authorization | OPEN |
+| R-24 | **Source status exposes collection metadata to granted readers (FD20)** | Low | M4-P1 | — | Founder decision FD20 | PROPOSED |
 
 ## Priority order for pilot B
 
