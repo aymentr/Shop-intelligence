@@ -1,7 +1,7 @@
 # B-002 Milestone 3 — design contract (migrations 0003 and later)
 
-**Status: design contract with implementation record. Migrations 0003–0006 are accepted development
-milestones; migration 0007 (§13) is implemented and pending independent acceptance. Nothing here is
+**Status: design contract with implementation record. Migrations 0003–0007 are accepted development
+milestones; migration 0008 (§14) is implemented and pending independent acceptance. Nothing here is
 production-approved; D8/G3 is not production-resolved.** (The original status, "proposed design", applied to the first revision.)
 Baseline: `ccb87ed91954e11d4fa4c6c37b3a782357640595` (Milestone 2: conditional development
 acceptance, D-M2-01; CI #109 green).
@@ -38,10 +38,15 @@ Implemented so far (none is production-approved):
   UNVERIFIABLE, database-computed, append-only), `si_verify_receipts` (si_monitor), frozen legacy receipt
   columns, fail-closed `si_evidence_readable` (granted to no role), RIGHTS_ENDED purge label, D7 production
   gate with a live collector session. Tests VR-1…VR-16, VR-M (9 mutants), PR-1…PR-5, RT-15, VL-1…VL-3,
-  M1g. **Pending independent acceptance.**
+  M1g. **Accepted** (baseline `6eca7a7`, CI #116).
+- **0008 — controlled internal retrieval** (M3-P3C, §14): `si_reader` group of dedicated `si_reader_<name>`
+  principals, per-source internal grants (`si.reader_grants`), the bounded `si_read_evidence` (VALID
+  verdict and current authorization for every record, source lock released when the read ends),
+  content-free access log. Internal synthetic evaluation only. Tests RD-1…RD-14, RC-1…RC-9, RD-M (5
+  mutants), SR-0, RL-1…RL-3 (reader), M1h. **Pending independent acceptance.**
 
-Not implemented: any read function or reader role (D8's read gate), suppression, `publication_gate`,
-deletion requests, live adapters. §10, §12.6 and §13.7 list what remains unverified.
+Not implemented: customer-facing display or export of any kind, suppression, `publication_gate`,
+deletion requests, live adapters. §10, §12.6, §13.7 and §14.9 list what remains unverified.
 
 ## 1. Frozen scope (PROPOSED)
 
@@ -86,7 +91,9 @@ content read or serving.
 | FD12 | APPROVED (M3-P3A authorization); IMPLEMENTED in 0006 | Retention decisions: retirement alone does not end retention; TERMINATE_RETENTION and applicable rights changes shorten the effective end; orphan identities are deleted completely, without tombstone digests; the stricter applicable cleanup deadline applies; evidence with unverifiable commit timestamps follows normal retention; no derived advertising evidence is kept beyond retention (§12.1). |
 | FD13 | **ACCEPTED with M3-P3A** — BD1 amendment | Definer allowlist × grantees gains: `si_retention` → `si_purge_due`, `si_record_purge_failure`; `si_retention`, `si_monitor` → `si_retention_status`, `si_purge_failures`; `si_retention` SELECT on `si.purge_log`, `si.purge_failures`. No application role gains any privilege on `si.ads` or `si.observations` (privileges G1/SD1). |
 | FD14 | APPROVED (M3-P3B security proof decisions); IMPLEMENTED in 0007 | Verdicts in a new append-only table, legacy receipt columns frozen (F1); verifier executed by `si_monitor` only (F2); VALID ⇔ `window_start ≤ commit_ts < window_end` with no extra margin (F3); INVALID / UNVERIFIABLE evidence follows normal retention (F4, FD12); slow CI job for real deadlines (F5); the `SET CONSTRAINTS … IMMEDIATE` vector is detected, not prevented (F6); RIGHTS_ENDED label fix (F7); D7 gate requires the collector login (F8); `step2-d5b.mjs` rebuild fix (F9). |
-| FD15 | **PROPOSED — BD1 amendment, pending acceptance** | Definer allowlist × grantees gains: `si_monitor` → `si_verify_receipts`, `si_record_verification_failure`, `si_verification_status`, `si_verification_failures`. No table grant on `si.receipt_verifications` / `si.verification_failures`; `si_evidence_readable`, `si_receipt_verdict`, `si_commit_ts` granted to no role. |
+| FD15 | **ACCEPTED with M3-P3B** — BD1 amendment | Definer allowlist × grantees gains: `si_monitor` → `si_verify_receipts`, `si_record_verification_failure`, `si_verification_status`, `si_verification_failures`. No table grant on `si.receipt_verifications` / `si.verification_failures`; `si_evidence_readable`, `si_receipt_verdict`, `si_commit_ts` granted to no role. |
+| FD16 | APPROVED (M3-P3C mission); IMPLEMENTED in 0008 | **Internal reader grant** — a concept separate from source-content display rights: an explicit, revocable, per-principal, per-source permission for internal synthetic evaluation (`purpose = INTERNAL_SYNTHETIC_EVALUATION`). It never implies `subscriber_display`, `export` or `media_mirror`, which stay DENIED/UNKNOWN by constraint and unchanged. Destination and creative URLs are excluded initially. |
+| FD17 | **PROPOSED — BD1 amendment, pending acceptance** | `si_reader` (NOLOGIN group of `si_reader_<name>` principals) → EXECUTE `si_read_evidence` only; `si_rights_admin` → `si_grant_reader`, `si_revoke_reader`, SELECT `si.reader_grants`; `si_monitor` → SELECT `si.reader_grants`, `si.reader_access_log`. No evidence-table privilege for any role. |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -556,8 +563,9 @@ Implementation status of the former blockers (all pending founder acceptance):
 4. **FD5:** EV-15 passes on PostgreSQL 16.15 (local and CI image); production must re-measure.
 
 Production-release blockers (unchanged from Milestone 2):
-5. **D8 / G3 (D-M2-10).** 0007 provides commit-time verification and a fail-closed predicate (§13); the
-   read gate itself (0008+, a reader role, the predicate wired into it) and independent verification remain.
+5. **D8 / G3 (D-M2-10).** 0007 provides commit-time verification and the fail-closed predicate (§13); 0008
+   wires them into an internal read gate (§14). Independent verification remains, and a production
+   content-serving path (customer display) is still prohibited and unauthorized by the rights model.
 6. **D5b (D-M2-09):** applied and verified on each production database; production preflight must
    fail closed without it.
 7. A production host able to perform D5b (`docs/b002-d5b-production-hardening.md`), and an
@@ -843,3 +851,95 @@ still a supported network (VR-11). It is false for pending, INVALID and UNVERIFI
   `track_commit_timestamp` must never be turned off (it erases history). Nothing is scheduled.
 - **D8 is not resolved:** the read gate (reader role, bounded read function using this predicate) does
   not exist; independent verification is still required (D-M2-10). D5b and production hosting are unchanged.
+
+## 14. Controlled internal evidence retrieval (M3-P3C, migration 0008) — IMPLEMENTED, pending independent acceptance
+
+Scope: **internal synthetic evaluation only.** No customer display, no export, no external sharing, no
+HTTP endpoint, no dashboard. The rights model is unchanged: evaluation rights are not subscriber-display
+rights, and no read here is a display (FD16). Migrations 0001–0007 are unchanged.
+
+### 14.1 Reader security model
+- **Principals.** `si_reader` is a NOLOGIN group (bootstrap). Each internal reader is its own LOGIN role
+  named `si_reader_<name>`, member of `si_reader` (INHERIT, no SET, no ADMIN), with no elevated attribute
+  and no membership in any other `si_*` role (`si_reader_principal_ok`). Bootstrap removes any other
+  member of `si_reader` on every run. Principals are provisioned by a cluster administrator with
+  `provisionReaderPrincipal` (src/persistence/bootstrap.ts), which also sets the principal's session limits
+  (role settings are per login, not inherited from the group). One principal per person or process:
+  credentials must never be shared — this is an operational rule the database cannot enforce.
+- **Identity.** The read is authorized for `session_user`, the authenticated login. `SET ROLE` changes
+  `current_user` only, so it cannot borrow another principal's grant (RD-12); the function takes no
+  principal argument, so no caller-supplied identifier is ever trusted. `SET SESSION AUTHORIZATION`
+  needs a superuser (outside the boundary).
+- **Privileges.** `si_reader` has EXECUTE on `si_read_evidence` and USAGE on its row type only: no table
+  privilege anywhere (SR-0), no rights, collection, verification or purge function (RD-2).
+
+### 14.2 Grants and revocation
+`si.reader_grants` (principal, source, purpose `INTERNAL_SYNTHETIC_EVALUATION`, reason, granted_by/at,
+revoked_by/at, revoke_reason). Only `si_grant_reader` / `si_revoke_reader` (SECURITY DEFINER,
+`si_rights_admin`) write it; attribution and times are server-set; a revocation is final (a new grant
+can follow); at most one active grant per principal and source; no update or delete otherwise, for
+every role (RD-7). Both functions lock the source row `FOR UPDATE` (rank 3), so they wait for a read in
+progress and every later read sees them. Grants are refused for non-dedicated principals, service
+roles, unknown or non-SYNTHETIC or retired sources.
+
+### 14.3 The read: `si_read_evidence(source_id, cursor, limit)`
+In order: READ COMMITTED; limit 1…100; principal check (`session_user`); session safety (no statement,
+duration, sampling or parameter logging; `statement_timeout` and `idle_in_transaction_session_timeout`
+between 1 ms and 10 s); cursor validation; then, **under `sources FOR SHARE`** (rank 3): an active grant
+for this principal and source, and for every run `si_evidence_readable(run)` (§13.5: VALID verdict and
+current retention, suspension, termination, retirement, rights and networks). Records are returned in
+`(collected_at, run_id, ordinal)` order.
+
+**Permitted fields:** `run_id`, `ordinal`, `collected_at` (run completion), `network`, `native_ad_id`,
+`advertiser_name`, `countries`, `seen_at`, `source_url`, `title`, `source_reported_first_seen`,
+`source_reported_last_seen`, `content_sha256`, `next_cursor`. **Excluded:** `destination_url`, `creative_url`.
+
+### 14.4 Pagination and limits
+At most 100 records and 262,144 bytes (JSON text of each record) per call; a page can be short because
+of the byte cap, so the end is an empty page. `next_cursor` = `v1|source|collected_at (µs, UTC)|run_id|ordinal`:
+strictly validated, bound to its source (another source's cursor is refused), and never a capability —
+authorization is re-evaluated on every call (RD-3, RD-7, RD-8, RD-9, RD-10).
+
+### 14.5 Locking and concurrency
+The source lock is the serialization point with rights changes, SUSPEND / TERMINATE, retirement,
+purge and grant changes. It is taken inside a sub-block whose subtransaction is rolled back before the
+function returns, which PostgreSQL documents as releasing locks acquired after the savepoint: **the lock
+lasts only for the read itself, even if the caller keeps its transaction open** (prototype and RC-9). The
+function pins `lock_timeout = 2s`: behind a change in progress a read waits at most 2 s, then fails with
+`SI_READ_BUSY` (RC-7). A change issued during a read waits for that read and the next read sees it
+(RC-1…RC-6); purge skips a source being read (`BUSY`) and purges it afterwards. Uncommitted verdicts are
+invisible (RC-8). Under four looping readers SUSPEND / TERMINATE completed in single-digit milliseconds.
+
+### 14.6 Errors and logging
+Fixed errors only: `SI_READ_NOT_AUTHORIZED` (42501; also an unknown source, a non-principal or a missing
+grant), `SI_READ_BAD_ARGUMENT`, `SI_READ_BAD_CURSOR` (22023), `SI_READ_UNSAFE_SESSION: <setting name>`
+(55000), `SI_READ_BUSY` (55P03), `SI_ISOLATION`. A non-principal learns nothing else. The library
+(`src/persistence/reader.ts`) returns records to its caller, never logs them, and reduces every failure
+to `READ_FAILED: <code>` (RD-11, RL-1…RL-3). `si.reader_access_log` records each successful read
+(principal, source, record and byte counts, time) without content; refused reads raise and leave no
+record, and a read inside a caller transaction that is rolled back loses its record.
+**Operational requirement:** applications must not log returned records; reader principals must keep
+the provisioned settings; superuser-level logging (e.g. `auto_explain`, debug levels) is outside the boundary.
+
+### 14.7 Tests and mutants
+RD-1…RD-14 (fields, unauthorized and service roles, cross-source, missing / INVALID / UNVERIFIABLE,
+expired / purged / suspended / terminated / retired / rights-revoked, grants, cursors, pagination, limits,
+logs, impersonation, unsafe sessions, unchanged collection / verification / purge), RC-1…RC-9 (forced
+interleavings and emergency-control timing), SR-0, M1h; mutants (each with a clean baseline): grant check,
+verdict, retention, source lock, output cap — the cap mutant is also refused by the access-log CHECK.
+DR-1 runs RD-1, RD-2, RD-7 and RD-12 on the restored cluster.
+
+### 14.8 Future customer display (not authorized)
+Customer-facing display requires, at least: a founder and legal decision and a rights-model change that
+allows `subscriber_display` (today constrained to DENIED/UNKNOWN), documented per source; a separate
+display purpose and grant; field-level review (URLs and media excluded until mirroring rights exist);
+an application authentication layer that maps end users to principals without trusting a supplied user
+id; independent verification of D8/G3 (D-M2-10); D5b and production hosting.
+
+### 14.9 Limitations
+- Credential sharing cannot be prevented by the database; one principal per person/process is operational.
+- Superusers can impersonate any login and bypass any control (trust boundary).
+- The access log is per successful read and transactional (see 14.6).
+- Verification lag delays readability (a run is unreadable until VALID is committed).
+- Timing measured on the PostgreSQL 16.15 test image only. D5b, production hosting and independent
+  verification of D8/G3 remain release blockers.

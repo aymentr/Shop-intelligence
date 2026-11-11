@@ -35,8 +35,8 @@ CI (`.github/workflows/ci.yml`) runs typecheck, tests and the demo on Node 22 an
 ## B-002 persistence (development milestones; not production-approved)
 
 PostgreSQL 16 foundation with roles, bootstrap, a migration runner and integration tests against a
-real, disposable database. Synthetic sources only; no read path, no content serving, no live
-collection, no production deployment.
+real, disposable database. Synthetic sources only; internal evaluation reads only (no customer display, no export, no content
+serving), no live collection, no production deployment.
 
 | Migration | Content | Status |
 |---|---|---|
@@ -46,7 +46,8 @@ collection, no production deployment.
 | 0004 | completion hardening (`si_complete_run(uuid, uuid, jsonb)`) | M3-P2A, accepted |
 | 0005 | atomic evidence persistence (`si.ads`, `si.observations`), collector logging prerequisite | M3-P2B, accepted as a development milestone; FD7 end-to-end scope enforcement accepted through P2B |
 | 0006 | retention enforcement and safe purge (`si_purge_due`, purge audit, retention status) | M3-P3A, accepted |
-| 0007 | receipt verification (VALID / INVALID / UNVERIFIABLE), frozen legacy receipt columns, fail-closed readability predicate (granted to no role) | M3-P3B, implemented, **pending independent acceptance** |
+| 0007 | receipt verification (VALID / INVALID / UNVERIFIABLE), frozen legacy receipt columns, fail-closed readability predicate | M3-P3B, accepted |
+| 0008 | controlled internal retrieval: `si_reader` principals, per-source grants, bounded `si_read_evidence` | M3-P3C, implemented, **pending independent acceptance** |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
@@ -72,6 +73,11 @@ never authorizes anything, and no evidence can be read in this milestone.
 ```bash
 SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js verification run [--limit N] | status | failures
 ```
+
+Internal retrieval (0008): a dedicated principal (`si_reader_<name>`, provisioned with
+`provisionReaderPrincipal`) with a per-source grant (`si_grant_reader`, by `si_rights_admin`) can read
+bounded pages of VALID, currently authorized synthetic evidence through `readEvidence`
+(src/persistence/reader.ts). Destination and creative URLs are not returned; nothing is customer-facing.
 
 Production mode (`SI_PRODUCTION=1`, `preflight --production`) also requires `SI_COLLECTOR_DATABASE_URL`:
 the gate checks a live collector session's effective logging settings and fails closed without it.

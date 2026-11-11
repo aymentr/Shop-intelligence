@@ -13,6 +13,13 @@ BEGIN
   END IF;
   ALTER ROLE si_owner NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION NOINHERIT;
 
+  -- Milestone 3 (M3-P3C): group of dedicated internal reader principals (si_reader_<name> logins).
+  -- It cannot log in; its members inherit EXECUTE on the read function only.
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'si_reader') THEN
+    CREATE ROLE si_reader NOLOGIN;
+  END IF;
+  ALTER ROLE si_reader NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB NOREPLICATION NOINHERIT;
+
   FOREACH r IN ARRAY ARRAY['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor', 'si_migrator'] LOOP
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = r) THEN
       EXECUTE format('CREATE ROLE %I LOGIN', r);
@@ -67,3 +74,19 @@ ALTER ROLE si_retention    SET lock_timeout = '30s';
 ALTER ROLE si_retention    SET statement_timeout = '120s';
 ALTER ROLE si_monitor      SET statement_timeout = '30s';
 ALTER ROLE si_migrator     SET lock_timeout = '30s';
+
+-- Normalize si_reader membership (M3-P3C): only dedicated reader principals (si_reader_<name>
+-- logins) may be members, never a service role. Any other membership is removed on every run.
+DO $$
+DECLARE g record;
+BEGIN
+  LOOP
+    SELECT pg_catalog.pg_get_userbyid(m.member) AS member, pg_catalog.pg_get_userbyid(m.grantor) AS grantor INTO g
+    FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles r ON r.oid = m.member
+    WHERE m.roleid = 'si_reader'::regrole AND NOT (r.rolname ~ '^si_reader_[a-z0-9_]{1,40}$' AND r.rolcanlogin)
+    ORDER BY m.admin_option DESC, m.oid
+    LIMIT 1;
+    IF NOT FOUND THEN EXIT; END IF;   -- spelled differently from the si_owner loop (mutation anchor)
+    EXECUTE format('REVOKE si_reader FROM %I GRANTED BY %I CASCADE', g.member, g.grantor);
+  END LOOP;
+END $$;

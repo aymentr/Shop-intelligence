@@ -102,8 +102,16 @@ if len(matches) != 1:
             print("DR-1 membership candidate: [unexpected syntax; withheld]")
     raise SystemExit(f"DR-1 unexpected membership grant count/format: {len(matches)}")
 updated = pattern.sub(r"\g<1>si_restore_admin\g<2>", source, count=1)
+# M3-P3C: dedicated reader principals' si_reader memberships (exact provisioned form only).
+reader = re.compile(
+    r"^(GRANT\s+si_reader\s+TO\s+si_reader_[a-z0-9_]{1,40}\s+WITH\s+INHERIT\s+TRUE,\s+SET\s+FALSE\s+"
+    r"GRANTED\s+BY\s+)si_bootstrap(\s*;)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+updated, readers = reader.subn(r"\g<1>si_restore_admin\g<2>", updated)
 pathlib.Path(sys.argv[2]).write_text(updated)
 print("DR-1 normalized exactly one membership grantor for recovery")
+print(f"DR-1 normalized {readers} reader-principal membership grantor(s) for recovery")
 PY
 docker exec -i -e PGPASSWORD=local-test-only "$name" \
   psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U si_restore_admin -d postgres \
@@ -178,4 +186,10 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^(VR-(1|10|13):|PR-(1|3|4):)' tests/db/m3-verification.test.mjs tests/db/production-gate.test.mjs
 echo 'DR-1 restored receipt verification, verification privileges and D7 production gate PASS'
+# Migration 0008 on the restored cluster: internal reads, the reader privilege boundary and grants.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^RD-(1|2|7|12):' tests/db/m3-reader.test.mjs
+echo 'DR-1 restored internal reads, reader privileges and grant semantics PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

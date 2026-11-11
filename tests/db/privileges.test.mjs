@@ -9,7 +9,8 @@ import { asOwner, cfg, connect, control, freshDatabase, recordRights, rejects, r
 const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor'];
 const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
                 'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope', 'si.ads', 'si.observations',
-                'si.purge_log', 'si.purge_failures', 'si.receipt_verifications', 'si.verification_failures'];
+                'si.purge_log', 'si.purge_failures', 'si.receipt_verifications', 'si.verification_failures',
+                'si.reader_grants', 'si.reader_access_log'];
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
@@ -20,11 +21,11 @@ const EXPECTED_TABLE = {
                      // 0002 step 1: read only; write grants arrive with their enforcing triggers (steps 2-4)
                      'si.collection_runs': ['SELECT'], 'si.publication_receipts': ['SELECT'] },
   si_rights_admin: { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
-                     'si.collection_runs': ['SELECT'] },
+                     'si.collection_runs': ['SELECT'], 'si.reader_grants': ['SELECT'] },                       // 0008: grants it manages
   si_retention:    { 'si.sources': ['SELECT'], 'si.rights_versions': ['SELECT'], 'si.rights_evidence': ['SELECT'], 'si.source_controls': ['SELECT'], 'si.schema_migrations': ['SELECT'],
                      'si.collection_runs': ['SELECT'], 'si.publication_receipts': ['SELECT'], 'si.run_errors': ['SELECT'],
                      'si.purge_log': ['SELECT'], 'si.purge_failures': ['SELECT'] },                  // 0006: content-free audit
-  si_monitor:      { 'si.schema_migrations': ['SELECT'] }
+  si_monitor:      { 'si.schema_migrations': ['SELECT'], 'si.reader_grants': ['SELECT'], 'si.reader_access_log': ['SELECT'] }
 };
 // Expected EXECUTE grantees per function (owner excluded). Anything else in schema si: none.
 const EXPECTED_EXECUTE = {
@@ -43,11 +44,13 @@ const EXPECTED_EXECUTE = {
   si_purge_due: ['si_retention'], si_record_purge_failure: ['si_retention'],               // 0006 (retention)
   si_retention_status: ['si_retention', 'si_monitor'], si_purge_failures: ['si_retention', 'si_monitor'],
   si_verify_receipts: ['si_monitor'], si_record_verification_failure: ['si_monitor'],                 // 0007 (verification)
-  si_verification_status: ['si_monitor'], si_verification_failures: ['si_monitor']
+  si_verification_status: ['si_monitor'], si_verification_failures: ['si_monitor'],
+  si_grant_reader: ['si_rights_admin'], si_revoke_reader: ['si_rights_admin'],                         // 0008 (internal reads)
+  si_read_evidence: ['si_reader']
 };
-const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_heartbeat_run', 'si_purge_due',
-                          'si_purge_failures', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
-                          'si_record_source_control', 'si_record_verification_failure', 'si_retention_status',
+const EXPECTED_DEFINER = ['si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_purge_due',
+                          'si_purge_failures', 'si_read_evidence', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
+                          'si_record_source_control', 'si_record_verification_failure', 'si_retention_status', 'si_revoke_reader',
                           'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_purge_check',
                           'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
                           'trg_runs_publish_check', 'trg_runs_purge_check'];
@@ -79,7 +82,10 @@ const EXPECTED_VOLATILITY = {
   // 0007 receipt verification
   si_verification_max_xid_age: 'i', si_verification_lag_target: 'i', si_commit_ts: 's', si_receipt_verdict: 's',
   trg_verification_insert: 'v', trg_verification_records_append_only: 'v', si_verify_receipts: 'v',
-  si_record_verification_failure: 'v', si_verification_status: 's', si_verification_failures: 's', si_evidence_readable: 's'
+  si_record_verification_failure: 'v', si_verification_status: 's', si_verification_failures: 's', si_evidence_readable: 's',
+  // 0008 internal reads
+  si_reader_principal_ok: 's', trg_reader_grants_guard: 'v', si_grant_reader: 'v', si_revoke_reader: 'v',
+  si_reader_session_problem: 's', trg_reader_access_log_append_only: 'v', si_read_evidence: 'v'
 };
 
 let db, c;
@@ -161,7 +167,9 @@ test('SD1: SECURITY DEFINER contract — owner, fixed search_path, no PUBLIC EXE
   assert.deepEqual(fns.map(f => f.proname).sort(), Object.keys(EXPECTED_VOLATILITY).sort(), 'no unexpected functions');
   for (const f of fns) {
     assert.equal(f.owner, 'si_owner', f.proname);
-    assert.deepEqual(f.proconfig, ['search_path=pg_catalog, pg_temp'], `${f.proname} search_path`);
+    // 0008: the read function also pins a bounded lock wait (it must never queue behind emergency controls).
+    assert.deepEqual(f.proconfig, f.proname === 'si_read_evidence' ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
+                                                                   : ['search_path=pg_catalog, pg_temp'], `${f.proname} search_path`);
     assert.equal(f.default_acl, false, `${f.proname}: a NULL ACL would mean PUBLIC EXECUTE`);
     assert.equal(f.public_grant, false, `${f.proname}: PUBLIC must not have EXECUTE`);
     assert.deepEqual(f.grantees, EXPECTED_EXECUTE[f.proname] ?? [], `${f.proname} grantees`);
@@ -285,4 +293,17 @@ test('IA-1 prerequisite: rights_versions has UNIQUE (rights_version_id, source_i
     WHERE conrelid = 'si.rights_versions'::regclass AND contype = 'u'`)).rows.map(x => x.def).sort();
   assert.ok(r.includes('UNIQUE (rights_version_id, source_id)'), JSON.stringify(r));
   assert.ok(r.includes('UNIQUE (source_id, version)'), JSON.stringify(r));
+});
+
+test('SR-0 (0008): si_reader is a NOLOGIN group with no table privilege anywhere and EXECUTE on the read function only', async () => {
+  const r = (await c.admin.query(`SELECT rolcanlogin, rolsuper, rolinherit, rolcreaterole, rolbypassrls FROM pg_roles WHERE rolname = 'si_reader'`)).rows[0];
+  assert.deepEqual(r, { rolcanlogin: false, rolsuper: false, rolinherit: false, rolcreaterole: false, rolbypassrls: false });
+  const tables = (await c.admin.query(`SELECT c.oid::regclass::text AS t FROM pg_class c WHERE c.relnamespace = 'si'::regnamespace AND c.relkind = 'r'`)).rows;
+  for (const { t } of tables) for (const priv of PRIVS) {
+    assert.equal((await c.admin.query('SELECT has_table_privilege($1, $2, $3) AS h', ['si_reader', t, priv])).rows[0].h, false, `si_reader ${priv} ${t}`);
+  }
+  const fns = (await c.admin.query(`SELECT p.oid::regprocedure::text AS f FROM pg_proc p WHERE p.pronamespace = 'si'::regnamespace
+                                     AND has_function_privilege('si_reader', p.oid, 'EXECUTE')`)).rows.map(x => x.f);
+  assert.deepEqual(fns, ['si.si_read_evidence(text,text,integer)']);
+  assert.deepEqual((await c.admin.query(`SELECT setconfig FROM pg_db_role_setting WHERE setrole = 'si_reader'::regrole`)).rows, [], 'group settings are not inherited; principals carry their own');
 });

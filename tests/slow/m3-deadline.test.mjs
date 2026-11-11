@@ -97,7 +97,7 @@ test('slow: real rights deadlines — G3 bypass detected (INVALID), deferred pro
   }
   // VR-2h: invalid historical evidence (committed under 0006, verified after the upgrade).
   assert.deepEqual([H.t2, H.commit], ['COMPLETED', 'COMMIT']);
-  assert.deepEqual(await migrateUp(hist.admin), [7]);
+  assert.deepEqual(await migrateUp(hist.admin), [7, 8]);
   await hist.si_monitor.query('SELECT * FROM si.si_verify_receipts(100)');
   assert.equal((await verdict(hist, H.run.run_id)).verdict, 'INVALID');
   // VR-2m: the window-ignoring mutant computes VALID for the late commit (detected); the table CHECK
