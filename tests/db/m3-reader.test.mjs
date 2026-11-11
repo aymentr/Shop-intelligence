@@ -1,4 +1,5 @@
-// B-002 Milestone 3 part 3C (migration 0008): controlled internal evidence retrieval. Real disposable
+// B-002 Milestone 3 part 3C (migration 0008, read entry point replaced by 0009 / M3-AUD-01): controlled
+// internal evidence retrieval. Every read here first commits a read intent (si_begin_read). Real disposable
 // PostgreSQL 16, synthetic sources only. Reader principals are cluster roles created by the test
 // administrator through provisionReaderPrincipal (the documented provisioning path).
 //
@@ -21,7 +22,7 @@ import { readEvidence, grantReader, revokeReader, ReadFailed, MAX_READ_BYTES } f
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 const MIG7 = readFileSync(new URL('../../db/migrations/0007_receipt_verification.up.sql', import.meta.url), 'utf8');
-const MIG8 = readFileSync(new URL('../../db/migrations/0008_internal_reader.up.sql', import.meta.url), 'utf8');
+const MIG9 = readFileSync(new URL('../../db/migrations/0009_read_audit.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 const FIELDS = ['run_id', 'ordinal', 'collected_at', 'network', 'native_ad_id', 'advertiser_name', 'countries', 'seen_at', 'source_url',
                 'title', 'source_reported_first_seen', 'source_reported_last_seen', 'content_sha256', 'next_cursor'];
@@ -71,8 +72,14 @@ async function collect(x, src, rows) {
 const rows = (k, tag = 'r') => Array.from({ length: k }, (_, i) => ROW(`${tag}${++n}-${i}`));
 const verify = x => x.si_monitor.query('SELECT * FROM si.si_verify_receipts(500)');
 const grant = (x, p, src) => grantReader(x.si_rights_admin, p, src, 'internal synthetic evaluation (test)');
-const READ = 'SELECT * FROM si.si_read_evidence($1, $2, $3)';
-const read = async (c, src, cursor = null, limit = 100) => (await c.query(READ, [src, cursor, limit])).rows;
+// Two statements: a committed intent (autocommit on `via`, by default the same session), then the read.
+const BEGIN_READ = 'SELECT si.si_begin_read($1, $2, $3) AS id';
+const READ = 'SELECT * FROM si.si_read_evidence($1, $2, $3, $4)';
+const intent = async (c, src, cursor = null, limit = 100) => (await c.query(BEGIN_READ, [src, cursor, limit])).rows[0].id;
+const read = async (c, src, cursor = null, limit = 100, via = c) => {
+  const id = await intent(via, src, cursor, limit);
+  return (await c.query(READ, [src, id, cursor, limit])).rows;
+};
 async function replica(x, sql, params) {
   await x.admin.query('BEGIN');
   try { await x.admin.query('SET LOCAL session_replication_role = replica'); await x.admin.query(sql, params); await x.admin.query('COMMIT'); }
@@ -93,7 +100,7 @@ function mutate(text, from, to) {
   assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`);
   return text.replace(from, to);
 }
-const READ_FN = fnText(MIG8, 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
+const READ_FN = fnText(MIG9, 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
 const READABLE_FN = fnText(MIG7, 'CREATE FUNCTION si.si_evidence_readable', '$evidence_readable$;\n');
 const PAUSE_ANCHOR = '    END IF;\n    FOR rec IN';
 const withPause = fn => mutate(fn, PAUSE_ANCHOR,
@@ -136,7 +143,9 @@ test('RD-2: unauthorized principals and every service role get nothing; readers 
   const bob = await x.connect('si_reader_bob');
   await rejects(assert, read(bob, src), NOT_AUTH);
   for (const role of ['si_collector', 'si_rights_admin', 'si_retention', 'si_monitor']) {
-    await rejects(assert, read(x[role], src), { code: '42501', message: /permission denied for function si_read_evidence/ });
+    await rejects(assert, read(x[role], src), { code: '42501', message: /permission denied for function si_begin_read/ });
+    await rejects(assert, x[role].query(READ, [src, '00000000-0000-4000-8000-000000000000', null, 100]),
+                  { code: '42501', message: /permission denied for function si_read_evidence/ });
   }
   const alice = await x.connect('si_reader_alice');
   for (const sql of ['SELECT 1 FROM si.observations', 'SELECT 1 FROM si.ads', 'SELECT 1 FROM si.receipt_verifications', 'SELECT 1 FROM si.reader_grants',
@@ -332,8 +341,10 @@ test('RD-12: no impersonation through SET ROLE, non-dedicated principals or serv
     const evil = await x.connect('evil_reader');
     await rejects(assert, read(evil, src), NOT_AUTH, 'not a dedicated si_reader_<name> principal');
     await rejects(assert, grantReader(x.si_rights_admin, 'evil_reader', src, 'x'), { code: '23514', message: /^SI_READER_GRANT_REFUSED/ });
-    const fn = (await x.admin.query(`SELECT pg_get_function_identity_arguments('si.si_read_evidence'::regproc) AS a`)).rows[0].a;
-    assert.equal(fn, 'p_source_id text, p_cursor text, p_limit integer', 'no caller-supplied principal');
+    const fn = (await x.admin.query(`SELECT pg_get_function_identity_arguments('si.si_read_evidence'::regproc) AS a,
+                                            pg_get_function_identity_arguments('si.si_begin_read'::regproc) AS b`)).rows[0];
+    assert.deepEqual(fn, { a: 'p_source_id text, p_intent_id uuid, p_cursor text, p_limit integer', b: 'p_source_id text, p_cursor text, p_limit integer' },
+                     'no caller-supplied principal');
   } finally {
     await a.query('REVOKE si_reader_alice FROM si_reader_carol');
     await a.query('REVOKE si_reader FROM evil_reader');
@@ -362,9 +373,9 @@ test('RD-13: sessions that could log or hold work unboundedly are refused', asyn
 test('RD-14: collection, verification and purge are unchanged by grants and concurrent reads', async t => {
   const x = await fresh(t);
   const { src } = await ready(x, 2);
-  const alice = await x.connect('si_reader_alice');
+  const alice = await x.connect('si_reader_alice'), alice2 = await x.connect('si_reader_alice');
   await alice.query('BEGIN');
-  assert.equal((await read(alice, src)).length, 2);
+  assert.equal((await read(alice, src, null, 100, alice2)).length, 2, 'intent committed by another session of the same login');
   const run2 = await collect(x, src, rows(3));                                   // T2 while the reader's transaction is open
   assert.equal((await verify(x)).rows[0].valid, 1);
   await alice.query('COMMIT');
@@ -381,9 +392,10 @@ test('RD-14: collection, verification and purge are unchanged by grants and conc
 async function paused(x, src, who = 'si_reader_alice') {
   const c = await x.connect(who);
   const cp = await pid(c);
+  const id = await intent(c, src);
   await c.query(`SET si.test_pause = '1.5'`);
   const done = { at: null };
-  const p = settle(c.query(READ, [src, null, 100]).then(r => { done.at = performance.now(); return r.rows; }));
+  const p = settle(c.query(READ, [src, id, null, 100]).then(r => { done.at = performance.now(); return r.rows; }));
   for (let i = 0; ; i++) {
     const w = (await x.admin.query('SELECT wait_event FROM pg_stat_activity WHERE pid = $1', [cp])).rows[0];
     if (w?.wait_event === 'PgSleep') break;
@@ -483,9 +495,9 @@ test('RC-9 (gates): an open reader transaction never holds the source; concurren
   const x = await fresh(t);
   const srcs = [];
   for (let i = 0; i < 2; i++) srcs.push((await ready(x, 50)).src);
-  const alice = await x.connect('si_reader_alice'), ra = await x.connect('si_rights_admin');
+  const alice = await x.connect('si_reader_alice'), ra = await x.connect('si_rights_admin'), alice2 = await x.connect('si_reader_alice');
   await alice.query('BEGIN');
-  assert.equal((await read(alice, srcs[0])).length, 50);
+  assert.equal((await read(alice, srcs[0], null, 100, alice2)).length, 50);
   const t0 = performance.now();
   await control(ra, srcs[0], 'SUSPEND');                                         // the reader's transaction is still open
   const openTxnWait = performance.now() - t0;
@@ -506,10 +518,13 @@ test('RC-9 (gates): an open reader transaction never holds the source; concurren
 
 // ------------------------------------------------------------------------------------------------
 // Negative-control mutants.
-async function scnGrant(x) {                                 // detected = a principal without a grant reads
+async function scnGrant(x) {                                 // detected = a principal whose grant was revoked reads
   const { src } = await ready(x, 1);
+  await grant(x, 'si_reader_bob', src);
   const bob = await x.connect('si_reader_bob');
-  const r = await settle(read(bob, src));
+  const id = await intent(bob, src);                         // committed while the grant was active
+  await revokeReader(x.si_rights_admin, 'si_reader_bob', src, 'revoked between intent and read');
+  const r = await settle(bob.query(READ, [src, id, null, 100]).then(q => q.rows));
   return r.status === 'ok' && r.value.length > 0;
 }
 async function scnVerdict(x) {                               // detected = UNVERIFIABLE evidence is returned
@@ -541,8 +556,8 @@ async function scnCap(x) {                                   // detected = a pag
   await verify(x);
   await grant(x, 'si_reader_alice', src);
   const r = await settle(read(await x.connect('si_reader_alice'), src, null, 100));
-  // Second, independent layer: the access-log CHECK refuses to record a page above the cap.
-  if (r.status !== 'ok') return r.code === '23514' && /reader_access_log_bytes_returned_check/.test(r.message);
+  // Second, independent layer: the intent and access-log CHECKs refuse to record a page above the cap.
+  if (r.status !== 'ok') return r.code === '23514' && /(read_intents|reader_access_log)_bytes_returned_check/.test(r.message);
   const page = r.value;
   const bytes = (await x.admin.query('SELECT sum(octet_length(row_to_json(r)::text))::int AS b FROM jsonb_populate_recordset(NULL::si.evidence_read_row, $1::jsonb) r',
     [JSON.stringify(page)])).rows[0].b;

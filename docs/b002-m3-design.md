@@ -96,6 +96,7 @@ content read or serving.
 | FD15 | **ACCEPTED with M3-P3B** — BD1 amendment | Definer allowlist × grantees gains: `si_monitor` → `si_verify_receipts`, `si_record_verification_failure`, `si_verification_status`, `si_verification_failures`. No table grant on `si.receipt_verifications` / `si.verification_failures`; `si_evidence_readable`, `si_receipt_verdict`, `si_commit_ts` granted to no role. |
 | FD16 | APPROVED (M3-P3C mission); IMPLEMENTED in 0008 | **Internal reader grant** — a concept separate from source-content display rights: an explicit, revocable, per-principal, per-source permission for internal synthetic evaluation (`purpose = INTERNAL_SYNTHETIC_EVALUATION`). It never implies `subscriber_display`, `export` or `media_mirror`, which stay DENIED/UNKNOWN by constraint and unchanged. Destination and creative URLs are excluded initially. |
 | FD17 | **ACCEPTED with M3-P3C** — BD1 amendment | `si_reader` (NOLOGIN group of `si_reader_<name>` principals) → EXECUTE `si_read_evidence` only; `si_rights_admin` → `si_grant_reader`, `si_revoke_reader`, SELECT `si.reader_grants`; `si_monitor` → SELECT `si.reader_grants`, `si.reader_access_log`. No evidence-table privilege for any role. |
+| FD18 | **PROPOSED (M3-AUD-01) — pending founder decision; implemented on branch `claude/b002-m3-aud-01` for review** | Durable read audit (`docs/b002-m3-audit.md`): (a) the audit standard is "committed request recorded before release; delivery unknown", not a count of deliveries; (b) intent lifetime 60 s, single use once consumed; (c) the intent is bound to login and exact scope (source, cursor digest, limit); (d) breaking signature change: `si_read_evidence(text, text, int)` is removed and replaced by `si_read_evidence(text, uuid, text, int)`; (e) no out-of-band log copy and no log shipping yet; (f) BD1 amendment: `si_reader` → EXECUTE `si_begin_read`; `si_monitor` → SELECT `si.read_intents`. No evidence-table privilege for any role. |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -952,3 +953,16 @@ See `docs/b002-m3-demo.md`: the real implementation, end to end, against a fresh
 16.15 container, with negative controls and the demonstration's own mutants; no schema change. Finding:
 the reader access log is transactional (A1); a production-safe audit design (committed intent before
 data) is proposed there and needs a separate decision.
+
+## 16. Durable audit before evidence retrieval (M3-AUD-01, migration 0009) — IMPLEMENTED, pending independent acceptance
+
+See `docs/b002-m3-audit.md`. Every internal read now has two steps:
+1. `si_begin_read` commits a scoped read intent (login, source, cursor digest, limit).
+2. `si_read_evidence(source, intent, cursor, limit)` returns evidence only for a committed, open, unexpired intent with that exact binding. It then re-applies every 0008 check, including D8/G3 through `si_evidence_readable`, and consumes the intent.
+
+The 0008 three-argument read is removed. A caller-side rollback no longer erases the audit record of returned data, which closes A1 (regression: AUD-2, demonstration A1).
+
+Lock order is unchanged: no FK to sources, and the intent row lock is taken only after the source lock is released.
+
+Decisions: FD18 (PROPOSED). Limitations: `docs/b002-m3-audit.md` §6. The rights model, synthetic-only scope and every other blocker in §10 are unchanged.
+

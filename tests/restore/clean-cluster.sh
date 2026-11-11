@@ -192,4 +192,11 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^RD-(1|2|7|12):' tests/db/m3-reader.test.mjs
 echo 'DR-1 restored internal reads, reader privileges and grant semantics PASS'
+# Migration 0009 on the restored cluster: committed read intents survive a caller rollback, bind identity
+# and scope, and no reader entry point returns evidence without one.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^AUD-(2|4|8)( |:)' tests/db/m3-audit.test.mjs
+echo 'DR-1 restored durable read audit (A1 regression), intent binding and reader entry points PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

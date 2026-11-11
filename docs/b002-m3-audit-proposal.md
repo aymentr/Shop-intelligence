@@ -1,6 +1,6 @@
 # M3-AUD-01 — durable read audit (proposal, not implemented)
 
-**Status: PROPOSAL for a founder decision. Nothing in this document is implemented.** Baseline:
+**Status: PROPOSAL for a founder decision.** The implementation now on branch `claude/b002-m3-aud-01` (migration 0009) is described in `docs/b002-m3-audit.md`, with its differences from this proposal in §8 there; it is pending independent acceptance. The original proposal text follows unchanged. Baseline:
 a0b63183f3c0e16f187287a42d2ab6c9ab5d01fd (migrations 0001–0008). Written for M3-CLOSE-01.
 
 ## 1. Problem (A1, reproduced)

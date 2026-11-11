@@ -1,6 +1,7 @@
-// Shop Intelligence — M3-P3D: complete synthetic evidence lifecycle demonstration.
+// Shop Intelligence — M3-P3D: complete synthetic evidence lifecycle demonstration (updated for M3-AUD-01:
+// every read commits a read intent first).
 //
-// Drives the REAL implementation (migrations 0001-0008 and the persistence library in dist/) against a
+// Drives the REAL implementation (migrations 0001-0009 and the persistence library in dist/) against a
 // disposable PostgreSQL 16.15 server started by demo/run.sh. Synthetic data only: the B-001 fixture
 // (fixtures/synthetic-ads.json), normalized by the existing B-001 parser and deterministically expanded
 // (identity suffixes only) where a scenario needs more records. No network collection, no live source.
@@ -25,7 +26,7 @@ import { checkOperationalPreconditions, checkCollectorLogging } from '../dist/pe
 import { fixtureSha256, requestSha256 } from '../dist/persistence/request-hash.js';
 import { t1PreflightScoped, completeRunWithEvidence, T2Refused } from '../dist/persistence/runs.js';
 import { verifyReceipts, verificationStatus } from '../dist/persistence/verification.js';
-import { readEvidence, grantReader, revokeReader, ReadFailed } from '../dist/persistence/reader.js';
+import { beginRead, readEvidence, grantReader, revokeReader, ReadFailed } from '../dist/persistence/reader.js';
 import { purgeDue, retentionStatus } from '../dist/persistence/retention.js';
 
 const REPO = fileURLToPath(new URL('../', import.meta.url));
@@ -67,7 +68,8 @@ const report = {
     verification: { valid: 0, invalid: 0, unverifiable: 0 },
     reads: { authorized_calls: 0, records_returned: 0, denied_calls: {} },
     purge: { runs: 0, observations: 0, identities: 0 },
-    audit: { purge_log_records: 0, reader_access_records: 0, access_records_lost_on_rollback: 0, verification_records: 0 }
+    audit: { purge_log_records: 0, reader_access_records: 0, read_intents: 0, read_intents_consumed: 0, audit_records_lost_on_rollback: 0,
+             completion_rows_lost_on_rollback: 0, verification_records: 0 }
   },
   timings_ms: {}, resources: {}, fixtures_used: [], limitations: []
 };
@@ -183,8 +185,12 @@ function fnText(file, start, end) {
 }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, 'mutation anchor'); return text.replace(from, to); }
 const MUTANTS = {
-  grant: () => mutate(fnText('0008_internal_reader.up.sql', 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;'),
-    'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g'),
+  // Both reader entry points check the grant (0009): the mutant disables it in both.
+  grant: () => [
+    mutate(fnText('0009_read_audit.up.sql', 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;'),
+      'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g'),
+    mutate(fnText('0009_read_audit.up.sql', 'CREATE FUNCTION si.si_begin_read', 'END $begin_read$;'),
+      '     OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', '     OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g')].join('\n'),
   retention: () => mutate(fnText('0007_receipt_verification.up.sql', 'CREATE FUNCTION si.si_evidence_readable', '$evidence_readable$;\n'),
     '       AND n.t + si.si_publish_margin() < si.si_effective_retention_end(r.source_id, v.version, r.retain_until)\n', ''),
   verdict: () => mutate(fnText('0007_receipt_verification.up.sql', 'CREATE FUNCTION si.si_evidence_readable', '$evidence_readable$;\n'),
@@ -206,7 +212,7 @@ try {
     const t0 = performance.now();
     const applied = await migrateUp(mig);
     time('migrations', performance.now() - t0);
-    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8], 'the real migrations 0001-0008 are applied by the least-privilege migrator');
+    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9], 'the real migrations 0001-0009 are applied by the least-privilege migrator');
     report.schema_version = codeSchemaVersion();
     report.postgres_version = (await A.query('SHOW server_version')).rows[0].server_version;
     assert.match(report.postgres_version, /^16\./, 'PostgreSQL 16');
@@ -424,9 +430,11 @@ try {
   });
   await scenario('N12', 'An excessive read limit is refused (library before sending; database as well)', 'negative', async () => {
     assert.equal(await denied(readEvidence(rd, S2, { limit: 101 })), 'BAD_ARGUMENT', 'library refuses');
-    let code = null;
-    try { await rd.query('SELECT * FROM si.si_read_evidence($1, NULL, 101)', [S2]); } catch (e) { code = e.code; }
-    assert.equal(code, '22023', 'database refuses (SQLSTATE only reported)');
+    const codes = [];
+    for (const sql of ['SELECT si.si_begin_read($1, NULL, 101)', 'SELECT * FROM si.si_read_evidence($1, NULL::uuid, NULL, 101)']) {
+      try { await rd.query(sql, [S2]); codes.push('none'); } catch (e) { codes.push(e.code); }
+    }
+    assert.deepEqual(codes, ['22023', '22023'], 'database refuses at the intent and at the read (SQLSTATE only reported)');
   });
   await scenario('N13', 'Unsafe logging configurations are refused before any payload or read', 'negative', async () => {
     await A.query(`ALTER ROLE si_collector IN DATABASE ${DB} SET log_parameter_max_length = -1`);
@@ -458,20 +466,48 @@ try {
     assert.deepEqual([p.outcome, p.runsPurged, p.identitiesPurged], ['PURGED', 1, 1], 'purged afterwards; the shared identity is kept');
   });
 
-  // ---------------------------------------------------------------- auditability (known weakness)
-  await scenario('A1', 'KNOWN WEAKNESS: a successful read inside a transaction that rolls back loses its access record', 'audit', async () => {
-    const count = async () => (await A.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n;
+  // ---------------------------------------------------------------- auditability (M3-AUD-01; A1 in M3-P3D)
+  const intentCount = async () => (await A.query('SELECT count(*)::int AS n FROM si.read_intents')).rows[0].n;
+  await scenario('A1', 'Durable audit: a read inside a transaction that rolls back keeps its committed audit record (was the A1 weakness)', 'audit', async () => {
+    const logCount = async () => (await A.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n;
     const s = await mk('demo-audit'); await collect(col, s, expand(3, 'a')); await verifyAll(mon);
-    await grantReader(ra, READER, s, 'audit weakness demonstration');
-    const before = await count();
+    await grantReader(ra, READER, s, 'durable audit demonstration');
+    const [intentsBefore, logBefore] = [await intentCount(), await logCount()];
+    const intentId = await beginRead(rd, s);                         // autocommit: the audit record commits first
     await rd.query('BEGIN');
-    const p = await readEvidence(rd, s);
+    const p = await readEvidence(rd, s, { intentId });
     await rd.query('ROLLBACK');
-    const after = await count();
     assert.ok(p.records.length > 0, 'the reader did receive records');
-    assert.equal(after, before, 'the access record was lost with the rollback (weakness demonstrated, not hidden)');
-    report.counts.audit.access_records_lost_on_rollback += 1;
-    return { records_received: p.records.length, access_records_written: after - before };
+    assert.equal(await intentCount() - intentsBefore, 1, 'the committed intent survived the rollback');
+    const st = (await A.query('SELECT principal, source_id, state FROM si.read_intents WHERE intent_id = $1', [intentId])).rows[0];
+    assert.deepEqual(st, { principal: READER, source_id: s, state: 'OPEN' }, 'bound to the reader and the source; outcome unknown');
+    assert.equal(await logCount(), logBefore, 'only the best-effort completion row rolled back');
+    await rd.query('BEGIN');
+    const inside = await denied(readEvidence(rd, s));
+    await rd.query('ROLLBACK');
+    assert.equal(inside, 'INTENT_UNCOMMITTED', 'an intent that is not committed releases nothing');
+    report.counts.audit.completion_rows_lost_on_rollback += 1;
+    return { records_received: p.records.length, durable_intents_written: 1, audit_records_lost: 0 };
+  });
+
+  await scenario('A2', 'Revocation between the committed intent and the read is enforced; the intent is single-use and a failed read may be retried', 'audit', async () => {
+    const s = await mk('demo-audit-2'); await collect(col, s, expand(2, 'r')); await verifyAll(mon);
+    await grantReader(ra, READER, s, 'revocation between steps');
+    const revoked = await beginRead(rd, s);
+    await revokeReader(ra, READER, s, 'revoked between the intent and the read');
+    assert.equal(await denied(readEvidence(rd, s, { intentId: revoked })), 'NOT_AUTHORIZED', 'a committed intent does not override revocation');
+    await grantReader(ra, READER, s, 'granted again');
+    await ra.query('BEGIN');
+    await control(ra, s, 'SUSPEND');
+    let busy = null;
+    try { await readEvidence(rd, s); } catch (e) { busy = e; }
+    await ra.query('ROLLBACK');
+    assert.ok(busy instanceof ReadFailed && busy.code === 'BUSY' && busy.retryable, 'BUSY while a control is in progress; retryable');
+    deny(busy.code);
+    const retried = await readEvidence(rd, s, { intentId: busy.intentId });
+    report.counts.reads.authorized_calls++; report.counts.reads.records_returned += retried.records.length;
+    assert.equal(retried.records.length, 2, 'the retry with the same committed intent reads');
+    assert.equal(await denied(readEvidence(rd, s, { intentId: busy.intentId })), 'INTENT_USED', 'a consumed intent is final');
   });
 
   // ---------------------------------------------------------------- real deadline (INVALID)
@@ -501,8 +537,14 @@ try {
 
   // ---------------------------------------------------------------- final counts
   const audit = (await A.query(`SELECT (SELECT count(*)::int FROM si.purge_log) AS p, (SELECT count(*)::int FROM si.reader_access_log) AS a,
-                                       (SELECT count(*)::int FROM si.receipt_verifications) AS v`)).rows[0];
-  Object.assign(report.counts.audit, { purge_log_records: audit.p, reader_access_records: audit.a, verification_records: audit.v });
+                                       (SELECT count(*)::int FROM si.receipt_verifications) AS v, (SELECT count(*)::int FROM si.read_intents) AS i,
+                                       (SELECT count(*)::int FROM si.read_intents WHERE state = 'CONSUMED') AS ic,
+                                       (SELECT count(*)::int FROM si.reader_access_log l WHERE NOT EXISTS (
+                                          SELECT 1 FROM si.read_intents r WHERE r.intent_id = l.intent_id
+                                            AND r.principal = l.principal AND r.source_id = l.source_id)) AS orphan`)).rows[0];
+  assert.equal(audit.orphan, 0, 'every completion record names a committed intent of the same reader and source');
+  Object.assign(report.counts.audit, { purge_log_records: audit.p, reader_access_records: audit.a, verification_records: audit.v,
+                                       read_intents: audit.i, read_intents_consumed: audit.ic });
   const vs = await verificationStatus(mon);
   report.counts.verification = { valid: vs.valid, invalid: vs.invalid, unverifiable: vs.unverifiable, pending: vs.pending };
   report.resources = { node_rss_mb: Math.round(process.memoryUsage().rss / 1048576),
@@ -518,7 +560,7 @@ report.duration_ms = Date.now() - started;
 report.limitations = [
   'Synthetic evidence only; no live source, no real advertising data, no network collection.',
   'Retention is advanced and one identity is disturbed by labelled superuser fixtures; superusers are outside the trust boundary.',
-  'The reader access log is transactional: a read inside a transaction that rolls back loses its record (A1).',
+  'Reads commit a scoped read intent before any evidence is released (M3-AUD-01). An intent proves an authorized request, not delivery; the completion row is best-effort.',
   'Internal evaluation reads only. Subscriber display, export and media mirroring are DENIED by the rights model; there is no customer-facing interface.',
   'D8/G3 still needs independent verification; D5b is not applied (no production host); production startup enforcement does not exist.',
   'Timings come from a disposable PostgreSQL 16 container and are not production measurements.',

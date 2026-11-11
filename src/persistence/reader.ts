@@ -1,7 +1,17 @@
 /**
- * Internal evidence retrieval (migration 0008). Internal synthetic evaluation only: no HTTP endpoint,
- * no export, no customer display. The caller's session must be a dedicated reader principal
+ * Internal evidence retrieval (migrations 0008 and 0009). Internal synthetic evaluation only: no HTTP
+ * endpoint, no export, no customer display. The caller's session must be a dedicated reader principal
  * (si_reader_<name>) with an active grant for the source; the database decides everything else.
+ *
+ * Every read is two statements (M3-AUD-01, migration 0009):
+ *   1. beginRead records a read intent for this login and the exact scope (source, cursor, limit). It
+ *      must COMMIT on its own, so call it on a client that is not inside a transaction. If it fails, or
+ *      its outcome is unknown (connection lost), nothing is read.
+ *   2. The read returns evidence only for a committed, open, unexpired intent of the same login and
+ *      scope, re-checks every authorization, and consumes the intent.
+ * A committed intent proves an authorized request, not delivery. Retry: after BUSY or CONNECTION the
+ * same intent may be retried (same scope) until it expires or is consumed (`retryable`); after
+ * INTENT_USED or INTENT_EXPIRED a new intent is needed; NOT_AUTHORIZED is final.
  *
  * Returned records are given to the caller and are never logged here; failures are a fixed code plus
  * the SQLSTATE, never PostgreSQL text. Destination and creative URLs are not part of the interface.
@@ -30,14 +40,16 @@ export interface EvidenceRecord {
 export interface EvidencePage { records: EvidenceRecord[]; nextCursor: string | null }
 
 export type ReadFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'NOT_AUTHORIZED' | 'UNSAFE_SESSION' | 'BUSY' | 'ISOLATION' |
-  'CONNECTION' | 'INTERNAL';
+  'INTENT_INVALID' | 'INTENT_UNCOMMITTED' | 'INTENT_USED' | 'INTENT_EXPIRED' | 'CONNECTION' | 'INTERNAL';
 
-/** Fixed message only: `READ_FAILED: <code>`. */
+/** Fixed message only: `READ_FAILED: <code>`. `intentId` is set when a committed intent exists for the failed read. */
 export class ReadFailed extends Error {
-  constructor(readonly code: ReadFailureCode, readonly sqlstate: string | null) {
+  constructor(readonly code: ReadFailureCode, readonly sqlstate: string | null, readonly intentId: string | null = null) {
     super(`READ_FAILED: ${code}`);
     this.name = 'ReadFailed';
   }
+  /** True when the same intent may be retried for the same scope (until it expires or is consumed). */
+  get retryable(): boolean { return this.intentId !== null && (this.code === 'BUSY' || this.code === 'CONNECTION'); }
 }
 
 function sqlstateOf(err: unknown): string | null {
@@ -51,6 +63,10 @@ function messageCode(err: unknown): string {
 
 export function classifyReadError(err: unknown): ReadFailureCode {
   const s = sqlstateOf(err), m = messageCode(err);
+  if (m === 'SI_READ_INTENT_INVALID') return 'INTENT_INVALID';
+  if (m === 'SI_READ_INTENT_UNCOMMITTED') return 'INTENT_UNCOMMITTED';
+  if (m === 'SI_READ_INTENT_USED') return 'INTENT_USED';
+  if (m === 'SI_READ_INTENT_EXPIRED') return 'INTENT_EXPIRED';
   if (m === 'SI_READ_BAD_CURSOR') return 'BAD_CURSOR';
   if (m === 'SI_READ_BAD_ARGUMENT') return 'BAD_ARGUMENT';
   if (m === 'SI_READ_UNSAFE_SESSION') return 'UNSAFE_SESSION';
@@ -64,23 +80,54 @@ export function classifyReadError(err: unknown): ReadFailureCode {
 const SOURCE_ID = /^[a-z0-9][a-z0-9-]{1,62}$/;
 const iso = (v: unknown): string | null => (v instanceof Date ? v.toISOString() : null);
 
-/**
- * One bounded page (at most `limit` records and MAX_READ_BYTES) in its own statement. Pass the
- * returned nextCursor to continue; an empty page (nextCursor null) means nothing more is readable now.
- */
-export async function readEvidence(client: ClientBase, sourceId: string,
-  opts: { cursor?: string | null; limit?: number } = {}): Promise<EvidencePage> {
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export interface ReadScope { cursor?: string | null; limit?: number }
+function scopeOf(sourceId: string, opts: ReadScope): { cursor: string | null; limit: number } {
   const limit = opts.limit ?? DEFAULT_READ_RECORDS;
   if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId) || !Number.isInteger(limit) || limit < 1 || limit > MAX_READ_RECORDS) {
     throw new ReadFailed('BAD_ARGUMENT', null);
   }
   const cursor = opts.cursor ?? null;
   if (cursor !== null && (typeof cursor !== 'string' || cursor.length > 160)) throw new ReadFailed('BAD_CURSOR', null);
-  let rows: Record<string, unknown>[];
+  return { cursor, limit };
+}
+
+/**
+ * Step 1: record a read intent for exactly this scope and return its id. It is usable only after this
+ * statement commits, so the client must not be inside a transaction (an intent created inside one is
+ * refused by the read as INTENT_UNCOMMITTED). Throws ReadFailed; on any failure nothing may be read.
+ */
+export async function beginRead(client: ClientBase, sourceId: string, opts: ReadScope = {}): Promise<string> {
+  const { cursor, limit } = scopeOf(sourceId, opts);
+  let id: unknown;
   try {
-    rows = (await client.query('SELECT * FROM si.si_read_evidence($1, $2, $3::int)', [sourceId, cursor, limit])).rows;
+    id = (await client.query('SELECT si.si_begin_read($1, $2, $3::int) AS id', [sourceId, cursor, limit])).rows[0]?.id;
   } catch (err) {
     throw new ReadFailed(classifyReadError(err), sqlstateOf(err));
+  }
+  if (typeof id !== 'string' || !UUID.test(id)) throw new ReadFailed('INTERNAL', null);
+  return id;
+}
+
+/**
+ * One bounded page (at most `limit` records and MAX_READ_BYTES). Without `intentId` it first records a
+ * committed intent (beginRead); with `intentId` it retries that intent, which must match the scope.
+ * Pass the returned nextCursor to continue; an empty page (nextCursor null) means nothing more is
+ * readable now.
+ */
+export async function readEvidence(client: ClientBase, sourceId: string,
+  opts: ReadScope & { intentId?: string } = {}): Promise<EvidencePage & { intentId: string }> {
+  const { cursor, limit } = scopeOf(sourceId, opts);
+  if (opts.intentId !== undefined && (typeof opts.intentId !== 'string' || !UUID.test(opts.intentId))) {
+    throw new ReadFailed('INTENT_INVALID', null);
+  }
+  const intentId = opts.intentId ?? await beginRead(client, sourceId, { cursor, limit });
+  let rows: Record<string, unknown>[];
+  try {
+    rows = (await client.query('SELECT * FROM si.si_read_evidence($1, $2::uuid, $3, $4::int)', [sourceId, intentId, cursor, limit])).rows;
+  } catch (err) {
+    throw new ReadFailed(classifyReadError(err), sqlstateOf(err), intentId);
   }
   const records = rows.map(r => ({
     runId: String(r.run_id), ordinal: Number(r.ordinal), collectedAt: iso(r.collected_at) ?? '', network: String(r.network),
@@ -91,7 +138,7 @@ export async function readEvidence(client: ClientBase, sourceId: string,
   }));
   const last = rows.length > 0 ? rows[rows.length - 1]?.next_cursor : null;
   // A page can be short because of the byte cap, so the end is an empty page, not a short one.
-  return { records, nextCursor: typeof last === 'string' ? last : null };
+  return { records, nextCursor: typeof last === 'string' ? last : null, intentId };
 }
 
 /** si_rights_admin: grant one reader principal internal access to one source. */

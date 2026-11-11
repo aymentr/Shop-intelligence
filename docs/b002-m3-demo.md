@@ -3,7 +3,7 @@
 **Status: implemented, pending independent acceptance. Synthetic data only. Not a product, not a
 production deployment, not customer-facing.**
 
-The demonstration drives the **real** implementation — migrations 0001–0008 applied by the
+The demonstration drives the **real** implementation — migrations 0001–0009 applied by the
 least-privilege migrator, and the persistence library in `src/persistence/` — against a fresh,
 disposable PostgreSQL 16.15 container. It contains no business logic of its own: the database and the
 library decide every outcome; the demonstration only calls them and asserts the results.
@@ -45,7 +45,7 @@ un-normalized fixture is itself the invalid batch of N3. There is no network col
 
 | ID | Scenario | Proves (real implementation) |
 |---|---|---|
-| E1 | Environment | Migrations 0001–0008 applied by `si_migrator`; PostgreSQL 16; D7 operational preconditions; safe collector logging |
+| E1 | Environment | Migrations 0001–0009 applied by `si_migrator`; PostgreSQL 16; D7 operational preconditions; safe collector logging |
 | H1 | Synthetic source | A SYNTHETIC source with two networks (inserted as `si_owner`: sources have no write function) |
 | H2 | Rights | `si_record_rights_version`: evaluation and retention ALLOWED; display, mirroring, export DENIED; valid for publication |
 | H3 | Scoped run | Scoped T1 binds the request to the fixture hash and records the network scope |
@@ -70,15 +70,18 @@ un-normalized fixture is itself the invalid batch of N3. There is no network col
 | N9 | Terminated | Nothing is returned after TERMINATE_RETENTION; the evidence is purged |
 | N10 | Revoked grant | Refused, including with a cursor obtained before the revocation |
 | N11 | Invalid cursor | Refused with BAD_CURSOR |
-| N12 | Read limit | 101 refused by the library before sending, and by the database (SQLSTATE only) |
+| N12 | Read limit | 101 refused by the library before sending, and by the database at both the intent and the read (SQLSTATE only) |
 | N13 | Unsafe logging | A collector session that could log parameters is refused before any payload; a reader session without a statement bound is refused |
 | N14 | Purge vs completion | A purge skips a source held by a completion (BUSY) — no foreign-key error — and purges it afterwards, keeping the shared identity |
-| A1 | Audit weakness | See §5 (demonstrated, not hidden) |
+| A1 | Durable audit (M3-AUD-01) | A read inside a transaction that rolls back keeps its **committed** read intent (bound to the reader and the source); only the best-effort completion row rolls back. A read whose intent is not committed releases nothing (INTENT_UNCOMMITTED). Until M3-AUD-01 this scenario demonstrated the A1 weakness (§5) |
+| A2 | Intent vs. current authorization | Revocation between the committed intent and the read is enforced (NOT_AUTHORIZED); BUSY during a control is retryable with the same intent; a consumed intent is final (INTENT_USED) |
 | L1 | Logs | No fixture value appears in the server log |
 
 **Negative control of the demonstration itself** (`demo/run-mutants.sh`): with the reader grant check,
 the retention check or the verdict check disabled in the disposable database, the demonstration fails
-(grant → H11, H13, N1, N2, N10; retention → N7; verdict → N6).
+(grant → H11, H13, N1, N2, N10, A2 — the grant check is disabled in both reader entry points since 0009;
+retention → N7; verdict → N6). The final audit check also requires every completion record to name a
+committed intent of the same reader and source.
 
 **Fixtures no product path can perform** (named in the report): the demo superuser ages a stored
 retention deadline (H12, N7, N14) and disturbs one receipt identity (N6) under
@@ -96,7 +99,11 @@ retention deadline (H12, N7, N14) and disturbs one receipt identity (N6) under
   under production load, replication, backup/restore cycles beyond DR-1, or clock faults; scheduling of
   verification and purge; operational logging outside PostgreSQL.
 
-## 5. Auditability: known weakness and proposed design (not implemented)
+## 5. Auditability: the A1 weakness and its resolution
+
+**Update (M3-AUD-01, migration 0009):** the design below is now implemented. See `docs/b002-m3-audit.md` for the
+contract, its differences from this outline, and the residual limitations. Scenario A1 now demonstrates the durable
+audit. The original M3-P3D text follows for the record.
 
 **Weakness (A1).** `si.reader_access_log` is written inside the read's transaction. A reader that wraps
 a successful read in `BEGIN … ROLLBACK` receives the records while the access record disappears. The
