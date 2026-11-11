@@ -101,8 +101,11 @@ on every production database (D-M2-09).
 ## Next gates
 
 1. Test rights semantics against actual platform/source agreements before enabling any live adapter.
-2. Close D8/G3 (commit-time verification and a fail-closed read gate) before any evidence read path.
+2. Independently verify D8/G3. Commit-time verification (0007) and an internal, synthetic-only read gate (0008)
+   exist, but no independent review has been performed. Make the read audit durable (M3-AUD-01: the access log is
+   lost when a read rolls back) before any pilot with real evidence. No customer display path is authorized.
 3. Obtain explicitly permitted API credentials and source-specific integration tests.
 4. Measure real record quality by country/network without claiming completeness.
 
-See `docs/architecture.md` and `docs/acceptance.md`.
+See `docs/architecture.md` and `docs/acceptance.md`. Milestone 3 closure review: `docs/b002-m3-closure.md`,
+`docs/b002-m3-risk-register.md`, `docs/b002-m3-audit-proposal.md`, `docs/b002-m4-options.md`.
