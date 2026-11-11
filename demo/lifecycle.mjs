@@ -68,8 +68,10 @@ const report = {
     verification: { valid: 0, invalid: 0, unverifiable: 0 },
     reads: { authorized_calls: 0, records_returned: 0, denied_calls: {} },
     purge: { runs: 0, observations: 0, identities: 0 },
-    audit: { purge_log_records: 0, reader_access_records: 0, read_intents: 0, read_intents_consumed: 0, audit_records_lost_on_rollback: 0,
-             completion_rows_lost_on_rollback: 0, verification_records: 0 }
+    // Measured, never assumed: A1 counts what a caller rollback removed. Request records are the committed
+    // read intents; release records are the consumption mark and the completion row (not rollback-resistant).
+    audit: { purge_log_records: 0, reader_access_records: 0, read_intents: 0, read_intents_consumed: 0,
+             request_records_lost_on_rollback: null, release_records_lost_on_rollback: null, verification_records: 0 }
   },
   timings_ms: {}, resources: {}, fixtures_used: [], limitations: []
 };
@@ -187,7 +189,7 @@ function mutate(text, from, to) { assert.equal(text.split(from).length, 2, 'muta
 const MUTANTS = {
   // Both reader entry points check the grant (0009): the mutant disables it in both.
   grant: () => [
-    mutate(fnText('0009_read_audit.up.sql', 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;'),
+    mutate(fnText('0010_read_durability.up.sql', 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;'),
       'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g'),
     mutate(fnText('0009_read_audit.up.sql', 'CREATE FUNCTION si.si_begin_read', 'END $begin_read$;'),
       '     OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', '     OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g')].join('\n'),
@@ -212,7 +214,7 @@ try {
     const t0 = performance.now();
     const applied = await migrateUp(mig);
     time('migrations', performance.now() - t0);
-    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9], 'the real migrations 0001-0009 are applied by the least-privilege migrator');
+    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'the real migrations 0001-0010 are applied by the least-privilege migrator');
     report.schema_version = codeSchemaVersion();
     report.postgres_version = (await A.query('SHOW server_version')).rows[0].server_version;
     assert.match(report.postgres_version, /^16\./, 'PostgreSQL 16');
@@ -468,12 +470,12 @@ try {
 
   // ---------------------------------------------------------------- auditability (M3-AUD-01; A1 in M3-P3D)
   const intentCount = async () => (await A.query('SELECT count(*)::int AS n FROM si.read_intents')).rows[0].n;
-  await scenario('A1', 'Durable audit: a read inside a transaction that rolls back keeps its committed audit record (was the A1 weakness)', 'audit', async () => {
+  await scenario('A1', 'Request audit only: a caller rollback keeps the committed request record but erases the release record (no disclosure audit)', 'audit', async () => {
     const logCount = async () => (await A.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n;
     const s = await mk('demo-audit'); await collect(col, s, expand(3, 'a')); await verifyAll(mon);
-    await grantReader(ra, READER, s, 'durable audit demonstration');
+    await grantReader(ra, READER, s, 'request audit demonstration');
     const [intentsBefore, logBefore] = [await intentCount(), await logCount()];
-    const intentId = await beginRead(rd, s);                         // autocommit: the audit record commits first
+    const intentId = await beginRead(rd, s);                         // autocommit: the request record commits (and is flushed) first
     await rd.query('BEGIN');
     const p = await readEvidence(rd, s, { intentId });
     await rd.query('ROLLBACK');
@@ -481,13 +483,18 @@ try {
     assert.equal(await intentCount() - intentsBefore, 1, 'the committed intent survived the rollback');
     const st = (await A.query('SELECT principal, source_id, state FROM si.read_intents WHERE intent_id = $1', [intentId])).rows[0];
     assert.deepEqual(st, { principal: READER, source_id: s, state: 'OPEN' }, 'bound to the reader and the source; outcome unknown');
-    assert.equal(await logCount(), logBefore, 'only the best-effort completion row rolled back');
     await rd.query('BEGIN');
     const inside = await denied(readEvidence(rd, s));
     await rd.query('ROLLBACK');
     assert.equal(inside, 'INTENT_UNCOMMITTED', 'an intent that is not committed releases nothing');
-    report.counts.audit.completion_rows_lost_on_rollback += 1;
-    return { records_received: p.records.length, durable_intents_written: 1, audit_records_lost: 0 };
+    const requestLost = 1 - (await intentCount() - intentsBefore);                // measured
+    const releaseLost = 1 - (await logCount() - logBefore);                       // measured: the release was not recorded
+    report.counts.audit.request_records_lost_on_rollback = requestLost;
+    report.counts.audit.release_records_lost_on_rollback = releaseLost;
+    assert.equal(requestLost, 0, 'request record kept');
+    assert.equal(releaseLost, 1, 'release record lost: rollback-resistant release accounting is NOT IMPLEMENTED');
+    return { records_received: p.records.length, request_records_lost: requestLost, release_records_lost: releaseLost,
+             disclosure_audit: 'NOT GUARANTEED' };
   });
 
   await scenario('A2', 'Revocation between the committed intent and the read is enforced; the intent is single-use and a failed read may be retried', 'audit', async () => {
@@ -560,7 +567,7 @@ report.duration_ms = Date.now() - started;
 report.limitations = [
   'Synthetic evidence only; no live source, no real advertising data, no network collection.',
   'Retention is advanced and one identity is disturbed by labelled superuser fixtures; superusers are outside the trust boundary.',
-  'Reads commit a scoped read intent before any evidence is released (M3-AUD-01). An intent proves an authorized request, not delivery; the completion row is best-effort.',
+  'REQUEST AUDIT only: every read first commits a scoped read intent, and no evidence is released until that commit is flushed to WAL (M3-AUD-01, M3-AUD-03). DISCLOSURE AUDIT: NOT GUARANTEED. Exactly-once delivery: NOT GUARANTEED. Rollback-resistant release accounting: NOT IMPLEMENTED (A1 measures the lost release record).',
   'Internal evaluation reads only. Subscriber display, export and media mirroring are DENIED by the rights model; there is no customer-facing interface.',
   'D8/G3 still needs independent verification; D5b is not applied (no production host); production startup enforcement does not exist.',
   'Timings come from a disposable PostgreSQL 16 container and are not production measurements.',

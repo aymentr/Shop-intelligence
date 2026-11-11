@@ -1,21 +1,57 @@
-# B-002 M3-AUD-01 — durable audit before evidence retrieval (migration 0009)
+# B-002 — request audit before evidence retrieval (migrations 0009 and 0010)
 
-**Status:** IMPLEMENTED on branch `claude/b002-m3-aud-01`, pending independent acceptance.
+**Status:**
+- M3-AUD-01 (0009) was implemented on branch `claude/b002-m3-aud-01`.
+- The M3-AUD-02 independent review rated it CONDITIONAL ACCEPT for synthetic use, with conditions C1 and C7.
+- M3-AUD-03 (0010) implements C1 and C7 on branch `claude/b002-m3-aud-03`, pending independent acceptance.
 
 **Scope:**
 - synthetic data only;
 - internal evaluation reads only;
 - no customer display, export, sharing or real-evidence access.
 
-**Design:** follows `docs/b002-m3-audit-proposal.md`. Where it differs, §8 says how.
+**Decisions:** FD18 (M3-AUD-01) and FD19 (M3-AUD-03) are recorded as **PROPOSED** in `docs/b002-m3-design.md` §2.1. They are not approved by these implementations.
 
-**Decisions:** the M3-AUD-01 design choices are recorded as **FD18 (PROPOSED)** in `docs/b002-m3-design.md` §2.1. They are **not** approved by this implementation.
+## 0. What this audit does and does not guarantee
 
-## 1. What A1 was
+> **REQUEST AUDIT:** records an authorized request, subject to independently verified durability conditions.
+> Every read first commits a read intent bound to the login and the exact scope. Since 0010, no evidence is
+> released until that intent's commit record is flushed to WAL on disk (§2.2). The durability conditions in
+> §2.3 are part of the guarantee.
+>
+> **DISCLOSURE AUDIT: NOT GUARANTEED.**
+>
+> **Exactly-once delivery: NOT GUARANTEED.**
+>
+> **Rollback-resistant release accounting: NOT IMPLEMENTED.**
 
-Migration 0008 wrote the only audit row of a read (`si.reader_access_log`) inside the caller's transaction. A reader could therefore run `BEGIN; read; ROLLBACK`: the reader kept the records, and the audit row disappeared. The M3-P3D demonstration (A1) and the M3-CLOSE-01 reproduction both showed this.
+| Guarantee | Status after 0010 | Basis |
+|---|---|---|
+| A. Request recorded | VERIFIED | No read returns rows without a matching intent (AUD-1…AUD-4, AUD-8, AUD-M mutants; M3-AUD-02 S2, S6, S7, S15) |
+| B. Request durably committed | VERIFIED, within the §2.3 conditions | Rows are released only after WAL is flushed past the intent's commit record (§2.2; AUD-12a/b/c; AUD-DM mutants) |
+| C. Retrieval authorized | VERIFIED at retrieval | Every 0008 check runs after the gate (AUD-5, AUD-13c, RD/RC). Not recorded: which grant authorized the release |
+| D. Evidence returned by PostgreSQL | PARTIAL | A CONSUMED intent or a completion row proves a release only if the caller's transaction committed. A rollback, a rolled-back savepoint, a dropped socket or a crash erases it |
+| E. Evidence received by the client | NOT GUARANTEED | The database cannot observe receipt |
+| F. Exactly-once disclosure | NOT GUARANTEED | One intent can be released repeatedly through rollbacks within its 60 s lifetime, and results can change under one intent (§5) |
 
-## 2. The flow after 0009
+## 1. Background: A1 and S13
+
+**A1 (0008).** The only record of a read (`si.reader_access_log`) was written in the caller's transaction, so `BEGIN; read; ROLLBACK` erased it. Migration 0009 added a committed **request** record (the read intent). It did not add a rollback-resistant **release** record.
+
+**S13 (0009, found by M3-AUD-02).** `RecordTransactionCommit` decides at commit time whether to flush, based on the current `synchronous_commit`. A reader could:
+1. call `si_begin_read`, which refused `synchronous_commit = off` at that moment;
+2. run `SET LOCAL synchronous_commit = off` in the same transaction;
+3. commit, and read at once.
+
+A server crash before the WAL writer flushed then lost the intent, although the rows had already been delivered.
+
+0009 checked only that the intent was committed (visible). A comment in `0009_read_audit.up.sql` says the `synchronous_commit` refusal makes "a committed intent … durable before it is visible". **That statement is incorrect (erratum).** 0009 is kept byte for byte, and 0010 corrects the behaviour.
+
+Reproduced on PostgreSQL 16.15 with SIGKILL crash recovery:
+- 0009 lost the intent after release in 3 of 12 attempts at the default WAL-writer delay, and deterministically with a 10 s delay;
+- 0010 lost 0 of 12, and refused deterministically with a 10 s delay.
+
+## 2. The flow after 0010
 
 ```
 reader (autocommit)                         database
@@ -25,100 +61,119 @@ SELECT si.si_begin_read(src, cursor, limit) checks: READ COMMITTED; limit 1..100
                                             synchronous_commit <> off); cursor belongs to src;
                                             SYNTHETIC source with an active grant
                                             INSERTs si.read_intents (OPEN, 60 s), server-set identity,
-                                            time and transaction id; returns intent_id
-COMMIT  ← the audit record is now durable ─────────────────────────────────────────────────────────
-SELECT * FROM si.si_read_evidence(          all 0008 argument, identity and session checks; then the
-          src, intent_id, cursor, limit)    intent must exist, belong to session_user and exactly
-                                            (src, sha256(cursor), limit), be COMMITTED
-                                            (pg_xact_status), OPEN and unexpired;
-                                            then, unchanged from 0008: source FOR SHARE (rank 3,
-                                            lock_timeout 2 s), current grant, si_evidence_readable
-                                            per run (D8/G3 verdict, retention, suspension,
-                                            termination, retirement, rights, networks), bounds;
-                                            source lock released; intent UPDATE OPEN → CONSUMED
-                                            (rows, bytes); completion row with intent_id; rows out
+                                            time and transaction id; the intent id carries that id
+COMMIT  (request record) ─────────────────────────────────────────────────────────────────────────
+SELECT * FROM si.si_read_evidence(          all 0008 argument, identity and session checks (plus
+          src, intent_id, cursor, limit)    synchronous_commit <> off); xid from the id; pg_xact_status
+                                            must be 'committed'; T := pg_current_wal_insert_lsn();
+                                            then the intent row: same session_user, exactly
+                                            (src, sha256(cursor), limit), created_xid = xid, OPEN,
+                                            unexpired; then WAIT until pg_current_wal_flush_lsn() >= T
+                                            (≤ 1 s, no lock held, else INTENT_NOT_DURABLE);
+                                            then, unchanged from 0008: source FOR SHARE, current grant,
+                                            si_evidence_readable per run, bounds; source lock released;
+                                            intent OPEN → CONSUMED; completion row; rows out
 ```
 
-The library (`src/persistence/reader.ts`) works as follows:
-- `readEvidence` always sends the two statements in that order.
-- `beginRead` exposes step 1 on its own.
-- `readEvidence(…, { intentId })` retries a committed intent.
-- The library never sends the read unless it received an intent id.
+### 2.1 Why the intent id carries its transaction id
+
+The WAL target T must be taken **after** the commit is observed. It must also be taken **before** the read touches `si.read_intents`, because a heap access can itself insert WAL (HOT pruning) that nothing will flush.
+
+A first prototype took T after looking up the intent row. It refused **153 of 1,500 idle reads (10 %)**, and `pg_walinspect` showed `Heap2:PRUNE` as the only unflushed WAL each time.
+
+With the transaction id taken from the id itself, observing the commit needs no table access. The same test gave **1,500 of 1,500** reads, with a maximum of 16 ms. The row must then have `created_xid` equal to that id, so a forged id that names some other committed transaction is refused.
+
+### 2.2 Durability proof (PostgreSQL 16 source and behaviour)
+
+1. **Commit order.** `RecordTransactionCommit` inserts the commit record first (`XactLogCommitRecord` → `XLogInsert`). It reserves `[start, end)` by advancing `Insert->CurrBytePos` under `insertpos_lck`. It then flushes, but only if `synchronous_commit > off` at commit time. Then it updates the clog (`TransactionIdCommitTree` or `TransactionIdAsyncCommitTree`). `ProcArrayEndTransaction` runs last.
+2. **What `pg_xact_status` sees.** It returns `committed` only if the transaction is no longer in the proc array **and** the clog says committed. Both happen after the commit record's space is reserved.
+3. **The target bounds the commit record.** `pg_current_wal_insert_lsn()` (`GetXLogInsertRecPtr`) reads `CurrBytePos` under the same spinlock, so T ≥ the end of the commit record.
+4. **The flush position means fsynced.** `pg_current_wal_flush_lsn()` (`LogwrtResult.Flush`) advances only in `XLogWrite`, after `WaitXLogInsertionsToFinish` and `issue_xlog_fsync`. So once flush ≥ T, the commit record is complete and fsynced, and crash recovery replays it.
+5. **Verified against behaviour, not only source.** The proof was checked by SIGKILL crash recovery:
+   - AUD-12a;
+   - the AUD-DM mutants, whose detecting scenarios crash the server;
+   - the M3-AUD-03 before/after experiment.
+
+   It was not assumed from "write vs. flush" positions.
+
+### 2.3 Durability conditions (part of the guarantee)
+
+- **fsync = on.** Durability means the local WAL flush, and it is only as strong as fsync. The test compose file runs `fsync = off`: a PostgreSQL crash is covered, but an OS or power failure is not exercised.
+- **Local durability only.** No synchronous standby is supported (D7 precondition).
+- **Primary only.** A server in recovery refuses reads with `INTENT_NOT_DURABLE`.
+- **Durability is not tamper resistance.** Superuser, owner and migrator remain outside the trust boundary: they can delete or rewrite intents.
+- **Bounded wait.** The wait is at most 1 s, holds no lock and can be cancelled. On timeout, `INTENT_NOT_DURABLE` (55000), nothing is released, and the intent stays OPEN.
 
 ## 3. Invariants and where each is enforced
 
 | ID | Invariant | Enforced by | Tests |
 |---|---|---|---|
-| AUD-I1 | No evidence is returned without a committed intent of the same login and exact scope | `si_read_evidence`: intent lookup, `pg_xact_status(created_xid) = 'committed'`, scope comparison | AUD-1, AUD-2, AUD-3, AUD-4; mutants AUD-M committed / principal / scope |
-| AUD-I2 | Application roles cannot delete or alter an intent; the only transition is OPEN → CONSUMED | owner-only table; `trg_read_intents_guard` (even the owner, including TRUNCATE) | AUD-4, AUD-8; privileges G1 |
-| AUD-I3 | Identity comes from `session_user`, never from a parameter; SET ROLE cannot borrow an intent | trigger sets `principal := session_user`; the read compares it with `session_user` | AUD-4, AUD-8, RD-12 |
-| AUD-I4 | An intent is single-use once its consumption commits, and expires after 60 s | `UPDATE … WHERE state = 'OPEN'` under a row lock; `expires_at` check; CHECK `read_intents_lifetime` | AUD-4, AUD-6, AUD-7; mutant AUD-M consumption |
-| AUD-I5 | A committed intent never overrides current authorization | Every 0008 check runs after the intent check, under the source lock | AUD-5; demo A2; the full RD/RC suite |
-| AUD-I6 | Intents are content-free | They store the source id, a SHA-256 of the cursor (never the cursor), the limit and counts | AUD-1, AUD-10 |
-| AUD-I7 | Emergency controls are never blocked by intents | `read_intents` has no FK to `sources`; `si_begin_read` takes no source lock; the intent row lock is taken only after the source lock is released | AUD-9, RC-9 |
-| AUD-I8 | Down 0009 restores the exact 0008 catalog, including the 0008 read byte for byte | `0009_read_audit.down.sql` | M1i, AUD-11 |
-| AUD-I9 | No reader entry point returns evidence without a matching committed record | 0009 drops `si_read_evidence(text, text, int)`. `si_reader` can execute only `si_begin_read` and the new read, and the read is the only function returning `si.evidence_read_row` | AUD-8, SR-0, SD1 |
+| AUD-I1 | No evidence is returned without a committed intent of the same login and exact scope | `si_read_evidence` (0010): transaction id from the intent id, `pg_xact_status`, row lookup, scope and `created_xid` comparison | AUD-1…AUD-4; AUD-M committed / principal / scope |
+| AUD-I1b | No evidence is returned until that intent's commit record is flushed | The durability gate (§2.2) | AUD-12a/b/c; AUD-DM: wait removed, timeout fails open, target weakened, target taken before the commit is observed |
+| AUD-I2 | Application roles cannot delete or alter an intent; the only transition is OPEN → CONSUMED | Owner-only table; `trg_read_intents_guard` | AUD-4, AUD-8; G1 |
+| AUD-I3 | Identity comes from `session_user`, never from a parameter | Trigger and read | AUD-4, AUD-8, RD-12 |
+| AUD-I4 | An intent is single-use once its consumption **commits**, and expires after 60 s | `UPDATE … WHERE state = 'OPEN'`; `expires_at` | AUD-4, AUD-6, AUD-7; AUD-M consumption |
+| AUD-I5 | A committed intent never overrides current authorization | Every 0008 check runs after the gate, under the source lock | AUD-5, AUD-13c; demo A2; RD/RC |
+| AUD-I6 | Intents are content-free | Source id, SHA-256 of the cursor, limit and counts | AUD-1, AUD-10 |
+| AUD-I7 | Emergency controls are never blocked by intents or by the gate | No FK to `sources`; the gate holds no lock; the intent row lock is taken after the source lock is released | AUD-9, AUD-13c, RC-9 |
+| AUD-I8 | Down 0010 restores the exact 0009 catalog; down 0009 restores the exact 0008 catalog | Down migrations | M1j, M1i, AUD-11 |
+| AUD-I9 | No reader entry point returns evidence without a matching intent | `si_reader` executes only `si_begin_read` and `si_read_evidence(text, uuid, text, int)` | AUD-8, SR-0, SD1 |
+| AUD-I10 | An uncertain transaction (malformed, foreign, future or aborted) or recovery fails closed with a fixed code | Exception mapping in the gate | AUD-12b; AUD-DM uncertain |
 
 ## 4. Failure, retry and what can be proved
 
 | Situation | Evidence released? | Record left | Retry |
 |---|---|---|---|
-| `si_begin_read` refused (no grant, bad argument, unsafe session) | No | Nothing (refusals raise) | Fix the cause |
-| `si_begin_read` inside an open transaction, then read in that transaction | No (`INTENT_UNCOMMITTED`) | Nothing once that transaction ends | Call it in autocommit |
-| The intent's COMMIT fails, or the connection is lost before the id arrives | No: the library has no id and sends no read | Nothing, or an OPEN intent if the commit did happen | A new intent |
-| Read refused: revoked, NOT_AUTHORIZED | No | OPEN intent: "authorized request at T, refused at retrieval" | No (final) |
-| Read BUSY (a control is in progress) or the connection is lost during the read | No, or unknown | OPEN intent (the consumption rolled back) | **Same intent, same scope, until it expires** (`ReadFailed.retryable`) |
-| Read succeeded, caller rolls back | **Yes** | **OPEN intent survives.** Only the completion row and the consumption mark roll back | Same intent while unexpired. Each reuse returns the same scope, under current authorization |
-| Read succeeded and committed | Yes | CONSUMED intent (rows, bytes) and a completion row naming the intent | `INTENT_USED`; a new intent is needed |
-| Two sessions use one intent concurrently | At most one per committed consumption | The second waits on the intent row, then gets `INTENT_USED`, or reads if the first rolled back | — |
+| `si_begin_read` refused | No | Nothing | Fix the cause |
+| Intent created in the caller's open transaction, read in it | No (`INTENT_UNCOMMITTED`) | Nothing once that transaction ends | Call it in autocommit |
+| Intent committed asynchronously and not yet flushed | No, until flushed; then normal | OPEN intent | Wait or start a new read. A timed-out intent can be reused once it is flushed |
+| Another session holds unflushed WAL written after the intent committed | No, if it is not flushed within 1 s (`INTENT_NOT_DURABLE`) | OPEN intent | **A new read.** The new intent's synchronous commit flushes the earlier WAL (AUD-13b). `readEvidence` does this itself when it created the intent: at most `NOT_DURABLE_ATTEMPTS` = 3 attempts in total, each leaving its own request record. A caller-supplied intent is never replaced |
+| The intent's COMMIT fails, or the connection is lost before the id arrives | No: the library has no id | Nothing, or an OPEN intent | New read |
+| Read refused: NOT_AUTHORIZED | No | OPEN intent | No (final) |
+| Read BUSY, cancelled or connection lost during the read | No, or unknown | OPEN intent | Same intent (`retryable`) |
+| **Read succeeded, caller rolls back** | **Yes** | **Only the request (OPEN intent).** The release record (consumption, completion row) is erased | The same intent can be reused while unexpired |
+| Read succeeded and committed | Yes | CONSUMED intent and completion row | New read |
+| A second session uses an intent another session is consuming | No while the first is open (`INTENT_NOT_DURABLE` or `INTENT_USED`) | — | Exactly one release per committed consumption |
 
 **What the records prove:**
-1. A committed intent proves that this login requested this exact scope at this time, while it held an active grant.
-2. CONSUMED, or a completion row, proves that the server released N rows and the caller's transaction committed.
-3. Nothing proves delivery to the client.
-4. An OPEN intent means "requested; outcome unknown".
-5. A caller who rolls back can reuse one intent for the same scope until it expires. The audit therefore proves at least one authorized request per release window. It does not count releases.
+1. A durable OPEN or CONSUMED intent proves that this login requested this exact scope at this time, while it held an active grant.
+2. CONSUMED, or a completion row, proves a release only if the caller's transaction committed. Its absence proves nothing.
+3. Nothing proves delivery or counts releases.
 
-## 5. Tests and mutants added or changed
+## 5. Residual limitations (not solved here)
 
-| Area | Change |
+1. **No disclosure audit.** Releases under rollback are not recorded. Measured in M3-AUD-02 S3–S6 and S12:
+   - before 0010, one intent was released about 620 times in 2 s with no release record;
+   - after 0010, about 12 times in 2 s, because each rolled-back read leaves unflushed WAL that the next read must wait for. This only slows reuse; it is not a control.
+2. **Content drift.** An intent binds scope, not content. The same intent returned 5 rows instead of 2 after more records were verified (S4).
+3. **Restored copies.**
+   - A same-cluster logical copy can still accept the original's open intents within their lifetime (S14). No database or cluster binding exists yet (C6).
+   - On a foreign cluster, transaction ids alias. The gate maps errors to fixed codes, and the 60 s lifetime remains the bound.
+4. **No grant attribution.** The authorizing grant is not recorded (S8, C4).
+5. **Unbounded growth.** About 1,200 intents per second per reader, about 200 B each, with no cap and no retention (S16, C5).
+6. **Liveness.** A read can fail closed (`INTENT_NOT_DURABLE`) when another session inserted unflushed WAL after the intent committed. Examples are an open writer, a second session consuming the same intent, or background activity: this was observed once in the regular suite, right after crash recovery. A new read resolves it, and the library retries with a new intent (bounded at 3 attempts). Measured with no other sessions active: 0 of 1,500 refusals. PostgreSQL exposes no SQL-observable tighter bound on an intent's commit record, because it does not reveal whether a commit was synchronous, so this cannot be tightened soundly.
+7. **Trust boundary.** Superuser and owner remain outside it. There is no out-of-band release record (C2) and no log shipping.
+8. **Unchanged blockers:** independent verification of D8/G3, D5b, D7 startup enforcement and scheduling.
+
+## 6. Tests and mutants
+
+| Area | Content |
 |---|---|
-| `tests/db/m3-audit.test.mjs` (new) | AUD-1…AUD-11 (AUD-11: down 0009 with intents present restores the exact 0008 catalog), plus 4 mutants: committed check, principal binding, scope binding and consumption omitted. Each mutant is detected and each baseline is clean |
-| `tests/db/m3-reader.test.mjs` | Every read now commits an intent first. The tests read the 0009 read function, the grant mutant revokes between intent and read, and the byte-cap mutant accepts either CHECK. RD-14 and RC-9 take their intent from a second session of the same login |
-| `tests/db/privileges.test.mjs` | SD1, G1 and SR-0 cover the 0009 objects and grants |
-| `tests/db/migrations.test.mjs`, `migrator.test.mjs` | Schema version 9; new test M1i |
-| `tests/reader.test.mjs` | RL-4…RL-6: statement order, an uncertain intent never leads to a read, retry semantics |
-| Demonstration | Migrations 0001–0009. A1 now shows the durable audit; new A2 covers revocation between the steps, BUSY, retry and single use; N12 checks both entry points; the grant mutant disables the check in both entry points; the final audit check finds no completion row without an intent |
-| DR-1 | Also runs AUD-2, AUD-4 and AUD-8 on the restored cluster |
-
-## 6. Residual limitations (not solved here)
-
-1. **Superuser and `si_owner` remain outside the trust boundary.** They can disable triggers, delete intents or replace functions. Durability against the operator needs log shipping to a separate system, which is not implemented.
-2. **Delivery is not provable** (§4).
-3. **The audit cannot count releases** that a caller rolls back (§4, point 5).
-4. **Asynchronous commit.** The intent refuses `synchronous_commit = off` at creation. A caller could still create the intent in an explicit transaction and then lower `synchronous_commit` before `COMMIT`; a server crash within the WAL-writer delay could then lose a visible intent. Exploiting this needs deliberate misuse plus a crash. PostgreSQL offers no reliable way for a function to detect an explicit transaction block: measured here, `statement_timestamp()` differs from `transaction_timestamp()` even in autocommit under the extended protocol.
-5. **Intents are never purged.** They are content-free, but they grow without bound and have no retention rule.
-6. **Credential sharing.** One login per person or process remains an operational control.
-7. **The out-of-band log copy** from proposal item 5 (`RAISE LOG`) is not implemented.
-8. **Each page costs two round trips.** Timings were measured on the test image only.
-9. **Not done here:** independent verification of D8/G3, D5b, D7 startup enforcement and scheduling. They are unchanged and still open.
+| `tests/crash/m3-durability-crash.test.mjs` (M3-AUD-03; separate CI step "Crash durability", because it restarts PostgreSQL) | **AUD-12a** async-commit crash durability (SIGKILL crash recovery): an unflushed intent is refused, and no released page loses its intent at the default writer delay. Also 4 crash-detected mutants: wait removed, timeout fails open, target weakened, target taken before the commit is observed |
+| `tests/db/m3-durability.test.mjs` (M3-AUD-03; regular suite) | **AUD-12b** bounded timeout and fail-closed uncertainty: future, foreign, zero and forged ids. **AUD-12c** a concurrently committing creator. **AUD-13a** ordinary reads (median about 4 ms), explicit transactions and savepoints, async read session refused. **AUD-13b** unrelated open writer (fail closed, then a new read succeeds) and racing readers. **AUD-13c** cancellation, revocation and retention expiry around the gate, with emergency-control latency |
+| AUD-DM mutants (6 in total) | Wait removed; timeout fails open; target weakened to the flush position; target taken before the commit is observed (these four through a real crash, in the crash file); read-session `synchronous_commit` check removed; uncertain transaction id not mapped to a fixed code (these two in the regular suite). Each is detected by a scenario that exercises the failure |
+| `tests/reader.test.mjs` | RL-7: bounded new-intent retry on `INTENT_NOT_DURABLE`; a caller-supplied intent is never replaced |
+| `tests/db/m3-audit.test.mjs` | AUD-1…AUD-11. **AUD-2 renamed:** it proves the request record survives a rollback and asserts that the release record does not. AUD-3 and AUD-7 were updated for 0010's fail-closed concurrency. The AUD-M mutants now target the 0010 read |
+| `tests/db/m3-reader.test.mjs` | RD and RC tests on the 0010 read; the instrumented pause marks itself, so it cannot be confused with the gate's sleeps |
+| Migrations | M1j (0010 reversibility, byte for byte); version lists updated to 10 |
+| Demonstration | **A1 renamed and measured:** request records lost on rollback = 0, release records lost = 1 (previously a hard-coded 0); limitations wording |
+| DR-1 | Also runs AUD-13a on the restored cluster (non-crash) |
 
 ## 7. What an independent reviewer should verify
 
-1. **Entry points:** in the catalog, `si_reader` can execute only `si_begin_read` and `si_read_evidence(text, uuid, text, int)`, and no other path returns `si.evidence_read_row`.
-2. **The committed check:**
-   - `pg_xact_status(created_xid)` returns `committed` only for committed transactions, including under subtransactions and after a crash or restart;
-   - the intent's `created_xid` (`pg_current_xact_id()` in the trigger) is the top-level transaction id;
-   - an intent from a rolled-back transaction is never visible.
-3. **Ordering:** no evidence is materialized before the intent checks, and nothing is returned if the consumption or completion insert fails.
-4. **Lock order:** the intent row lock is never held together with the source lock. Emergency controls still see bounded waits (AUD-9, RC-9).
-5. **Mutants and fixtures:** each AUD-M mutant fails against the real migration for the stated reason, and the commit-failure fixture in AUD-3 behaves as described.
-6. **Down migration:** it restores the exact 0008 catalog (M1i).
-7. **Residual risks:** the synchronous-commit residual (§6.4) and the "at least one request per release window" standard (§4) are acceptable for the next classification step.
-
-## 8. Differences from the proposal
-
-- The intent is also bound to the **cursor digest and limit**, so it covers the exact read scope rather than only the source.
-- The explicit-transaction refusal (proposal item 2 and AUD-I5) was **dropped as unreliable** (§6.4). Safety rests on the committed-transaction check alone.
-- The intent table has **no foreign key** to `sources`, so emergency controls are never blocked. Source existence is checked in the function instead.
-- **Not implemented:** the `RAISE LOG` copy (proposal item 5).
+1. The §2.2 ordering argument against the PostgreSQL 16 source, and that `pg_xact_status` cannot report `committed` before the commit record is reserved.
+2. That no statement before the target capture can let evidence out, and that statements before it can only make T later, never earlier.
+3. That the `created_xid` binding makes a forged id (another committed transaction's id) harmless.
+4. That the four crash-based mutant scenarios fail for the stated reason, and the fixture (`wal_writer_delay = 10s`, SIGKILL) is sound.
+5. The §2.3 conditions (fsync, primary only, no synchronous standby) as operational requirements.
+6. That the documentation nowhere claims disclosure accounting.

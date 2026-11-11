@@ -21,7 +21,8 @@ import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-has
 import { beginRead, readEvidence, grantReader, revokeReader, ReadFailed } from '../../dist/persistence/reader.js';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
-const MIG9 = readFileSync(new URL('../../db/migrations/0009_read_audit.up.sql', import.meta.url), 'utf8');
+// The read function as last defined (0010 replaces the 0009 read with the durability gate).
+const MIG10 = readFileSync(new URL('../../db/migrations/0010_read_durability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 let n = 0;
 
@@ -104,7 +105,7 @@ test('AUD-1: a read commits a scoped intent first; the read consumes it; the com
   assert.ok(!stored.includes(first.nextCursor), 'the cursor itself is not stored');
 });
 
-test('AUD-2 (A1 regression): a caller-side rollback cannot erase the audit record of returned data', async t => {
+test('AUD-2 (A1 regression, REQUEST audit only): a caller rollback cannot erase the committed request record; the release itself is NOT recorded', async t => {
   const x = await fresh(t);
   const { src } = await ready(x, 3);
   const alice = await x.connect('si_reader_alice');
@@ -117,7 +118,10 @@ test('AUD-2 (A1 regression): a caller-side rollback cannot erase the audit recor
   const after = await intents(x);
   assert.deepEqual(after.map(i => [i.intent_id, i.principal, i.source_id, i.state, i.xact]), [[id, 'si_reader_alice', src, 'OPEN', 'committed']],
     'the committed intent survives the rollback (state OPEN = requested, outcome unknown)');
-  assert.equal((await x.admin.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n, 0, 'only the best-effort completion row rolled back');
+  // Limitation asserted, not hidden: the records that rows were RELEASED (consumption, completion row) rolled back.
+  // This test proves a request record, not disclosure accounting (rollback-resistant release accounting: NOT IMPLEMENTED).
+  assert.equal((await x.admin.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n, 0, 'the release record rolled back with the caller');
+  assert.equal(after[0].state, 'OPEN', 'no record that 3 rows were released');
   // Through the library inside a caller transaction: the intent is uncommitted, so nothing is returned at all.
   await alice.query('BEGIN');
   const err = await readEvidence(alice, src).catch(e => e);
@@ -139,10 +143,11 @@ test('AUD-3: a failed or uncertain audit commit returns no evidence', async t =>
   const id = await intent(alice, src);
   await rejects(assert, readWith(alice, src, id), UNCOMMITTED);
   await alice.query('ROLLBACK');
-  // (b) uncommitted in another session: invisible; after its rollback it never existed.
+  // (b) uncommitted in another session: refused (since 0010 the id names its transaction, still in progress);
+  // after its rollback the intent never existed.
   await alice.query('BEGIN');
   const id2 = await intent(alice, src);
-  await rejects(assert, readWith(alice2, src, id2), INVALID);
+  await rejects(assert, readWith(alice2, src, id2), UNCOMMITTED);
   await alice.query('ROLLBACK');
   await rejects(assert, readWith(alice2, src, id2), INVALID);
   await rejects(assert, readWith(alice, src, id), INVALID);
@@ -254,23 +259,24 @@ test('AUD-7: concurrent requests — exactly one committed consumption per inten
   const x = await fresh(t);
   const { src } = await ready(x, 2);
   const a1 = await x.connect('si_reader_alice'), a2 = await x.connect('si_reader_alice');
-  const p1 = await pid(a1), p2 = await pid(a2);
+  // Since 0010 a second session on the same intent cannot release anything while the first consumer's
+  // transaction is open: that transaction's WAL is unflushed, so the second read fails closed in the
+  // durability gate (or, once the first commits, finds the intent consumed). It never waits on the row lock.
   const id = await intent(a1, src);
   await a1.query('BEGIN');
   assert.equal((await readWith(a1, src, id)).length, 2, 'first consumer, not yet committed');
-  const second = settle(readWith(a2, src, id));
-  await waitUntilBlocked(x.admin, p2, p1);
-  await a1.query('COMMIT');
-  const s = await second;
+  const s = await settle(readWith(a2, src, id));
   assert.deepEqual([s.status, s.code], ['db-error', '55000']);
-  assert.match(s.message, /^SI_READ_INTENT_USED/, 'the second consumer finds it consumed');
+  assert.match(s.message, /^SI_READ_INTENT_(NOT_DURABLE|USED)/, 'the second consumer releases nothing while the first is open');
+  await a1.query('COMMIT');
+  await rejects(assert, readWith(a2, src, id), USED, 'after the first consumer committed, the intent is consumed');
   const id2 = await intent(a1, src);
   await a1.query('BEGIN');
   await readWith(a1, src, id2);
   const third = settle(readWith(a2, src, id2));
-  await waitUntilBlocked(x.admin, p2, p1);
-  await a1.query('ROLLBACK');
-  assert.equal((await third).value.length, 2, 'after the first consumer rolled back, the waiting retry consumes the intent');
+  await sleep(200);
+  await a1.query('ROLLBACK');                                                    // the abort is flushed by the WAL writer
+  assert.equal((await third).value?.length, 2, 'after the first consumer rolled back, the waiting retry consumes the intent');
   // Many sessions race on one intent in autocommit: exactly one releases evidence.
   const id3 = await intent(a1, src);
   const racers = await Promise.all(Array.from({ length: 6 }, () => x.connect('si_reader_alice')));
@@ -371,11 +377,11 @@ test('AUD-11: down 0009 with intents and completion rows present restores the ex
   const ref = await freshDatabase(t, 'm3aud8', { migrate: false });
   const refc = await connect({ database: ref }); t.after(() => refc.end());
   await migrateUp(refc, { to: 8 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 8, allowDestructive: true }), [9]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 8, allowDestructive: true }), [10, 9]);
   const norm = f => f.replaceAll('"relacl":"{si_owner=arwdDxt/si_owner}"', '"relacl":null');    // equivalent ACL spelling after restore (DR-1)
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(await schemaFingerprint(refc)), 'exact 0008 catalog with 0009 data present before down');
   assert.equal((await x.admin.query('SELECT count(*)::int AS n FROM si.reader_access_log')).rows[0].n, 1, 'completion rows are kept (without the intent column)');
-  assert.deepEqual(await migrateUp(x.admin), [9]);
+  assert.deepEqual(await migrateUp(x.admin), [9, 10]);
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(at9));
   assert.equal((await readEvidence(await x.connect('si_reader_alice'), src)).records.length, 2, 'reads work after the round trip');
 });
@@ -390,15 +396,18 @@ function mutate(text, from, to) {
   assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`);
   return text.replace(from, to);
 }
-const READ_FN = fnText(MIG9, 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
+const READ_FN = fnText(MIG10, 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
 const ok = async p => { const r = await settle(p); return r.status === 'ok' && r.value.length > 0; };
 const MUTANTS = [
-  { name: 'committed-intent check omitted', sql: mutate(READ_FN, `IF pg_xact_status(it.created_xid) IS DISTINCT FROM 'committed' THEN`, 'IF false THEN'),
+  { name: 'committed-intent check omitted', sql: mutate(READ_FN, `  IF st <> 'committed' THEN`, '  IF false THEN'),
     scenario: async x => {                                          // detected = a read in the intent's own open transaction releases evidence
       const { src } = await ready(x, 1);
       const alice = await x.connect('si_reader_alice');
+      await x.admin.query('CREATE TABLE IF NOT EXISTS public.flushme (x int)');
       await alice.query('BEGIN');
-      const leaked = await ok(readWith(alice, src, await intent(alice, src)));
+      const id = await intent(alice, src);
+      await x.admin.query('INSERT INTO public.flushme VALUES (1)');   // a synchronous commit flushes the WAL (so the durability gate alone does not mask the mutant)
+      const leaked = await ok(readWith(alice, src, id));
       await alice.query('ROLLBACK');
       return leaked;
     } },

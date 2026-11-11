@@ -22,7 +22,8 @@ import { readEvidence, grantReader, revokeReader, ReadFailed, MAX_READ_BYTES } f
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 const MIG7 = readFileSync(new URL('../../db/migrations/0007_receipt_verification.up.sql', import.meta.url), 'utf8');
-const MIG9 = readFileSync(new URL('../../db/migrations/0009_read_audit.up.sql', import.meta.url), 'utf8');
+// The read function as last defined (0010 replaces the 0009 read with the durability gate).
+const MIG10 = readFileSync(new URL('../../db/migrations/0010_read_durability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 const FIELDS = ['run_id', 'ordinal', 'collected_at', 'network', 'native_ad_id', 'advertiser_name', 'countries', 'seen_at', 'source_url',
                 'title', 'source_reported_first_seen', 'source_reported_last_seen', 'content_sha256', 'next_cursor'];
@@ -100,11 +101,12 @@ function mutate(text, from, to) {
   assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`);
   return text.replace(from, to);
 }
-const READ_FN = fnText(MIG9, 'CREATE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
+const READ_FN = fnText(MIG10, 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
 const READABLE_FN = fnText(MIG7, 'CREATE FUNCTION si.si_evidence_readable', '$evidence_readable$;\n');
 const PAUSE_ANCHOR = '    END IF;\n    FOR rec IN';
+// The pause marks itself in application_name, so it cannot be confused with the durability gate's own short sleeps (0010).
 const withPause = fn => mutate(fn, PAUSE_ANCHOR,
-  `    END IF;\n    PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float8);\n    FOR rec IN`);
+  `    END IF;\n    IF coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float8 > 0 THEN PERFORM set_config('application_name', 'si-test-paused', false); END IF;\n    PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float8);\n    FOR rec IN`);
 /** A ready source with `k` verified records readable by alice. */
 async function ready(x, k = 3) {
   const src = await source(x);
@@ -397,8 +399,8 @@ async function paused(x, src, who = 'si_reader_alice') {
   const done = { at: null };
   const p = settle(c.query(READ, [src, id, null, 100]).then(r => { done.at = performance.now(); return r.rows; }));
   for (let i = 0; ; i++) {
-    const w = (await x.admin.query('SELECT wait_event FROM pg_stat_activity WHERE pid = $1', [cp])).rows[0];
-    if (w?.wait_event === 'PgSleep') break;
+    const w = (await x.admin.query('SELECT wait_event, application_name FROM pg_stat_activity WHERE pid = $1', [cp])).rows[0];
+    if (w?.wait_event === 'PgSleep' && w.application_name === 'si-test-paused') break;
     assert.ok(i < 300, 'the read reached its pause');
     await sleep(5);
   }

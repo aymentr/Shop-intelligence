@@ -48,7 +48,8 @@ serving), no live collection, no production deployment.
 | 0006 | retention enforcement and safe purge (`si_purge_due`, purge audit, retention status) | M3-P3A, accepted |
 | 0007 | receipt verification (VALID / INVALID / UNVERIFIABLE), frozen legacy receipt columns, fail-closed readability predicate | M3-P3B, accepted |
 | 0008 | controlled internal retrieval: `si_reader` principals, per-source grants, bounded `si_read_evidence` | M3-P3C, accepted |
-| 0009 | durable read audit: a committed, scoped read intent (`si_begin_read`) before any evidence; replaces the 0008 read entry point | M3-AUD-01, pending acceptance |
+| 0009 | read request audit: a committed, scoped read intent (`si_begin_read`) before any evidence; replaces the 0008 read entry point | M3-AUD-01, conditionally accepted for synthetic use by M3-AUD-02 |
+| 0010 | crash-durable read intent: no evidence until the intent's commit is flushed to WAL (bounded, fail closed) | M3-AUD-03, pending acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
@@ -79,8 +80,11 @@ Internal retrieval (0008): a dedicated principal (`si_reader_<name>`, provisione
 `provisionReaderPrincipal`) with a per-source grant (`si_grant_reader`, by `si_rights_admin`) can read
 bounded pages of VALID, currently authorized synthetic evidence through `readEvidence`
 (src/persistence/reader.ts). Destination and creative URLs are not returned; nothing is customer-facing.
-Since 0009 every read first commits a read intent bound to the login and the exact scope, so a caller-side
-rollback cannot erase the audit record of returned data (`docs/b002-m3-audit.md`).
+Since 0009 every read first commits a read intent bound to the login and the exact scope, and since 0010
+no evidence is released until that commit is flushed to WAL. This is a REQUEST AUDIT only (an authorized
+request is recorded, subject to the durability conditions in `docs/b002-m3-audit.md` §2.3). DISCLOSURE
+AUDIT: NOT GUARANTEED. Exactly-once delivery: NOT GUARANTEED. Rollback-resistant release accounting: NOT
+IMPLEMENTED — a caller rollback still erases the record that rows were released.
 
 Lifecycle demonstration (M3-P3D): `npm run demo:lifecycle` runs the real implementation end to end —
 synthetic collection, verification, internal read, revocation, retention and purge, plus negative
@@ -104,12 +108,13 @@ on every production database (D-M2-09).
 ## Next gates
 
 1. Test rights semantics against actual platform/source agreements before enabling any live adapter.
-2. Independently verify D8/G3 and the durable read audit. Commit-time verification (0007), an internal,
-   synthetic-only read gate (0008) and committed read intents (0009, M3-AUD-01) exist, but no independent review
-   has been performed. No customer display path is authorized.
+2. Independently verify D8/G3 and the read request audit. Commit-time verification (0007), an internal,
+   synthetic-only read gate (0008), committed read intents (0009) and their crash durability (0010) exist; only
+   0009 has had an independent review (M3-AUD-02). A disclosure audit does not exist. No customer display path
+   is authorized.
 3. Obtain explicitly permitted API credentials and source-specific integration tests.
 4. Measure real record quality by country/network without claiming completeness.
 
 See `docs/architecture.md` and `docs/acceptance.md`. Milestone 3 closure review: `docs/b002-m3-closure.md`,
-`docs/b002-m3-risk-register.md`, `docs/b002-m3-audit-proposal.md`, `docs/b002-m4-options.md`. Durable read audit:
+`docs/b002-m3-risk-register.md`, `docs/b002-m3-audit-proposal.md`, `docs/b002-m4-options.md`. Read request audit (what it does and does not guarantee):
 `docs/b002-m3-audit.md`.

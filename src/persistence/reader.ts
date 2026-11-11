@@ -9,9 +9,16 @@
  *      its outcome is unknown (connection lost), nothing is read.
  *   2. The read returns evidence only for a committed, open, unexpired intent of the same login and
  *      scope, re-checks every authorization, and consumes the intent.
- * A committed intent proves an authorized request, not delivery. Retry: after BUSY or CONNECTION the
- * same intent may be retried (same scope) until it expires or is consumed (`retryable`); after
- * INTENT_USED or INTENT_EXPIRED a new intent is needed; NOT_AUTHORIZED is final.
+ * Since migration 0010 the read also waits (at most 1 s) until the intent's commit is flushed to disk, and
+ * otherwise fails with INTENT_NOT_DURABLE. That can also happen to an ordinary read when another session
+ * inserted WAL that nothing has flushed yet; a new intent's synchronous commit flushes it, so readEvidence
+ * starts a new read (at most NOT_DURABLE_ATTEMPTS in total) when it created the intent itself. Every attempt
+ * leaves its own committed request record.
+ * A committed intent proves an authorized request (REQUEST AUDIT). It is not a disclosure audit: releases
+ * are not recorded rollback-resistantly, and delivery and exactly-once delivery are not guaranteed.
+ * Retry: after BUSY or CONNECTION the same intent may be retried (same scope) until it expires or is
+ * consumed (`retryable`); after INTENT_USED, INTENT_EXPIRED or INTENT_NOT_DURABLE a new read is needed;
+ * NOT_AUTHORIZED is final.
  *
  * Returned records are given to the caller and are never logged here; failures are a fixed code plus
  * the SQLSTATE, never PostgreSQL text. Destination and creative URLs are not part of the interface.
@@ -21,6 +28,8 @@ import type { ClientBase } from 'pg';
 export const MAX_READ_RECORDS = 100;
 export const DEFAULT_READ_RECORDS = 50;
 export const MAX_READ_BYTES = 262144;
+/** Total attempts (each with a new intent) when a read the library started is refused INTENT_NOT_DURABLE. */
+export const NOT_DURABLE_ATTEMPTS = 3;
 
 export interface EvidenceRecord {
   runId: string;
@@ -40,7 +49,7 @@ export interface EvidenceRecord {
 export interface EvidencePage { records: EvidenceRecord[]; nextCursor: string | null }
 
 export type ReadFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'NOT_AUTHORIZED' | 'UNSAFE_SESSION' | 'BUSY' | 'ISOLATION' |
-  'INTENT_INVALID' | 'INTENT_UNCOMMITTED' | 'INTENT_USED' | 'INTENT_EXPIRED' | 'CONNECTION' | 'INTERNAL';
+  'INTENT_INVALID' | 'INTENT_UNCOMMITTED' | 'INTENT_USED' | 'INTENT_EXPIRED' | 'INTENT_NOT_DURABLE' | 'CONNECTION' | 'INTERNAL';
 
 /** Fixed message only: `READ_FAILED: <code>`. `intentId` is set when a committed intent exists for the failed read. */
 export class ReadFailed extends Error {
@@ -67,6 +76,7 @@ export function classifyReadError(err: unknown): ReadFailureCode {
   if (m === 'SI_READ_INTENT_UNCOMMITTED') return 'INTENT_UNCOMMITTED';
   if (m === 'SI_READ_INTENT_USED') return 'INTENT_USED';
   if (m === 'SI_READ_INTENT_EXPIRED') return 'INTENT_EXPIRED';
+  if (m === 'SI_READ_INTENT_NOT_DURABLE') return 'INTENT_NOT_DURABLE';
   if (m === 'SI_READ_BAD_CURSOR') return 'BAD_CURSOR';
   if (m === 'SI_READ_BAD_ARGUMENT') return 'BAD_ARGUMENT';
   if (m === 'SI_READ_UNSAFE_SESSION') return 'UNSAFE_SESSION';
@@ -122,12 +132,18 @@ export async function readEvidence(client: ClientBase, sourceId: string,
   if (opts.intentId !== undefined && (typeof opts.intentId !== 'string' || !UUID.test(opts.intentId))) {
     throw new ReadFailed('INTENT_INVALID', null);
   }
-  const intentId = opts.intentId ?? await beginRead(client, sourceId, { cursor, limit });
+  let intentId: string;
   let rows: Record<string, unknown>[];
-  try {
-    rows = (await client.query('SELECT * FROM si.si_read_evidence($1, $2::uuid, $3, $4::int)', [sourceId, intentId, cursor, limit])).rows;
-  } catch (err) {
-    throw new ReadFailed(classifyReadError(err), sqlstateOf(err), intentId);
+  for (let attempt = 1; ; attempt++) {
+    intentId = opts.intentId ?? await beginRead(client, sourceId, { cursor, limit });
+    try {
+      rows = (await client.query('SELECT * FROM si.si_read_evidence($1, $2::uuid, $3, $4::int)', [sourceId, intentId, cursor, limit])).rows;
+      break;
+    } catch (err) {
+      const failure = new ReadFailed(classifyReadError(err), sqlstateOf(err), intentId);
+      if (failure.code === 'INTENT_NOT_DURABLE' && opts.intentId === undefined && attempt < NOT_DURABLE_ATTEMPTS) continue;
+      throw failure;
+    }
   }
   const records = rows.map(r => ({
     runId: String(r.run_id), ordinal: Number(r.ordinal), collectedAt: iso(r.collected_at) ?? '', network: String(r.network),

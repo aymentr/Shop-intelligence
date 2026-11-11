@@ -97,6 +97,7 @@ content read or serving.
 | FD16 | APPROVED (M3-P3C mission); IMPLEMENTED in 0008 | **Internal reader grant** — a concept separate from source-content display rights: an explicit, revocable, per-principal, per-source permission for internal synthetic evaluation (`purpose = INTERNAL_SYNTHETIC_EVALUATION`). It never implies `subscriber_display`, `export` or `media_mirror`, which stay DENIED/UNKNOWN by constraint and unchanged. Destination and creative URLs are excluded initially. |
 | FD17 | **ACCEPTED with M3-P3C** — BD1 amendment | `si_reader` (NOLOGIN group of `si_reader_<name>` principals) → EXECUTE `si_read_evidence` only; `si_rights_admin` → `si_grant_reader`, `si_revoke_reader`, SELECT `si.reader_grants`; `si_monitor` → SELECT `si.reader_grants`, `si.reader_access_log`. No evidence-table privilege for any role. |
 | FD18 | **PROPOSED (M3-AUD-01) — pending founder decision; implemented on branch `claude/b002-m3-aud-01` for review** | Durable read audit (`docs/b002-m3-audit.md`): (a) the audit standard is "committed request recorded before release; delivery unknown", not a count of deliveries; (b) intent lifetime 60 s, single use once consumed; (c) the intent is bound to login and exact scope (source, cursor digest, limit); (d) breaking signature change: `si_read_evidence(text, text, int)` is removed and replaced by `si_read_evidence(text, uuid, text, int)`; (e) no out-of-band log copy and no log shipping yet; (f) BD1 amendment: `si_reader` → EXECUTE `si_begin_read`; `si_monitor` → SELECT `si.read_intents`. No evidence-table privilege for any role. |
+| FD19 | **PROPOSED (M3-AUD-03) — pending founder decision; implemented on branch `claude/b002-m3-aud-03` for review** | Crash-durable read intent (`docs/b002-m3-audit.md` §2): (a) no evidence is released until WAL is flushed past the intent's commit record (target taken after `pg_xact_status` = committed, flush compared with it); (b) bounded wait of 1 s, then `SI_READ_INTENT_NOT_DURABLE`, fail closed; (c) the intent id carries its creating transaction id (server-set), bound by `created_xid`; (d) read sessions with `synchronous_commit = off` are refused; (e) the audit is a REQUEST audit only: disclosure audit and exactly-once delivery NOT GUARANTEED, rollback-resistant release accounting NOT IMPLEMENTED. No new privilege. |
 
 ### 2.2 Milestone 2 governance decisions (preserved, unchanged)
 
@@ -954,15 +955,33 @@ See `docs/b002-m3-demo.md`: the real implementation, end to end, against a fresh
 the reader access log is transactional (A1); a production-safe audit design (committed intent before
 data) is proposed there and needs a separate decision.
 
-## 16. Durable audit before evidence retrieval (M3-AUD-01, migration 0009) — IMPLEMENTED, pending independent acceptance
+## 16. Request audit before evidence retrieval (M3-AUD-01, migration 0009) — IMPLEMENTED; conditionally accepted for synthetic use by M3-AUD-02
 
 See `docs/b002-m3-audit.md`. Every internal read now has two steps:
 1. `si_begin_read` commits a scoped read intent (login, source, cursor digest, limit).
 2. `si_read_evidence(source, intent, cursor, limit)` returns evidence only for a committed, open, unexpired intent with that exact binding. It then re-applies every 0008 check, including D8/G3 through `si_evidence_readable`, and consumes the intent.
 
-The 0008 three-argument read is removed. A caller-side rollback no longer erases the audit record of returned data, which closes A1 (regression: AUD-2, demonstration A1).
+The 0008 three-argument read is removed. A caller-side rollback no longer erases the committed **request** record (regression: AUD-2, demonstration A1). It still erases the **release** record: A1 is closed as a request audit only. Disclosure audit: NOT GUARANTEED (M3-AUD-02).
 
 Lock order is unchanged: no FK to sources, and the intent row lock is taken only after the source lock is released.
 
-Decisions: FD18 (PROPOSED). Limitations: `docs/b002-m3-audit.md` §6. The rights model, synthetic-only scope and every other blocker in §10 are unchanged.
+Decisions: FD18 (PROPOSED). Limitations: `docs/b002-m3-audit.md` §5. The rights model, synthetic-only scope and every other blocker in §10 are unchanged.
+
+**Correction (M3-AUD-02 / M3-AUD-03):** 0009 records a committed *request*, not a release. Its comment that the `synchronous_commit` refusal makes "a committed intent … durable before it is visible" is incorrect (finding S13).
+
+## 17. Crash-durable read intent (M3-AUD-03, migration 0010) — IMPLEMENTED, pending independent acceptance
+
+`si_read_evidence` (same signature and privileges) now does the following:
+1. Derives the intent's creating transaction id from the server-generated intent id.
+2. Requires `pg_xact_status` = committed.
+3. Captures `T = pg_current_wal_insert_lsn()` before touching `si.read_intents`.
+4. After every intent check, waits at most 1 s, holding no lock, until `pg_current_wal_flush_lsn() >= T`. Otherwise it fails closed with `SI_READ_INTENT_NOT_DURABLE`.
+
+It also refuses read sessions with `synchronous_commit = off`, and maps uncertain transaction ids to `SI_READ_INTENT_INVALID`.
+
+The proof from PostgreSQL 16's commit order, and its conditions (fsync on, primary only, no synchronous standby), are in `docs/b002-m3-audit.md` §2.2–§2.3.
+
+REQUEST AUDIT: records an authorized request, subject to those durability conditions. DISCLOSURE AUDIT: NOT GUARANTEED. Exactly-once delivery: NOT GUARANTEED. Rollback-resistant release accounting: NOT IMPLEMENTED.
+
+Decisions: FD19 (PROPOSED).
 

@@ -2,7 +2,7 @@
 // bad input; the intent statement always precedes the read, and a failed intent means no read).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { beginRead, classifyReadError, readEvidence, ReadFailed, MAX_READ_RECORDS, MAX_READ_BYTES } from '../dist/persistence/reader.js';
+import { beginRead, classifyReadError, readEvidence, ReadFailed, MAX_READ_RECORDS, MAX_READ_BYTES, NOT_DURABLE_ATTEMPTS } from '../dist/persistence/reader.js';
 
 const spy = (err = { code: '42501', message: 'SI_READ_NOT_AUTHORIZED: not authorized' }) => {
   const sent = [];
@@ -15,7 +15,8 @@ test('RL-1: database errors map to fixed read codes', () => {
     [{ code: '55000', message: 'SI_READ_UNSAFE_SESSION: log_statement' }, 'UNSAFE_SESSION'], [{ code: '55P03', message: 'SI_READ_BUSY: x' }, 'BUSY'],
     [{ code: '25000', message: 'SI_ISOLATION: x' }, 'ISOLATION'], [{ code: '42501', message: 'SI_READ_INTENT_INVALID: x' }, 'INTENT_INVALID'],
     [{ code: '55000', message: 'SI_READ_INTENT_UNCOMMITTED: x' }, 'INTENT_UNCOMMITTED'], [{ code: '55000', message: 'SI_READ_INTENT_USED: x' }, 'INTENT_USED'],
-    [{ code: '55000', message: 'SI_READ_INTENT_EXPIRED: x' }, 'INTENT_EXPIRED'], [{ code: '08006' }, 'CONNECTION'], [new Error('x'), 'CONNECTION'], [{ code: 'XX000' }, 'INTERNAL']];
+    [{ code: '55000', message: 'SI_READ_INTENT_EXPIRED: x' }, 'INTENT_EXPIRED'],
+    [{ code: '55000', message: 'SI_READ_INTENT_NOT_DURABLE: x' }, 'INTENT_NOT_DURABLE'], [{ code: '08006' }, 'CONNECTION'], [new Error('x'), 'CONNECTION'], [{ code: 'XX000' }, 'INTERNAL']];
   for (const [e, want] of cases) assert.equal(classifyReadError(e), want, JSON.stringify(e));
 });
 
@@ -76,11 +77,30 @@ test('RL-6: retry semantics — BUSY / CONNECTION after a committed intent are r
   assert.deepEqual([busy.code, busy.intentId, busy.retryable], ['BUSY', ID, true]);
   const lost = await readEvidence(scripted([{ id: ID }], { code: '57P01', message: 'terminating' }), 'rd-1').catch(e => e);
   assert.deepEqual([lost.code, lost.retryable], ['CONNECTION', true]);
-  for (const [m, code] of [['SI_READ_INTENT_USED: x', 'INTENT_USED'], ['SI_READ_INTENT_EXPIRED: x', 'INTENT_EXPIRED'], ['SI_READ_NOT_AUTHORIZED: x', 'NOT_AUTHORIZED']]) {
-    const e = await readEvidence(scripted([{ id: ID }], { code: '55000', message: m }), 'rd-1').catch(x => x);
+  for (const [m, code] of [['SI_READ_INTENT_USED: x', 'INTENT_USED'], ['SI_READ_INTENT_EXPIRED: x', 'INTENT_EXPIRED'], ['SI_READ_INTENT_NOT_DURABLE: x', 'INTENT_NOT_DURABLE'],
+                             ['SI_READ_NOT_AUTHORIZED: x', 'NOT_AUTHORIZED']]) {
+    // With a caller-supplied intent there is no automatic new read (RL-7 covers the library's own retry).
+    const e = await readEvidence(scripted({ code: '55000', message: m }), 'rd-1', { intentId: ID }).catch(x => x);
     assert.deepEqual([e.code, e.retryable], [code, false]);
   }
   const c = scripted([]);
   await readEvidence(c, 'rd-1', { intentId: ID });
   assert.deepEqual(c.sent.map(s => s[0]), ['SELECT * FROM si.si_read_evidence($1, $2::uuid, $3, $4::int)'], 'a retry reuses the intent: no new intent');
+});
+
+test('RL-7 (0010): a read the library started and that is refused INTENT_NOT_DURABLE is retried with a NEW intent, bounded', async () => {
+  const ND = { code: '55000', message: 'SI_READ_INTENT_NOT_DURABLE: x' };
+  const ID2 = '00000000-0000-4000-8000-0000000000aa';
+  const c = scripted([{ id: ID }], ND, [{ id: ID2 }], []);
+  const page = await readEvidence(c, 'rd-1');
+  assert.equal(page.intentId, ID2, 'the second attempt used a new intent');
+  assert.deepEqual(c.sent.map(x => x[0].split('(')[0]), ['SELECT si.si_begin_read', 'SELECT * FROM si.si_read_evidence', 'SELECT si.si_begin_read', 'SELECT * FROM si.si_read_evidence']);
+  assert.equal(NOT_DURABLE_ATTEMPTS, 3);
+  const steps = []; for (let i = 0; i < NOT_DURABLE_ATTEMPTS; i++) steps.push([{ id: ID }], ND);
+  const always = scripted(...steps);
+  const err = await readEvidence(always, 'rd-1').catch(e => e);
+  assert.deepEqual([err.code, err.retryable, always.sent.length], ['INTENT_NOT_DURABLE', false, 2 * NOT_DURABLE_ATTEMPTS], 'bounded, then fails closed');
+  const given = scripted(ND);
+  assert.equal((await readEvidence(given, 'rd-1', { intentId: ID }).catch(e => e)).code, 'INTENT_NOT_DURABLE');
+  assert.equal(given.sent.length, 1, 'a caller-supplied intent is never replaced');
 });

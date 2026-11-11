@@ -3,7 +3,7 @@
 **Status: implemented, pending independent acceptance. Synthetic data only. Not a product, not a
 production deployment, not customer-facing.**
 
-The demonstration drives the **real** implementation — migrations 0001–0009 applied by the
+The demonstration drives the **real** implementation — migrations 0001–0010 applied by the
 least-privilege migrator, and the persistence library in `src/persistence/` — against a fresh,
 disposable PostgreSQL 16.15 container. It contains no business logic of its own: the database and the
 library decide every outcome; the demonstration only calls them and asserts the results.
@@ -45,7 +45,7 @@ un-normalized fixture is itself the invalid batch of N3. There is no network col
 
 | ID | Scenario | Proves (real implementation) |
 |---|---|---|
-| E1 | Environment | Migrations 0001–0009 applied by `si_migrator`; PostgreSQL 16; D7 operational preconditions; safe collector logging |
+| E1 | Environment | Migrations 0001–0010 applied by `si_migrator`; PostgreSQL 16; D7 operational preconditions; safe collector logging |
 | H1 | Synthetic source | A SYNTHETIC source with two networks (inserted as `si_owner`: sources have no write function) |
 | H2 | Rights | `si_record_rights_version`: evaluation and retention ALLOWED; display, mirroring, export DENIED; valid for publication |
 | H3 | Scoped run | Scoped T1 binds the request to the fixture hash and records the network scope |
@@ -73,7 +73,7 @@ un-normalized fixture is itself the invalid batch of N3. There is no network col
 | N12 | Read limit | 101 refused by the library before sending, and by the database at both the intent and the read (SQLSTATE only) |
 | N13 | Unsafe logging | A collector session that could log parameters is refused before any payload; a reader session without a statement bound is refused |
 | N14 | Purge vs completion | A purge skips a source held by a completion (BUSY) — no foreign-key error — and purges it afterwards, keeping the shared identity |
-| A1 | Durable audit (M3-AUD-01) | A read inside a transaction that rolls back keeps its **committed** read intent (bound to the reader and the source); only the best-effort completion row rolls back. A read whose intent is not committed releases nothing (INTENT_UNCOMMITTED). Until M3-AUD-01 this scenario demonstrated the A1 weakness (§5) |
+| A1 | Request audit only (M3-AUD-01/03) | A read inside a transaction that rolls back keeps its **committed** request record (the read intent, bound to the reader and the source) and the report **measures** what the rollback erased: request records lost = 0, release records lost = 1. Rollback-resistant release accounting is NOT IMPLEMENTED; disclosure audit NOT GUARANTEED. A read whose intent is not committed releases nothing (INTENT_UNCOMMITTED). Until M3-AUD-01 this scenario demonstrated the A1 weakness (§5) |
 | A2 | Intent vs. current authorization | Revocation between the committed intent and the read is enforced (NOT_AUTHORIZED); BUSY during a control is retryable with the same intent; a consumed intent is final (INTENT_USED) |
 | L1 | Logs | No fixture value appears in the server log |
 
@@ -101,8 +101,8 @@ retention deadline (H12, N7, N14) and disturbs one receipt identity (N6) under
 
 ## 5. Auditability: the A1 weakness and its resolution
 
-**Update (M3-AUD-01, migration 0009):** the design below is now implemented. See `docs/b002-m3-audit.md` for the
-contract, its differences from this outline, and the residual limitations. Scenario A1 now demonstrates the durable
+**Update (M3-AUD-01 / M3-AUD-03, migrations 0009 and 0010):** a REQUEST audit is implemented (committed, crash-durable read intents); a disclosure audit is NOT GUARANTEED and rollback-resistant release accounting is NOT IMPLEMENTED. See `docs/b002-m3-audit.md` for the
+contract, its differences from this outline, and the residual limitations. Scenario A1 now demonstrates the request
 audit. The original M3-P3D text follows for the record.
 
 **Weakness (A1).** `si.reader_access_log` is written inside the read's transaction. A reader that wraps
