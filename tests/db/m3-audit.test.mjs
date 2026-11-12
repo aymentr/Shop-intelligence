@@ -44,7 +44,9 @@ async function fresh(t, prefix = 'm3aud') {
 const ROW = (id, o = {}) => ({ network: 'META', nativeAdId: id, advertiserName: 'Synthetic Co', countries: ['DE'],
   seenAt: '2026-01-01T00:00:00.000Z', sourceUrl: 'https://example.test/a', destinationUrl: 'https://example.test/dest',
   creativeUrl: 'https://example.test/creative', title: 'Synthetic title', ...o });
-const rows = (k, tag = 'a') => Array.from({ length: k }, (_, i) => ROW(`${tag}${++n}-${i}`));
+// Ids contain letters outside [0-9a-f-] ("zq", "x"): AUD-1 searches the stored intents (UUIDs, hex digests) for each
+// record value, and an id such as 'a2-0' can occur by chance at a UUID group boundary (M4-P2: one spurious failure).
+const rows = (k, tag = 'a') => Array.from({ length: k }, (_, i) => ROW(`zq${tag}${++n}x${i}`));
 async function collect(x, src, rs) {
   const networks = [...new Set(rs.map(r => r.network))].sort();
   const fx = fixtureSha256(rs), sha = requestSha256({ adapterId: src, evidenceKind: 'SYNTHETIC', networks, fixtureSha256: fx });
@@ -260,14 +262,19 @@ test('AUD-7: concurrent requests — exactly one committed consumption per inten
   const { src } = await ready(x, 2);
   const a1 = await x.connect('si_reader_alice'), a2 = await x.connect('si_reader_alice');
   // Since 0010 a second session on the same intent cannot release anything while the first consumer's
-  // transaction is open: that transaction's WAL is unflushed, so the second read fails closed in the
-  // durability gate (or, once the first commits, finds the intent consumed). It never waits on the row lock.
+  // transaction is open. Two fail-closed outcomes are possible, depending on the WAL writer (corrected in M4-P2: the
+  // earlier claim "it never waits on the row lock" held only when the writer did not flush in time; measured
+  // 4/30 failures of the old assertion on bb155d3 and 6/30 on M4-P2):
+  //   - the first consumer's WAL is still unflushed: the durability gate refuses (55000 NOT_DURABLE, or USED);
+  //   - the WAL writer flushed it within the gate's 1 s: the gate passes, the consumption UPDATE then waits on the
+  //     intent's row lock and gives up after lock_timeout (55P03 SI_READ_BUSY). The statement aborts; nothing is released.
   const id = await intent(a1, src);
   await a1.query('BEGIN');
   assert.equal((await readWith(a1, src, id)).length, 2, 'first consumer, not yet committed');
   const s = await settle(readWith(a2, src, id));
-  assert.deepEqual([s.status, s.code], ['db-error', '55000']);
-  assert.match(s.message, /^SI_READ_INTENT_(NOT_DURABLE|USED)/, 'the second consumer releases nothing while the first is open');
+  assert.equal(s.value, undefined, 'the second consumer releases nothing while the first is open');
+  assert.ok((s.code === '55000' && /^SI_READ_INTENT_(NOT_DURABLE|USED)/.test(s.message)) || (s.code === '55P03' && /^SI_READ_BUSY:/.test(s.message)),
+    `exactly one of the two fail-closed refusals: ${s.code} ${s.message}`);
   await a1.query('COMMIT');
   await rejects(assert, readWith(a2, src, id), USED, 'after the first consumer committed, the intent is consumed');
   const id2 = await intent(a1, src);

@@ -487,3 +487,11 @@ All of these are tested in SRV-5.
 
 **Governance:** the new reader privilege (EXECUTE on `si_search_advertisers` and `si_advertiser_history`) is recorded as **FD22 (PROPOSED)**. R-22 (the client-side scan) is resolved on the product path by 0014.
 
+### Regression findings during M4-P2 (Phase 8), each investigated
+
+| Finding | Root cause | Resolution |
+|---|---|---|
+| COLD-2 failed 3/3 | It expected M4-P1.2's three audited requests per history. Server-side history is one request, with availability inside | Expectation corrected: one request; at most `NOT_DURABLE_ATTEMPTS − 1` refused attempts. On cold clones: 0–1 refused attempts, about 1 s |
+| Scheduled-version test failed | It hooked evidence pages, which the server-side history no longer uses | SV-1/SV-M now run on the client-scan path, which uses the 0013 availability function. New SV-2/SV-2M: a version taking effect between server-side pages gives `AVAILABILITY_CHANGED`; the server-token mutant without the version in effect gives `ok:3` (killed) |
+| AUD-1 failed once (pre-existing M3 test) | Its content-free check searches the stored intents (UUIDs, hex digests) for record values. Ids such as `a2-0` can occur by chance at a UUID group boundary | Fixture ids now contain letters outside `[0-9a-f-]`; 0/20 after the fix |
+| AUD-7 failed once (pre-existing M3 test) | Two fail-closed outcomes depend on WAL-writer timing: the gate refuses (`55000`), or the gate passes and the consumption waits on the intent row lock (`55P03 SI_READ_BUSY`). The old assertion accepted only the first. Measured 4/30 failures on `bb155d3` and 6/30 on M4-P2 | Accepts exactly those two refusals and still asserts that nothing is released; 0/20 after the fix |
