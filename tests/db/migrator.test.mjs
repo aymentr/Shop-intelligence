@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -204,6 +204,32 @@ test('MG8 (D5b compatibility): hardening is per database — clones keep it, tem
   assert.match(dump.stdout, /GRANT ALL ON FUNCTION pg_catalog\.pg_advisory_xact_lock\(bigint\) TO si_migrator/);
 });
 
+/**
+ * Runs pg_dump / pg_restore with the SAME major version as the server (M4-P1.2: the CI runner image moved its host
+ * client to a newer major, whose pg_restore issues settings a PostgreSQL 16 server rejects, e.g. transaction_timeout).
+ * Uses the host tool when its major matches the server's; otherwise the server container's own tool (compose service
+ * `db`, as DR-1 does), streaming the archive through stdin/stdout. Returns { status, stdout, stderr, via }.
+ */
+async function matchedPgTool(tool, args, { input } = {}) {
+  const c = await connect();
+  let serverMajor;
+  try { serverMajor = Math.floor(Number((await c.query('SHOW server_version_num')).rows[0].server_version_num) / 10000); } finally { await c.end(); }
+  const major = out => Number(/\(PostgreSQL\) (\d+)/.exec(out ?? '')?.[1]);
+  const env = { ...process.env, PGPASSWORD: cfg.adminPassword };
+  const host = spawnSync(tool, ['--version'], { encoding: 'utf8' });
+  if (!host.error && major(host.stdout) === serverMajor) {
+    const r = spawnSync(tool, ['-h', cfg.host, '-p', String(cfg.port), '-U', cfg.adminUser, ...args], { env, input, maxBuffer: 1 << 28 });
+    return { status: r.status, stdout: r.stdout, stderr: String(r.stderr ?? r.error?.message ?? ''), via: `host ${tool} ${serverMajor}` };
+  }
+  const repo = fileURLToPath(new URL('../../', import.meta.url));
+  const exec = ['compose', 'exec', '-T', '-e', `PGPASSWORD=${cfg.adminPassword}`, 'db'];
+  const inside = spawnSync('docker', [...exec, tool, '--version'], { encoding: 'utf8', cwd: repo });
+  assert.equal(major(inside.stdout), serverMajor,
+    `no ${tool} matching server major ${serverMajor}: host ${host.stdout?.trim() || host.error?.message}, container ${inside.stdout?.trim() || inside.stderr}`);
+  const r = spawnSync('docker', [...exec, tool, '-h', '127.0.0.1', '-U', cfg.adminUser, ...args], { cwd: repo, input, maxBuffer: 1 << 28 });
+  return { status: r.status, stdout: r.stdout, stderr: String(r.stderr ?? r.error?.message ?? ''), via: `container ${tool} ${serverMajor}` };
+}
+
 test('MG9 (D5b restore): hardened PostgreSQL dump restores effective privileges and schema', async t => {
   const source = await freshDatabase(t, 'mg9src');
   const target = uniqueDbName('mg9restore');
@@ -215,22 +241,16 @@ test('MG9 (D5b restore): hardened PostgreSQL dump restores effective privileges 
   const directory = mkdtempSync(join(tmpdir(), 'si-mg9-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const archive = join(directory, 'backup.dump');
-  const env = { ...process.env, PGPASSWORD: cfg.adminPassword };
-  const dump = spawnSync('pg_dump',
-    ['-Fc', '--no-owner', '-h', cfg.host, '-p', String(cfg.port), '-U', cfg.adminUser, '-f', archive, source],
-    { encoding: 'utf8', env });
-  assert.equal(dump.error, undefined, `pg_dump unavailable: ${dump.error?.message}`);
-  assert.equal(dump.status, 0, `pg_dump failed: ${dump.stderr}`);
+  const dump = await matchedPgTool('pg_dump', ['-Fc', '--no-owner', source]);
+  assert.equal(dump.status, 0, `pg_dump failed (${dump.via}): ${dump.stderr}`);
+  writeFileSync(archive, dump.stdout);
+  t.diagnostic(`MG9 dump and restore tools: ${dump.via}`);
 
   const maintenance = await connect();
   try { await maintenance.query(`CREATE DATABASE ${target} TEMPLATE template0`); }
   finally { await maintenance.end(); }
-  const restore = spawnSync('pg_restore',
-    ['--exit-on-error', '--no-owner', '-h', cfg.host, '-p', String(cfg.port),
-      '-U', cfg.adminUser, '-d', target, archive],
-    { encoding: 'utf8', env });
-  assert.equal(restore.error, undefined, `pg_restore unavailable: ${restore.error?.message}`);
-  assert.equal(restore.status, 0, `pg_restore failed: ${restore.stderr}`);
+  const restore = await matchedPgTool('pg_restore', ['--exit-on-error', '--no-owner', '-d', target], { input: readFileSync(archive) });
+  assert.equal(restore.status, 0, `pg_restore failed (${restore.via}): ${restore.stderr}`);
 
   const restored = await connect({ database: target });
   try {
