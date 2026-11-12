@@ -628,3 +628,12 @@ Workloads of M4-P2-ACCEPT-01: source A holds 200,000 observations of one adverti
 | History of a 304- or 1,000-character name (D5) | `BAD_ARGUMENT` | complete |
 | Pagination after a 1,000-character CJK name (D4) | `BAD_CURSOR` | complete (cursors up to 44,110 characters measured, REM-4) |
 | Ingestion of an incompressible 1,000-character CJK name | run failed (54000, index row size) | stored |
+
+### 12.11 Regression findings during M4-P2.1 (Phase 9), each investigated
+
+| Finding | Root cause | Resolution |
+|---|---|---|
+| History page time doubled at 200,000 candidates (2.0 → 4.8 s); a 600,000-observation database reached the 10 s timeout | The first index fix compared the full normalized name on every row (one normalization per row), in addition to the key | Identity verified once per distinct spelling (§12.6); history page 0.93 s |
+| Lifecycle and intelligence demonstrations failed | They assert the applied migration list `1..14` | Updated to `1..15`; lifecycle 31/0, intelligence 7/0, demonstration mutants killed |
+| AUD-12b failed once in the crash suite | Pre-existing: 1/10 on `61bda9d` and 1/10 on M4-P2.1, same assertion (the re-read after the flushing commit is refused `INTENT_NOT_DURABLE`). The test and the gate are not touched by 0015 | Recorded as R-32 (open, unexplained); it fails closed |
+| `pg_stat_database.temp_bytes` attributed temporary files to the next request | Statistics reporting lag | Figures reported from paired readings (§12.10) |
