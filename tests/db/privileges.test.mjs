@@ -100,8 +100,12 @@ const EXPECTED_VOLATILITY = {
   si_availability_mac: 's', si_rotate_availability_state_key: 'v',
   // 0014 server-side intelligence (helpers owner-only)
   si_normalize_advertiser: 'i', si_intelligence_scope: 'i', si_availability_state: 'v', si_intelligence_iso: 'i',
-  si_intelligence_check_args: 'i', si_search_advertisers: 'v', si_advertiser_history: 'v'
+  si_intelligence_check_args: 'i', si_search_advertisers: 'v', si_advertiser_history: 'v',
+  // 0015 intelligence remediation (index key, owner-only)
+  si_advertiser_key: 'i'
 };
+// 0015 (D3): resource bounds pinned on the two server-side reader functions.
+const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB'.split('|')];
 
 let db, c;
 const cleanups = [];
@@ -214,13 +218,21 @@ test('SD1: SECURITY DEFINER contract — owner, fixed search_path, no PUBLIC EXE
   for (const f of fns) {
     assert.equal(f.owner, 'si_owner', f.proname);
     // 0008: the read function also pins a bounded lock wait (it must never queue behind emergency controls).
-    assert.deepEqual(f.proconfig, ['si_read_evidence', 'si_read_source_status', 'si_read_source_availability', 'si_search_advertisers', 'si_advertiser_history'].includes(f.proname) ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
+    assert.deepEqual(f.proconfig, ['si_search_advertisers', 'si_advertiser_history'].includes(f.proname) ? PINNED_INTELLIGENCE
+                                : ['si_read_evidence', 'si_read_source_status', 'si_read_source_availability'].includes(f.proname) ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
                                                                    : ['search_path=pg_catalog, pg_temp'], `${f.proname} search_path`);
     assert.equal(f.default_acl, false, `${f.proname}: a NULL ACL would mean PUBLIC EXECUTE`);
     assert.equal(f.public_grant, false, `${f.proname}: PUBLIC must not have EXECUTE`);
     assert.deepEqual(f.grantees, EXPECTED_EXECUTE[f.proname] ?? [], `${f.proname} grantees`);
     assert.equal(f.provolatile, EXPECTED_VOLATILITY[f.proname], `${f.proname} volatility`);
   }
+});
+
+test('SD15 (0015): the only parameter privilege is SET on temp_file_limit for si_owner (no grant option); no other role holds one', async () => {
+  const rows = (await c.admin.query(`SELECT p.parname, pg_get_userbyid(a.grantee) AS grantee, a.privilege_type, a.is_grantable
+                                 FROM pg_parameter_acl p CROSS JOIN LATERAL aclexplode(p.paracl) a JOIN pg_roles r ON r.oid = a.grantee
+                                WHERE NOT r.rolsuper ORDER BY 1, 2, 3`)).rows;                       // the superuser's own implicit entries aside
+  assert.deepEqual(rows.map(r => [r.parname, r.grantee, r.privilege_type, r.is_grantable]), [['temp_file_limit', 'si_owner', 'SET', false]]);
 });
 
 test('SD2/G3: role attributes and per-role session settings', async () => {

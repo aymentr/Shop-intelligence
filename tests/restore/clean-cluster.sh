@@ -218,4 +218,11 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^SRV-(3|4|6):' tests/db/m4-server-intelligence.test.mjs
 echo 'DR-1 restored server-side search and history: authorization, availability and request audit PASS'
+# Migration 0015 on the restored cluster: the parameter grant is a global (pg_dumpall), the pinned settings are part of
+# the functions; both must survive. REM-3: effective values under a relaxed reader session; REM-1: the exact audit bound.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^REM-(1|3) ' tests/db/m4-remediation.test.mjs
+echo 'DR-1 restored intelligence remediation: pinned resource bounds and the exact response bound PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

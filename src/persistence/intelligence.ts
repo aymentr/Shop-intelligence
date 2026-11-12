@@ -30,7 +30,7 @@ export const MAX_SEARCH_RESULTS = 50;
 export const MAX_SOURCES_PER_REQUEST = 10;
 
 export type IntelligenceFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'SCAN_LIMIT' | 'SOURCE_UNAVAILABLE' | 'AVAILABILITY_CHANGED'
-  | 'RESULT_CHANGED' | 'RESULT_TOO_LARGE';
+  | 'RESULT_CHANGED' | 'RESULT_TOO_LARGE' | 'RESOURCE_LIMIT';
 /** Why a granted reader may not read a source now (migration 0012), in this fixed order. */
 export const UNAVAILABILITY_REASONS = ['RETIRED', 'TERMINATED', 'SUSPENDED', 'RIGHTS_RESTRICTED', 'RETENTION_RESTRICTED',
                                        'NOT_SYNTHETIC', 'UNAVAILABLE'] as const;
@@ -131,16 +131,16 @@ export const availabilityCursor = (sourceId: string): string => `v1|${sourceId}|
 /** One content-free, audited request (its own committed, crash-durable intent), with the library's bounded fresh-intent
  *  retry on INTENT_NOT_DURABLE only. `onError` may map a database error to a typed failure first. */
 async function auditedCall(client: ClientBase, sourceId: string, cursor: string, sql: string, params: unknown[],
-  onError: (message: string) => Error | null = () => null, limit = 1): Promise<Record<string, unknown> | undefined> {
+  onError: (message: string, sqlstate: string | null) => Error | null = () => null, limit = 1): Promise<Record<string, unknown> | undefined> {
   for (let attempt = 1; ; attempt++) {
     const intentId = await beginRead(client, sourceId, { cursor, limit });
     try {
       return (await client.query(sql, [sourceId, intentId, ...params])).rows[0];
     } catch (err) {
       const m = (err as { message?: unknown })?.message;
-      const mapped = typeof m === 'string' ? onError(m) : null;
-      if (mapped) throw mapped;
       const code = (err as { code?: unknown })?.code;
+      const mapped = typeof m === 'string' ? onError(m, typeof code === 'string' ? code : null) : null;
+      if (mapped) throw mapped;
       const failure = new ReadFailed(classifyReadError(err), typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null, intentId);
       if (failure.code === 'INTENT_NOT_DURABLE' && attempt < NOT_DURABLE_ATTEMPTS) continue;
       throw failure;
@@ -325,6 +325,11 @@ export async function searchAdvertisersClientScan(client: ClientBase, q: SearchQ
 
 export const MAX_HISTORY_PAGE = 100;
 export const MAX_HISTORY_OBSERVATIONS = 5000;
+/** Longest advertiser name (si.observations, 0005), in code points as PostgreSQL length() counts them. */
+export const MAX_ADVERTISER_NAME = 1000;
+/** Longest normalized name: NFKC expands one code point to at most 18 (U+FDFA); measured over every code point (0015). */
+export const MAX_NORMALIZED_NAME = 18 * MAX_ADVERTISER_NAME;
+const codePoints = (s: string): number => { let k = 0; for (const _ of s) k++; return k; };
 const NETWORKS = ['GOOGLE', 'META', 'OTHER', 'PINTEREST', 'TIKTOK'];
 
 /** Code point order (the server's COLLATE "C"): compare UTF-8 bytes. */
@@ -343,7 +348,7 @@ function canonicalNetworks(n: string[] | undefined): string[] {
   return list;
 }
 function serverError(sourceId: string) {
-  return (m: string): Error | null => {
+  return (m: string, sqlstate: string | null): Error | null => {
     const u = /^SI_READ_SOURCE_UNAVAILABLE: ([A-Z_,]+)$/.exec(m);
     if (u) {
       const reasons = (u[1] as string).split(',');
@@ -355,6 +360,10 @@ function serverError(sourceId: string) {
     if (m.startsWith('SI_READ_SCAN_LIMIT:')) return new IntelligenceFailed('SCAN_LIMIT', { sourceId });
     if (m.startsWith('SI_READ_RESULT_TOO_LARGE:')) return new IntelligenceFailed('RESULT_TOO_LARGE', { sourceId });
     if (m.startsWith('SI_READ_BAD_CURSOR:')) return new IntelligenceFailed('BAD_CURSOR', { sourceId });
+    // M4-P2.1 (D3): the server's resource bounds. temp_file_limit (pinned on the function, 0015) -> SI_READ_RESOURCE_LIMIT;
+    // the reader session's statement_timeout (at most 10 s, enforced by the session check) -> 57014.
+    if (m.startsWith('SI_READ_RESOURCE_LIMIT:')) return new IntelligenceFailed('RESOURCE_LIMIT', { sourceId });
+    if (sqlstate === '57014' && m === 'canceling statement due to statement timeout') return new IntelligenceFailed('RESOURCE_LIMIT', { sourceId });
     return null;
   };
 }
@@ -364,6 +373,18 @@ function checkDoc(doc: unknown, sourceId: string): ServerDoc & Record<string, un
   if (!d || typeof d !== 'object' || d.source_id !== sourceId || typeof d.state_token !== 'string' || !/^[0-9a-f]{32}$/.test(d.state_token) ||
       toMs(d.as_of) === null) throw new ReadFailed('INTERNAL', null);
   return d as ServerDoc & Record<string, unknown>;
+}
+
+/**
+ * M4-P2.1 (D1): a page is refused above 262,144 bytes (SI_READ_RESULT_TOO_LARGE, the audit limit). A refused page is
+ * requested again with half the page size, down to 1, each attempt its own audited request (at most 7 for a page of
+ * 100); a page of one result always fits (docs §11.7). The reduced size is kept for the following pages.
+ */
+async function sizedPage<T>(size: number, call: (n: number) => Promise<T>, shrunk: (n: number) => void): Promise<T> {
+  for (let n = size; ; n = Math.max(1, Math.floor(n / 2))) {
+    try { const r = await call(n); if (n !== size) shrunk(n); return r; }
+    catch (e) { if (!(e instanceof IntelligenceFailed && e.code === 'RESULT_TOO_LARGE' && n > 1)) throw e; }
+  }
 }
 
 /** One server-side search page for ONE source (one audited request). */
@@ -390,12 +411,16 @@ export async function searchSourcePage(client: ClientBase, sourceId: string,
 }
 
 interface SearchCursorV2 { v: 2; k: string; a: [string, string]; t: Record<string, string> }
+// The largest cursor: a position of MAX_NORMALIZED_NAME code points (at most 6 JSON bytes each, a \u escape), one source
+// id and up to MAX_SOURCES_PER_REQUEST tokens (under 1,200 bytes with the envelope), base64url (4/3).
+const MAX_CURSOR = Math.ceil(((MAX_NORMALIZED_NAME * 6) + 1200) * 4 / 3);
 function encodeCursorV2(c: SearchCursorV2): string { return Buffer.from(JSON.stringify(c), 'utf8').toString('base64url'); }
 function decodeCursorV2(c: string, key: string, sources: string[]): SearchCursorV2 {
   try {
-    if (c.length > 4096) throw new Error('long');
+    if (c.length > MAX_CURSOR) throw new Error('long');
     const o = JSON.parse(Buffer.from(c, 'base64url').toString('utf8'));
     if (o?.v === 2 && o.k === key && Array.isArray(o.a) && o.a.length === 2 && o.a.every((x: unknown) => typeof x === 'string') &&
+        o.a[0].length > 0 && codePoints(o.a[0]) <= MAX_NORMALIZED_NAME && sources.includes(o.a[1]) &&
         o.t && typeof o.t === 'object' && sources.every(s => typeof o.t[s] === 'string' && /^[0-9a-f]{32}$/.test(o.t[s]))) return o as SearchCursorV2;
   } catch { /* fall through */ }
   throw new IntelligenceFailed('BAD_CURSOR');
@@ -423,19 +448,25 @@ export async function searchAdvertisers(client: ClientBase, q: SearchQuery, _opt
     .digest('hex').slice(0, 32);
   const cur = q.cursor ? decodeCursorV2(q.cursor, key, sources) : null;
   const all: AdvertiserHit[] = [], tokens: Record<string, string> = {}, checked: AvailableSource[] = [];
-  let more = false, calls = 0;
+  let more = false, calls = 0, boundary: AdvertiserHit | null = null;
+  const order = (a: AdvertiserHit, b: AdvertiserHit) => cpCompare(a.normalizedName, b.normalizedName) || cpCompare(a.sourceId, b.sourceId);
   for (const sourceId of sources) {                                           // each source: its own authorization and availability
     const after = cur ? cur.a[0] : null, afterInclusive = cur ? cpCompare(sourceId, cur.a[1]) > 0 : false;
-    const page = await searchSourcePage(client, sourceId, { query: q.query, networks, period, after, afterInclusive, limit });
-    calls++;
+    const page = await sizedPage(limit, n => { calls++; return searchSourcePage(client, sourceId, { query: q.query, networks, period, after, afterInclusive, limit: n }); }, () => {});
     if (cur && cur.t[sourceId] !== page.stateToken) throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });
     tokens[sourceId] = page.stateToken;
     checked.push({ sourceId, state: 'AVAILABLE', checkedFrom: page.asOf, asOf: page.asOf });
     all.push(...page.hits);
-    if (page.hasMore) more = true;
+    if (page.hasMore) {
+      more = true;
+      // Hits of this source after its last returned hit are not known: the merged page may not go beyond it.
+      const lastHit = page.hits[page.hits.length - 1];
+      if (!lastHit) throw new ReadFailed('INTERNAL', null);
+      if (!boundary || order(lastHit, boundary) < 0) boundary = lastHit;
+    }
   }
-  all.sort((a, b) => cpCompare(a.normalizedName, b.normalizedName) || cpCompare(a.sourceId, b.sourceId));
-  const hits = all.slice(0, limit);
+  all.sort(order);
+  const hits = all.filter(h => !boundary || order(h, boundary) <= 0).slice(0, limit);
   const last = hits[hits.length - 1];
   const next = (all.length > limit || more) && last ? encodeCursorV2({ v: 2, k: key, a: [last.normalizedName, last.sourceId], t: tokens }) : null;
   return { hits, nextCursor: next, scannedPages: calls, sources: checked };
@@ -450,7 +481,7 @@ export async function searchAdvertisers(client: ClientBase, q: SearchQuery, _opt
 export async function advertiserHistory(client: ClientBase, sourceId: string, advertiserName: string,
   opts: { period?: Period; pageSize?: number; maxRecords?: number; withStatus?: boolean; networks?: string[] } = {}): Promise<AdvertiserHistory> {
   if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId)) throw new IntelligenceFailed('BAD_ARGUMENT');
-  if (typeof advertiserName !== 'string' || normalizeAdvertiser(advertiserName).length === 0 || advertiserName.length > 300) {
+  if (typeof advertiserName !== 'string' || normalizeAdvertiser(advertiserName).length === 0 || codePoints(advertiserName) > MAX_ADVERTISER_NAME) {
     throw new IntelligenceFailed('BAD_ARGUMENT');
   }
   const period = checkPeriod(opts.period);
@@ -461,17 +492,22 @@ export async function advertiserHistory(client: ClientBase, sourceId: string, ad
   }
   const from = isoUs(period?.from ?? null), to = isoUs(period?.to ?? null);
   const observations: Observation[] = [];
-  let after: string | null = null, first: (ServerDoc & Record<string, unknown>) | null = null, lastAsOf = '';
+  let after: string | null = null, first: (ServerDoc & Record<string, unknown>) | null = null, lastAsOf = '', size = limit;
   for (;;) {
-    const cursor = intelligenceScope('history', sourceId, [advertiserName, networks.join(','), from, to, after]);
-    const row = await auditedCall(client, sourceId, cursor,
-      'SELECT si.si_advertiser_history($1, $2::uuid, $3, $4::text[], $5::timestamptz, $6::timestamptz, $7, $8) AS doc',
-      [advertiserName, networks, from, to, after, limit], serverError(sourceId), limit);
-    const d = checkDoc(row?.doc, sourceId);
+    const d = await sizedPage(size, n => {
+      const cursor = intelligenceScope('history', sourceId, [advertiserName, networks.join(','), from, to, after]);
+      return auditedCall(client, sourceId, cursor,
+        'SELECT si.si_advertiser_history($1, $2::uuid, $3, $4::text[], $5::timestamptz, $6::timestamptz, $7, $8) AS doc',
+        [advertiserName, networks, from, to, after, n], serverError(sourceId), n).then(row => checkDoc(row?.doc, sourceId));
+    }, n => { size = n; });
     const page = d.observations;
-    if (!Array.isArray(page) || page.length > limit || typeof d.summary !== 'object' || d.summary === null) throw new ReadFailed('INTERNAL', null);
-    if (!first) first = d;
-    else {
+    if (!Array.isArray(page) || page.length > size || typeof d.summary !== 'object' || d.summary === null) throw new ReadFailed('INTERNAL', null);
+    if (!first) {
+      first = d;
+      // M4-P2.1 (D2): the summary counts every observation the pages would return (same filters, one statement), so a
+      // history above the bound is refused after the first page, not after scanning up to the bound.
+      if (Number((d.summary as Record<string, unknown>).observations) > max) throw new IntelligenceFailed('SCAN_LIMIT', { sourceId });
+    } else {
       if (d.state_token !== first.state_token) throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });
       if (JSON.stringify(d.summary) !== JSON.stringify(first.summary) || d.normalized_name !== first.normalized_name) {
         throw new IntelligenceFailed('RESULT_CHANGED', { sourceId });
@@ -488,7 +524,7 @@ export async function advertiserHistory(client: ClientBase, sourceId: string, ad
     }
     const next = d.next_after;
     if (next === null || next === undefined) break;
-    if (typeof next !== 'string' || page.length !== limit) throw new ReadFailed('INTERNAL', null);
+    if (typeof next !== 'string' || page.length !== size) throw new ReadFailed('INTERNAL', null);
     after = next;
   }
   const f = first as ServerDoc & Record<string, unknown>;

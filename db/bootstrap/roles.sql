@@ -90,3 +90,8 @@ BEGIN
     EXECUTE format('REVOKE si_reader FROM %I GRANTED BY %I CASCADE', g.member, g.grantor);
   END LOOP;
 END $$;
+
+-- M4-P2.1 (migration 0015, D3): the reader functions pin temp_file_limit in their SET clause, so that a reader can
+-- neither exceed nor relax the bound. temp_file_limit is a superuser parameter: only this grant lets si_owner attach it
+-- to a function (it grants nothing to readers or service roles, and si_owner cannot pass it on). Idempotent.
+GRANT SET ON PARAMETER temp_file_limit TO si_owner;

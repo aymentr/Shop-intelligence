@@ -433,7 +433,7 @@ src/persistence/intelligence.ts
 | Availability (FD21) | Evaluated inside each page under the lock (`si_availability_state`, the 0013 predicate, reasons and keyed token, unchanged). Unavailable gives `SOURCE_UNAVAILABLE` with fixed reasons, never an empty result. The page token equals the FD21 availability token | SRV-4; mutants "availability check omitted", "server state token ignores the row version" |
 | Only readable evidence | Runs filtered by `si_evidence_readable` (VALID verdict, retention, controls, rights, networks) | SRV-1, SRV-5; mutant "readable-evidence predicate omitted" |
 | No cross-source aggregation | One source per call. The library merges hit lists without merging identities; one unauthorized or unavailable source fails the whole search | SRV-3; lib mutant "page position not inclusive" |
-| Bounded resources | Page size 1–50 (search) or 1–100 (history). At most 200,000 candidate observations per call (`SCAN_LIMIT`), at most 1 MiB per response (`RESULT_TOO_LARGE`), at most 10 spellings per hit (`namesTruncated`). Query or name at most 300 characters; at most 5 networks, canonical; period at most 366 days at millisecond precision | SRV-2, SRV-7 (bounds enforced through lowered limits in copies) |
+| Bounded resources (**corrected in §12.2–§12.4**: response ≤ 262,144 bytes; the candidate cap does not bound work) | Page size 1–50 (search) or 1–100 (history). At most 200,000 candidate observations per call (`SCAN_LIMIT`), at most 1 MiB per response (`RESULT_TOO_LARGE`), at most 10 spellings per hit (`namesTruncated`). Query or name at most 300 characters; at most 5 networks, canonical; period at most 366 days at millisecond precision | SRV-2, SRV-7 (bounds enforced through lowered limits in copies) |
 | No direct access | Readers gain EXECUTE on the two functions only. Every helper (normalizer, scope, availability state, argument checks) is owner-only; readers still have no table privilege | SRV-3; SR-0, SD1, AUD-8 |
 | Request audit only | Consumption plus a completion row naming the hits or observations released. **This is a request audit, not proof of delivery** | SRV-6 |
 
@@ -447,6 +447,8 @@ src/persistence/intelligence.ts
 - An expression index `observations_by_source_advertiser (source_id, si_normalize_advertiser(advertiser_name))` serves history. It must be rebuilt with `REINDEX` after a PostgreSQL or ICU upgrade that changes Unicode tables.
 
 ### Consistency (what is and is not guaranteed)
+
+> **Superseded by §12.8 (M4-P2.1).** The table below overstated detection: a grant revoked and restored between pages, and an add-and-remove swap that leaves the summary identical, are not detected.
 
 **Each page** is computed in one statement under the source lock, so it is consistent within itself. **No snapshot spans pages.** The library distinguishes:
 
@@ -474,7 +476,7 @@ All of these are tested in SRV-5.
 - **Search** reads every readable run's observations: a Bitmap Heap Scan per run that discards non-matching names. Execution takes 314 ms and 9,804 buffers at 50,000; sort memory is 125 kB. It costs roughly linear time in the source's observations per page, and every page re-aggregates.
 - **Variants tried:** a single evaluation of the normalizer per row and an inlinable variant did not reduce the cost (measured 148–211 ms against 117 ms for the normalizer step), so none was adopted.
 - **Per-page overhead:** the request intent (a synchronous commit) costs about 1 ms. Authorization, availability and the durability gate are within the 10–14 ms of a page at 1,000 observations.
-- **Bound:** the 200,000-candidate cap limits the worst case at about 1.2 s per page by this profile.
+- **Bound:** ~~the 200,000-candidate cap limits the worst case at about 1.2 s per page by this profile~~. Incorrect (M4-P2-ACCEPT-01 D3): the cap does not bound the scan; see §12.4.
 
 ### Limitations (M4-P2)
 
@@ -495,3 +497,134 @@ All of these are tested in SRV-5.
 | Scheduled-version test failed | It hooked evidence pages, which the server-side history no longer uses | SV-1/SV-M now run on the client-scan path, which uses the 0013 availability function. New SV-2/SV-2M: a version taking effect between server-side pages gives `AVAILABILITY_CHANGED`; the server-token mutant without the version in effect gives `ok:3` (killed) |
 | AUD-1 failed once (pre-existing M3 test) | Its content-free check searches the stored intents (UUIDs, hex digests) for record values. Ids such as `a2-0` can occur by chance at a UUID group boundary | Fixture ids now contain letters outside `[0-9a-f-]`; 0/20 after the fix |
 | AUD-7 failed once (pre-existing M3 test) | Two fail-closed outcomes depend on WAL-writer timing: the gate refuses (`55000`), or the gate passes and the consumption waits on the intent row lock (`55P03 SI_READ_BUSY`). The old assertion accepted only the first. Measured 4/30 failures on `bb155d3` and 6/30 on M4-P2 | Accepts exactly those two refusals and still asserts that nothing is released; 0/20 after the fix |
+
+## 12. M4-P2.1: server-side intelligence remediation (migration 0015)
+
+**Status:** IMPLEMENTED on branch `claude/b002-m4-p2-1` from `61bda9d` (the M4-P2 review commit), pending independent acceptance. It addresses M4-P2-ACCEPT-01 findings D1–D7, documents D8, and fixes one further defect found while reproducing D4 (ingestion, §12.6). Synthetic data only; no display, export or deployment. The architecture of §11 is unchanged: the same two reader functions (same signatures, privileges, gate, lock, grant and availability checks, readable-evidence policy and audit), replaced by `CREATE OR REPLACE` in 0015.
+
+### 12.1 Reproduction on the baseline (61bda9d, disposable databases)
+
+| Finding | Workload | Expected | Actual on 61bda9d |
+|---|---|---|---|
+| D1 | History of 100 observations (1,000-character titles, 2,000-character URLs), page size 80 | Typed refusal or a page | `ReadFailed INTERNAL` (23514 from the audit CHECK `bytes_returned <= 262144`); page size 70 succeeds. Search, 50 hits of 990-character CJK names: `INTERNAL` |
+| D2 | Library history of one advertiser with 200,000 observations (bound 5,000) | Refusal after one page | `SCAN_LIMIT` after **51 pages / 51 audited requests, 93 s, 4.56 GB of temporary files** (the acceptance review measured 168 s and 5.06 GB) |
+| D3 | Same source | Work bounded | No-match search over 200,000: 1.0 s; over 400,000: 2.5 s (the candidate cap never applies). Concentrated search: 2.5 s, 52 MB temp; history page: 2.0 s, 93 MB temp. Reader `SET work_mem = '1GB'` was in effect inside the definer function (temp 50 MB → 0 MB): the reader could relax memory |
+| D4 | Search pagination, page size 1, after a 1,000-character CJK name | Next page | `BAD_CURSOR` (cursor 4,150 > 4,096 characters; the server also refused positions above 1,000 characters) |
+| D5 | History of a 304-character name and of a 1,000-character name | History | `BAD_ARGUMENT` (limit 300) |
+| D6 | The four surviving mutants | Killed | Not covered by any test on 61bda9d (search period end, history network filter, search `synchronous_commit` check, search source lock) |
+| D7 | Grant revoked and restored between history pages; add-and-remove swap | Documented honestly | Revoke+restore: `ok:3` (not detected); the §11 table did not say so |
+| D8 | SUSPEND issued during a concentrated search page | Documented | Waited 2.3–3.1 s for the page's source lock |
+| (new) | Ingestion of an incompressible 1,000-character CJK advertiser name (valid per 0005) | Stored | **54000: index row size 3,024 exceeds btree maximum 2,704** for `observations_by_source_advertiser`; the whole run completion failed |
+
+Plans at 200,000 candidates (`EXPLAIN (ANALYZE, BUFFERS)`, work_mem 4 MB): the candidate `LIMIT 200001` sits above the scan and join; it bounds the rows materialized, not the rows read. The temporary files come from the materialized CTEs (`cand`, `mine`; each is read twice), not from sorts: search 17 MB, history 59 MB in the plan. A no-match search reads every readable run's observations (Nested Loop over 800 runs × Bitmap Heap Scan, 2.3 s at 400,000) and is never limited by the cap.
+
+### 12.2 D1 — the response bound is the audit bound
+
+- `max_bytes` = **262,144** in both functions: exactly the 0008/0009 CHECK. The size is `octet_length(out_doc::text)`, the same value written to `read_intents.bytes_returned` and `reader_access_log.bytes_returned`, and the byte length of the text a client receives (REM-1 measures it on the client). The historical CHECKs are unchanged.
+- Above it: `SI_READ_RESULT_TOO_LARGE` (54000) **before** the intent is consumed. Nothing is released, the intent stays `OPEN`, no completion row. The library maps it to `RESULT_TOO_LARGE`.
+- **Exact boundary (REM-1, real function):** a history page built to exactly 262,144 bytes is released and audited as 262,144; the same page one byte larger is refused typed, not by the CHECK. The construction is linear and exact (fixed-width fields); the test asserts the measured size, so the boundary is not assumed.
+- **The library reduces the page size** on `RESULT_TOO_LARGE`: the page is requested again at half the size, down to 1 (at most 7 audited requests for a page of 100; each is its own audited request with its own scope, never a retry of the same request). The reduced size is kept for later pages. Search merges per-source pages up to the smallest last hit of any source that has more (a reduced page must not let another source's later hits skip it; lib mutant "search merge ignores a reduced source page").
+- **A page of one result always fits.** History spellings in the summary are bounded to the first 50 in code-point order *and* 64 KiB (`namesTruncated` when cut). Worst case of a one-observation history page: normalized name ≤ 33 KB (18,000 characters of ≤ 33 UTF-8 bytes per original character), spellings ≤ 64 KiB, one observation ≤ ~25 KB (name and title of 1,000 characters at ≤ 6 JSON bytes each, URL of 2,048 at ≤ 6), envelope < 1 KB: under 125 KB. A search hit: ≤ 33 KB + 10 spellings × 6 KB < 95 KB. REM-4b builds a worst case (64 spellings of 1,000 characters, 994 of them control characters; control-character title; quote-filled URL): the page of one observation is 82,516 bytes.
+
+### 12.3 D2 — history above the library bound fails after one page
+
+`advertiserHistory` compares the first page's `summary.observations` with its bound and fails `SCAN_LIMIT` immediately. The count's semantics: the number of observations the pages of *this* request would return (same source, normalized name, networks and period, readable evidence), counted in the same statement as the page, up to the server cap (above it the server already fails `SCAN_LIMIT`). It cannot be bypassed:
+- **Filters** are part of the request and of the count (REM-2: a network filter that excludes nothing is refused; one that excludes everything returns 0).
+- **Pagination:** the library always starts at the first page (no caller-supplied position for history), and every later page's summary must equal the first's.
+- **Concurrent changes:** growth after the first page changes the summary of the next page → `RESULT_CHANGED` (REM-2), never a longer result; the per-observation bound check remains.
+
+### 12.4 D3 — resource bounds
+
+**Pinned on both functions** (`proconfig`, verified exactly by SD1 and REM-3):
+
+| Setting | Value | Why |
+|---|---|---|
+| `work_mem` | 4MB | The server default; measured 4–64 MB: larger values did not reduce latency at 200,000 candidates and increased history temp (93 → 118–167 MB). Pinned so that a reader's `SET work_mem = '1GB'` no longer applies inside |
+| `hash_mem_multiplier` | 2 | The default, pinned for the same reason |
+| `max_parallel_workers_per_gather` | 0 | `temp_file_limit` is per process; parallel workers would each get their own. The measured plans used none |
+| `jit` | off | No compilation cost on large plans; deterministic plans |
+| `temp_file_limit` | 256MB | Above the largest legitimate page measured at the cap (93–167 MB), far below the 4.6 GB of the D2 workload. 53400 inside the page → `SI_READ_RESOURCE_LIMIT` (54000) → library `RESOURCE_LIMIT`. A superuser-only parameter: the cluster bootstrap grants `SET ON PARAMETER temp_file_limit TO si_owner` (without it 0015 fails closed with 42501). Nobody else holds a parameter privilege (SD15) |
+| `lock_timeout` | 2s | Unchanged from 0014 |
+
+**Verified, not assumed:**
+- REM-3 relaxes the reader session (`work_mem 1GB`, `hash_mem_multiplier 1000`, 8 parallel workers, `jit on`) and reads the values inside an instrumented copy of the production text: `4MB / 2 / 0 / off / 256MB`.
+- The reader cannot `SET temp_file_limit` (42501), nor change its own role settings.
+- Function settings take precedence over session settings for the statements inside; they cannot be changed by the caller.
+
+**Time.** A function's `SET statement_timeout` does not shorten the statement that is already running (measured: a 200 ms function setting around `pg_sleep(1)` completed in 1,002 ms). The per-statement time bound is therefore the reader session's `statement_timeout`. The reader session check (0008, unchanged) requires it to be between 1 ms and 10 s (provisioned: 10 s), so no page runs longer than 10 s. A timeout is 57014 → library `RESOURCE_LIMIT` (REM-3b).
+
+**What bounds the work (and what does not).** The 200,000-candidate cap does **not** bound SQL work: it limits the rows materialized after the scan and join, and a no-match search reads every readable observation of the source. The enforceable bounds are: time ≤ the session `statement_timeout` (≤ 10 s, checked); temporary files ≤ 256 MB per page; memory ≈ `work_mem` × plan nodes, with no parallel workers; one source per call; page sizes 1–50 / 1–100. Shared-buffer reads are bounded only by the time bound.
+
+**Smallest next step** for bounded search work (not in this remediation): a per-source advertiser summary maintained at publication time (normalized name → counts, first/last, networks, spellings), searched instead of the observations. That makes search O(advertisers of the source) and lets history read only its own index range. The readable-evidence policy would have to be re-applied to the summary (verdicts, retention and controls change after publication), which is a design of its own. `pg_trgm` remains not adopted.
+
+### 12.5 D4/D5 — names up to the documented maximum
+
+- **History** accepts names of 1–1,000 characters (0005), counted in code points on both sides (the library no longer uses UTF-16 length: a 1,000-code-point astral name is 1,999 JavaScript units).
+- **Search positions** may be any normalized name: the server accepts up to **18,000** characters (NFKC expands one code point to at most 18, U+FDFA; measured over every code point: the largest expansion is 18 characters/33 bytes). The library's cursor bound is derived from that (18,000 × 6 JSON bytes + tokens, base64url: 145,600 characters), and the decoded cursor must name a requested source and a position of at most 18,000 code points. Forged, oversized or foreign positions are `BAD_CURSOR` (REM-4); the cursor remains bound to the exact query and carries the state tokens (unchanged).
+- **Identity keys are never truncated.** History compares the full normalized name.
+
+### 12.6 Ingestion defect found during reproduction: the advertiser index
+
+The 0014 btree index on `(source_id, si_normalize_advertiser(advertiser_name))` stores the full normalized name. A btree row holds at most 2,704 bytes: an incompressible 1,000-character CJK name normalizes to 3,000 bytes, and inserting it **failed the whole run completion** (54000). 0015 replaces it with `observations_by_source_advertiser_key (source_id, si_advertiser_key(advertiser_name))`, a SHA-256 of the normalized name. History selects rows by the key (index condition, no per-row normalization). Identity remains the full normalized name: every distinct spelling selected must normalize to the requested name, verified once per spelling in the same statement. Otherwise the page is refused (`SI_READ_IDENTITY_CONFLICT`, library `INTERNAL`): a digest collision fails closed and never merges identities (mutant "identity guard omitted", with a collision simulated in an instrumented copy). A first version compared the full name on every row; it doubled the history page time at 200,000 candidates (2.0 → 4.8 s) and reached the 10 s statement timeout on a 600,000-observation database. That was measured during Phase 9 and replaced by the per-spelling check. The down migration recreates the 0014 index and is refused (54000) if such a name has been stored: 0014 cannot represent it.
+
+### 12.7 D6 — negative controls
+
+New mutants (`tests/db/m4-remediation.test.mjs`); each baseline gives exactly its outcome, each mutant exactly the defect:
+
+| Mutant | Scenario | Baseline | Mutant |
+|---|---|---|---|
+| Search period end inclusive | A run finished exactly at `to` | `ok:0` | `ok:1` |
+| History network filter omitted | META and TIKTOK observations, `networks: ['META']` | `ok:1` | `ok:2` |
+| Search `synchronous_commit` protection omitted | Intent taken in a safe session; the call made with `synchronous_commit = off` (the library path is already refused by `si_begin_read`) | `SI_READ_UNSAFE_SESSION` | `ok` |
+| Search source lock omitted | Instrumented pause after the availability check; SUSPEND issued during the pause | `search:ok:1,suspend` (the control waits) | `suspend,search:ok:0` (the page, checked available, silently releases nothing) |
+| Response bound above the audit bound (the 0014 value) | Search page above 262,144 bytes | `SI_READ_RESULT_TOO_LARGE` | `SQLSTATE:23514` |
+| History identity guard omitted (simulated key collision: the instrumented selector also takes `Acme Synthetic Labs`) | History of `Acme Synthetic` | `READ:INTERNAL` (`SI_READ_IDENTITY_CONFLICT`) | `ok:2` (identities merged) |
+| (§11, updated) History identity by substring: selector and guard both removed | `Acme Synthetic` vs `Acme Synthetic Labs` | `ok:1` | `ok:2` |
+| Lib: history bound checked per observation only (D2) | 12 observations, bound 11, page size 2 | `SCAN_LIMIT` after 1 request | `SCAN_LIMIT` after 6 |
+| Lib: no page-size reduction on `RESULT_TOO_LARGE` (D1) | 60 large observations, default page size | `ok:60` | `RESULT_TOO_LARGE` |
+| Lib: search merge ignores a reduced source page | Source A's page reduced to 2 of 5 hits; source B's 2 hits sort after A's | `n1,n2,n3,n4,n5,z1,z2` | `n1,n2,z1,z2` (A's n3–n5 skipped) |
+
+Real response-bound tests (not lowered copies): REM-1 (exact boundary of the history function), REM-1b (a search page of 50 long-name hits refused raw; the library paginates completely, every released page ≤ 262,144 bytes), REM-4b (worst-case one-observation page). The §11 mutants run against the 0015 text (the §11 identity mutant now removes both the key selector and the identity guard).
+
+### 12.8 D7 — consistency, corrected
+
+This replaces the §11 consistency table. **Each page** is one statement under the source lock: consistent within itself. **No snapshot spans pages, and not every change between pages is detected.**
+
+| Between pages | Detected? | Outcome |
+|---|---|---|
+| Authorization: the grant is revoked | Yes, per page | Every page re-checks the active grant: `NOT_AUTHORIZED` (REM-5) |
+| Authorization: revoked **and restored** between two pages | **No** | The grant is not an input of the state token; the pages before and after are each authorized when computed (REM-5: `ok:3`) |
+| The source becomes unavailable | Yes | `SOURCE_UNAVAILABLE` with reasons on the next page |
+| Availability changes and recovers (suspend→lift, rights version, retire→un-retire, key rotation) | Yes, by the state token | `AVAILABILITY_CHANGED` |
+| History: evidence added, expired or invalidated so that the summary changes (count, distinct ads, runs, first/last times, networks, spellings) | Yes | `RESULT_CHANGED` |
+| History: an add-and-remove **swap that leaves the summary identical** (e.g. one run expires and another of the same instant becomes readable) | **No** | Each page is correct when computed; the result belongs to no single state (REM-5: `w1, w3` where w2 was replaced by w3) |
+| Search: names added or removed | Not detected | Keyset continuation after the last returned name: no duplicates and no skipped later names; a name sorting before the position appears only in a new search; each page's aggregates reflect that page's time (REM-5) |
+| Retention expiry between pages | History: detected only through a summary change; search: not detected | As above |
+
+**History's actual guarantee:** every observation returned was readable evidence of an available, granted source when its page was computed; the summary is identical on every page; the number of observations returned equals that summary's count. It is not a snapshot. A stronger guarantee (for example a digest of the readable set carried between pages) would need its own design and evaluation and is not part of this remediation.
+
+### 12.9 Governance, D8 and the Unicode/ICU risk
+
+- **FD21** remains ratified for synthetic development (unchanged). **FD22** is recorded as **conditionally authorized for synthetic development, pending acceptance of M4-P2.1** (design doc). **R-22** is back to **PENDING**: its closure criteria are to be established independently. **R-26, R-28, R-29** remain open. Nothing here authorizes real evidence, customer access, export or production.
+- **D8 (documented, R-30):** a page holds the source lock (`FOR SHARE`) for its whole statement, so an emergency control (SUSPEND, TERMINATE_RETENTION) on that source waits for the running page: measured 2.3–3.1 s at 200,000 candidates, bounded by the reader statement timeout (10 s). The control itself is not lost: it commits when the page ends, and every later page sees it. Pages, not controls, carry the 2 s lock timeout (a page never queues behind a control for more than 2 s).
+- **Unicode/ICU upgrade (R-31):** identity depends on the server's Unicode tables (NFKC) and ICU (lower-casing). Both expression functions are declared IMMUTABLE for their index. A PostgreSQL or ICU upgrade that changes these tables can split or merge identities, leave the index inconsistent with the function, and change the search order. Required after such an upgrade: `REINDEX INDEX si.observations_by_source_advertiser_key` and a re-validation of identities. Nothing detects the change automatically today (no stored Unicode/ICU version is compared at startup).
+
+### 12.10 Performance and resources, before and after (local PostgreSQL 16.15 container)
+
+Workloads of M4-P2-ACCEPT-01: source A holds 200,000 observations of one advertiser (the candidate cap); in the resource harness, source B holds 400,000 observations of 500 advertisers. `SCALE-1` (`tests/slow/m4-remediation-scale.test.mjs`, slow CI job) asserts the D2/D3 outcomes on every run. Temporary-file figures come from `pg_stat_database.temp_bytes`, whose reporting lags by up to one request; the values below are per request, from paired readings.
+
+| Workload | 61bda9d | M4-P2.1 (0015) |
+|---|---|---|
+| Library history of A (bound 5,000) | `SCAN_LIMIT` after **51 audited requests, 93 s, 4.56 GB** temp | `SCAN_LIMIT` after **1 request, 0.93–0.96 s, ~89 MB** |
+| One history page of A (server) | 2.0 s, 93 MB temp | 0.93 s (Bitmap Index Scan on the key index; identity checked per spelling) |
+| Concentrated search of A (200,000 candidates) | 2.5 s, 52 MB | 2.3–2.6 s, 50–52 MB |
+| Same, reader `SET work_mem = '1GB'`, `hash_mem_multiplier = 1000` | 3.1 s, **0 MB (the reader relaxed the definer function's memory)** | 2.3–2.5 s, 49.8 MB (pinned: the session value is not used) |
+| No-match search, 200,000 / 400,000 observations | 1.0 s / 2.5 s | 1.0–1.1 s / 2.5 s (unchanged: the scan is not bounded by the cap; §12.4) |
+| Broad search of B (400,000 candidates) | `SCAN_LIMIT`, 3.1 s | `SCAN_LIMIT`, 3.4 s |
+| Library history of one of B's 500 advertisers (800 observations, 8 pages) | 4.1 s | 3.4 s |
+| SUSPEND issued during a concentrated search page (D8) | waited 2.3–3.1 s | waited 2.0–2.3 s |
+| History page of 80–100 large observations (D1) | `INTERNAL` (23514) | complete (page size reduced 100 → 50) |
+| Search of 50 hits of 990-character CJK names (D1) | `INTERNAL` | 25 hits and a cursor per library page; every page ≤ 262,144 bytes |
+| History of a 304- or 1,000-character name (D5) | `BAD_ARGUMENT` | complete |
+| Pagination after a 1,000-character CJK name (D4) | `BAD_CURSOR` | complete (cursors up to 44,110 characters measured, REM-4) |
+| Ingestion of an incompressible 1,000-character CJK name | run failed (54000, index row size) | stored |

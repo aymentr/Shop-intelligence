@@ -53,7 +53,8 @@ serving), no live collection, no production deployment.
 | 0011 | reader source status: content-free per-source, per-period run and verdict counts for freshness and reliability, gated like an evidence page | M4-P1, conditionally accepted for synthetic development by M4-P1-ACCEPT-01 (FD20 approved, synthetic only) |
 | 0012 | reader source availability: available or not, fixed reason codes and a state token, so that history and search never present an unavailable source as empty | M4-P1.1 (D1), conditionally accepted for synthetic development by M4-P1.1-ACCEPT-01 |
 | 0013 | opaque availability state: the token becomes an HMAC under an owner-only key, bound to reader and source (no recoverable metadata) | M4-P1.2 (R1), conditionally accepted by M4-P1.2-ACCEPT-01 (FD21 accepted for synthetic development) |
-| 0014 | server-side audited advertiser search and history: bounded, keyset-paged, one audited request per page binding the complete request; replaces the client-side 5,000-record scan | M4-P2, pending independent acceptance (FD22 proposed) |
+| 0014 | server-side audited advertiser search and history: bounded, keyset-paged, one audited request per page binding the complete request; replaces the client-side 5,000-record scan | M4-P2, conditionally accepted (M4-P2-ACCEPT-01); FD22 conditionally authorized |
+| 0015 | intelligence remediation: response bound = audit bound (262,144 bytes, typed refusal); resource bounds pinned on the reader functions (work_mem, temp_file_limit; requires the bootstrap parameter grant); names up to 1,000 characters (index on a digest of the normalized name) | M4-P2.1, pending independent acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
