@@ -396,12 +396,15 @@ async function scnSearchLock(x, mutantSql) {
   await asOwner(x.admin, a => a.query(mutate(mutantSql ?? SEARCH_FN, '    WITH readable AS (', pause)));
   const s = await source(x); await collect(x, s, [AD('Northwind Synthetic', 'lk')]);
   const alice = await reader(x); await alice.query(`SET si.test_pause = '1.5'`);
-  const events = [];
-  const search = INTEL.searchAdvertisers(alice, { sources: [s], query: 'north' }).then(p => events.push(`search:ok:${p.hits.length}`), e => events.push(`search:${e.code}`));
-  await new Promise(r => setTimeout(r, 500));
-  const suspend = control(x.si_rights_admin, s, 'SUSPEND').then(() => events.push('suspend'));
-  await Promise.all([search, suspend]);
-  return `value:${events.join(',')}`;
+  // Barrier: the reader's backend is inside the instrumented pause, i.e. past the lock and the availability check.
+  const search = INTEL.searchAdvertisers(alice, { sources: [s], query: 'north' }).then(p => `search:ok:${p.hits.length}`, e => `search:${e.code}`);
+  const paused = async () => (await x.admin.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = 'si_reader_alice'
+                                                     AND datname = current_database() AND wait_event = 'PgSleep'`)).rows[0].n === 1;
+  for (let i = 0; !(await paused()); i++) { if (i > 100) return 'value:the read never reached its pause'; await new Promise(r => setTimeout(r, 50)); }
+  const t0 = performance.now();
+  await control(x.si_rights_admin, s, 'SUSPEND');
+  const waited = performance.now() - t0;                                      // the pause is 1.5 s
+  return `value:${await search},suspend-${waited > 500 ? 'waited' : 'immediate'}`;
 }
 const DB_MUTANTS = [
   { name: 'search period end inclusive', scenario: scnSearchPeriodEnd, baseline: 'ok:0', mutant: 'ok:1',
@@ -410,7 +413,7 @@ const DB_MUTANTS = [
     sql: mutate(HISTORY_FN, 'AND (cardinality(p_networks) = 0 OR o.network = ANY (p_networks))', 'AND true') },
   { name: 'search synchronous_commit protection omitted', scenario: scnSearchSyncCommit, baseline: 'SI_READ_UNSAFE_SESSION', mutant: 'ok',
     sql: mutate(SEARCH_FN, "CASE WHEN current_setting('synchronous_commit') = 'off' THEN 'synchronous_commit' END", 'NULL') },
-  { name: 'search source lock omitted', scenario: x => scnSearchLock(x), baseline: 'value:search:ok:1,suspend', mutant: 'value:suspend,search:ok:0',
+  { name: 'search source lock omitted', scenario: x => scnSearchLock(x), baseline: 'value:search:ok:1,suspend-waited', mutant: 'value:search:ok:0,suspend-immediate',
     lock: true, sql: mutate(SEARCH_FN, 'PERFORM 1 FROM si.sources x WHERE x.source_id = p_source_id FOR SHARE;', 'PERFORM 1 FROM si.sources x WHERE x.source_id = p_source_id;') },
   { name: 'response bound above the audit bound (0014 value)', scenario: scnResponseBound, baseline: 'SI_READ_RESULT_TOO_LARGE', mutant: 'SQLSTATE:23514',
     sql: mutate(SEARCH_FN, 'max_bytes constant int := 262144;', 'max_bytes constant int := 1048576;') },
