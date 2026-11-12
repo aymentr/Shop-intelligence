@@ -122,7 +122,7 @@ test('G1: table privileges match the grant matrix exactly (every role x table x 
   assert.deepEqual(pub, [], 'nothing in si is granted to PUBLIC');
 });
 
-test('SD13 (0013): the availability state key, its MAC and its rotation are owner-only; no application or reader role reaches them', async () => {
+test('SD13 (0013): the availability state key, its MAC and its rotation are owner-controlled; no runtime application or reader role reaches them', async () => {
   const roles = ['si_reader', 'si_reader_alice', 'si_collector', 'si_rights_admin', 'si_retention', 'si_monitor', 'si_migrator'];
   const known = (await c.admin.query(`SELECT rolname FROM pg_roles WHERE rolname = ANY ($1)`, [roles])).rows.map(r => r.rolname);
   for (const r of known) {
@@ -133,6 +133,21 @@ test('SD13 (0013): the availability state key, its MAC and its rotation are owne
       assert.equal((await c.admin.query('SELECT has_function_privilege($1, $2, $3) AS h', [r, f, 'EXECUTE'])).rows[0].h, false, `${r} EXECUTE ${f}`);
     }
   }
+  // Follow-up (M4-P1.2-ACCEPT-01 defect 2): privilege checks above see INHERITED rights only. Who can become the owner with
+  // SET ROLE is a separate path: exactly si_migrator (the migration principal acts as the owner, by design) among the
+  // application and reader roles. Superusers also bypass ACLs. No reader or runtime application role can.
+  const setters = [];
+  for (const r of known) if ((await c.admin.query(`SELECT pg_has_role($1, 'si_owner', 'SET') AS h`, [r])).rows[0].h) setters.push(r);
+  assert.deepEqual(setters, ['si_migrator'], 'only the migrator may SET ROLE si_owner');
+  const viaSetRole = await connect({ user: 'si_migrator', database: db });
+  try {
+    await viaSetRole.query('BEGIN'); await viaSetRole.query('SET LOCAL ROLE si_owner');
+    assert.equal((await viaSetRole.query('SELECT octet_length(secret) AS n FROM si.availability_state_key')).rows[0].n, 32,
+      'documented exception: the migrator, acting as the owner, can read the key');
+    await viaSetRole.query('ROLLBACK');
+  } finally { await viaSetRole.end(); }
+  const reader = await connect({ user: 'si_reader_alice', database: db }).catch(() => null);
+  if (reader) { try { await rejects(assert, reader.query('SET ROLE si_owner'), { code: '42501' }); } finally { await reader.end(); } }
   const acl = (await c.admin.query(`SELECT relacl::text AS a, pg_get_userbyid(relowner) AS o FROM pg_class WHERE oid = 'si.availability_state_key'::regclass`)).rows[0];
   assert.equal(acl.o, 'si_owner');
   assert.ok(acl.a === null || !/=[a-zA-Z]*\//.test(acl.a.replace(/si_owner=[a-zA-Z]*\/si_owner/, '')), `owner-only ACL: ${acl.a}`);

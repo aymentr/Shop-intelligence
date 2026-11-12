@@ -40,7 +40,7 @@ const GATE_FN = mutate(mutate(mutate(READ_FN,
  * after its intent committed (`f`), and, from the WAL itself (pg_walinspect), the end of that intent's COMMIT record.
  * With the instrumented copy installed, also the gate's own report (target, flush at target, wait in ms).
  */
-async function measuredReads(x, a, src, n, records) {
+async function measuredReads(x, a, src, n, records, { strayAfterIntent = false } = {}) {
   await x.admin.query('CREATE EXTENSION IF NOT EXISTS pg_walinspect');
   const notices = [];
   const onNotice = m => { if (/^SI_GATE /.test(m.message)) notices.push(m.message.slice(8).split('|')); };
@@ -51,6 +51,10 @@ async function measuredReads(x, a, src, n, records) {
     for (let i = 0; i < n; i++) {
       const id = await intent(a, src);                                          // si_begin_read in autocommit: a synchronous commit
       const f = (await x.admin.query('SELECT pg_current_wal_flush_lsn() AS f')).rows[0].f;
+      if (strayAfterIntent) {                                                   // unrelated WAL after the intent, left to the WAL writer
+        await x.admin.query('BEGIN'); await x.admin.query('SET LOCAL synchronous_commit = off');
+        await x.admin.query('INSERT INTO public.flushme VALUES (2)'); await x.admin.query('COMMIT');
+      }
       const before = notices.length;
       const t0 = performance.now(); const r = await settle(a.query(READ, [src, id, null, 100])); const ms = performance.now() - t0;
       reads.push({ id, f, ms, outcome: outcome(r), gate: notices.length > before ? notices[notices.length - 1] : null });
@@ -178,14 +182,28 @@ test('AUD-13a: ordinary reads, explicit transactions and savepoints', async t =>
   const inst = await measuredReads(x, a, src, 50, 3);
   assert.equal(inst.filter(r => r.gate).length, inst.filter(r => r.outcome === 'ok:3').length, 'every released read reported its gate');
   assertGateNeverWaitsForOwnIntent(inst, 3, 'instrumented gate');
+  // (3) M4-P1.2-ACCEPT-01 follow-up: exercise the wait branch deterministically. After each read's intent has committed
+  // (synchronously, so it is durable), another session commits ASYNCHRONOUSLY: unrelated WAL beyond the read's own commit
+  // that only the WAL writer flushes. The gate must wait for it (never for the read's own intent) and then release.
+  const stray = await measuredReads(x, a, src, 5, 3, { strayAfterIntent: true });
+  assertGateNeverWaitsForOwnIntent(stray, 3, 'instrumented gate with unrelated unflushed WAL');
+  const strayWaited = stray.filter(r => r.gate && r.waitLoops > 0);
+  assert.ok(strayWaited.length >= 1, `the wait branch is exercised: ${JSON.stringify(stray.map(r => [r.outcome, r.waitLoops, r.unflushed_at_target]))}`);
+  for (const r of strayWaited) assert.equal(r.unflushed_at_target, true, 'every wait was for WAL beyond the read\'s own durable commit');
   await asOwner(x.admin, k => k.query(READ_FN));                               // restore the production function
   await warm(x, src);                                                          // and again before the single-attempt reads below
+  // Refusal bound (follow-up): ordinary single-attempt reads after the warm-up may be refused fail-closed only rarely;
+  // a partial liveness regression (e.g. 30 % refusals) fails here. 0 of 1,500 such reads were refused when measured.
+  const prodRefused = prod.filter(r => r.outcome !== 'ok:3').length;
+  assert.ok(prodRefused <= 2, `at most 2 of 50 ordinary production reads refused fail-closed (got ${prodRefused})`);
+  assert.ok(inst.filter(r => r.outcome !== 'ok:3').length <= 2, 'at most 2 of 50 instrumented reads refused fail-closed');
   const ms = prod.map(r => r.ms).sort((p, q) => p - q), waited = inst.filter(r => r.gate && r.waitLoops > 0);
   const instRefused = inst.filter(r => r.outcome !== 'ok:3').length;
   console.log(`# AUD-13a production: ${prod.length} reads, own intent durable before the read on ${prod.filter(r => r.durable_before_read).length}, ` +
               `refused (fail closed) ${prod.filter(r => r.outcome !== 'ok:3').length}, median ${ms[25].toFixed(1)} ms, max ${ms[49].toFixed(1)} ms; ` +
               `instrumented gate (${inst.length} reads, ${instRefused} refused fail-closed): own commit durable at target ${inst.filter(r => r.durable_at_gate).length}/${inst.filter(r => r.gate).length}, ` +
-              `gate waited on ${waited.length} (max ${Math.max(0, ...waited.map(r => r.gateMs)).toFixed(1)} ms, each for WAL beyond the read's own commit)`);
+              `gate waited on ${waited.length} (max ${Math.max(0, ...waited.map(r => r.gateMs)).toFixed(1)} ms, each for WAL beyond the read's own commit); ` +
+              `with unrelated async WAL: waited on ${strayWaited.length}/${stray.length} (max ${Math.max(0, ...strayWaited.map(r => r.gateMs)).toFixed(1)} ms)`);
   // Inside an explicit transaction and a savepoint, a committed intent reads; one created in the transaction does not.
   const id = await intent(a, src);
   await a.query('BEGIN'); await a.query('SAVEPOINT s');

@@ -253,7 +253,9 @@ Every output is labelled *SYNTHETIC DATA — not live market conditions*. In CI 
    - `RUNNING` runs are excluded until they finish or are reaped as FAILED;
    - so a source whose collection is refused at preflight shows `UNKNOWN` reliability, not 0.
 10. **First-seen fallback.** `sourceReportedFirstSeen` and `sourceReportedLastSeen` are the minimum and maximum over the observations of the source-reported value. Where a record carries none, the record's own source-reported `seenAt` is used. They are unverified source claims, never verified times; the verified times are `firstObservedAt` and `lastObservedAt`.
-11. **Availability is source-level.** Per-run conditions (a run's retention ending, a network no longer supported, a verdict still pending) are not source unavailability: such runs simply stop or start being readable. A run whose retention ends during a scan can be missing from that scan's result, as with any concurrent change (limitation 4). A rights version taking effect during a scan changes the token, so the scan fails conservatively with `AVAILABILITY_CHANGED`.
+11. **Availability is source-level.** Per-run conditions (a run's retention ending, a network no longer supported, a verdict still pending) are not source unavailability: such runs simply stop or start being readable. A run whose retention ends during a scan can be missing from that scan's result, as with any concurrent change (limitation 4).
+   - **A successful scan is not a point-in-time snapshot.** Records whose own retention ends, or that are purged, after the scan started and before their page is read are omitted; records released earlier in the scan stay in the result. This is correct retention behaviour: expired evidence is never released. The state token does not change, because the source's availability did not change.
+   - Independently measured in M4-P1.2-ACCEPT-01: one run's retention expired mid-scan, or the run was purged by `si_purge_due`, and the scan returned `ok:2`. A rights version taking effect during a scan changes the token, so the scan fails conservatively with `AVAILABILITY_CHANGED`.
 12. **Search over several sources fails as a whole** when any one source is unavailable (typed, naming that source). There is no partial result with per-source gaps.
 7. **Inherited limits are unchanged:** no disclosure audit (release records are not rollback-resistant), no exactly-once delivery, no restored-copy binding, and the durability conditions (fsync, primary, no failover).
 8. **Not production.** Synthetic data only; D5b, D7 enforcement, hosting and independent review are still required.
@@ -305,7 +307,10 @@ The historical evidence of M4-P1.1 and its review is not changed, apart from the
 
 **Construction.** `left(HMAC-SHA256(K, 'v2|<reader>|<source>|<xmin>|<last control seq>|<version in effect id>'), 32)`.
 - `K` is 32 bytes from two `gen_random_uuid()` values (`pg_strong_random`, 244 random bits), stored in `si.availability_state_key`.
-- The table and the functions `si_availability_mac` and `si_rotate_availability_state_key` are owner-only. No role, reader or application, gains anything (SD13).
+- The table and the functions `si_availability_mac` and `si_rotate_availability_state_key` are **owner-controlled**. They are reachable by `si_owner`, by roles that may `SET ROLE si_owner`, and by superusers.
+  - Among the application and reader roles, exactly **`si_migrator`** may `SET ROLE si_owner`, by design (it applies migrations as the owner), so it can read the key.
+  - No reader and no runtime application role (`si_collector`, `si_rights_admin`, `si_retention`, `si_monitor`) can reach the key, by inheritance or by `SET ROLE`.
+  - SD13 asserts all of this since the M4-P1.2 follow-up. **Correction:** the original wording "No role … gains anything" ignored `SET ROLE`; M4-P1.2-ACCEPT-01 defect 2.
 
 **Security properties and their evidence:**
 
@@ -320,7 +325,11 @@ The historical evidence of M4-P1.1 and its review is not changed, apart from the
 
 **Secret lifecycle:**
 - **Rotation.** `si_rotate_availability_state_key()`, owner only. Every token changes, so a scan in flight across a rotation fails closed with `AVAILABILITY_CHANGED` (INT-23 (5)).
-- **Backup and restore.** The key is schema data, so dumps are as confidential as the key, and a restored copy keeps producing the same tokens (DR-1 restores it with the schema). A restore without the row fails closed until the owner rotates.
+- **Backup and restore.** The key is schema data, so dumps and WAL are as confidential as the key, and DR-1 restores it with the schema.
+  - **Correction (M4-P1.2-ACCEPT-01 defect 1):** a *logical* restore (`pg_dump`/`pg_restore`, as DR-1 does) does **not** keep producing the same tokens, because every source row gets a new `xmin` (independently measured: same key, `xmin` 10118 → 10357, a different token).
+  - The consequence is only fail-closed: a scan straddling a restore gets `AVAILABILITY_CHANGED`. The earlier sentence ("a restored copy keeps producing the same tokens") was wrong for logical restores.
+  - **Rotate the key** (`si_rotate_availability_state_key()`, as the owner) after restoring a copy into any environment with lower trust or different readers: the copy carries the production key, and with readers there it would re-open R1 offline inversion against that key.
+  - A restore without the row fails closed until the owner rotates.
 - **Down 0013** restores 0012's function byte for byte and drops the key (M1m).
 
 **The "latest rights version" input is dropped as redundant.** A rights version recorded during a scan either:
@@ -373,7 +382,23 @@ The 500 ms wall-clock bound, with up to two tolerated refusals, is replaced by m
 - **FD21:** conditionally authorized for synthetic development; final ratification pending independent verification of R1.
 - **R7** (any source-row update or new rights version refuses an in-flight scan) is recorded as accepted conservative behaviour (R-27).
 - **R5** (RT-13 failed once, unexplained) stays OPEN (R-28).
-- **R-29 (new, OPEN):** RD-M "source lock omitted" (an M3 test, unchanged) failed once in three fresh-container suite runs and did not reproduce in 20 targeted runs. Its barrier now records what the read did.
+- **R-29 (new, OPEN):** RD-M "source lock omitted" (an M3 test whose assertions are unchanged; M4-P1.2 added only a failure diagnostic to its barrier) failed once in three fresh-container suite runs and did not reproduce in 20 targeted runs. Its barrier now records what the read did.
 - **Found and fixed during the M4-P1.2 regression (DR-1):** the new AUD-13a replaces the read function twice (instrumented copy, then the original). Each DDL leaves dead `pg_proc` tuples whose first-touch pruning made a later single-attempt read fail closed on the restored cluster. AUD-13a now warms the database after each replacement: the R4 mechanism, applied to the test itself.
 - All real-evidence pilot and production blockers above are unchanged.
 - **CI #125 (first push of M4-P1.2):** MG9 failed with `unrecognized configuration parameter "transaction_timeout"`. MG9 is a Milestone 2 restore test, unchanged since it passed in CI #124. The runner image's host `pg_dump`/`pg_restore` had moved to a newer major whose restore issues that setting, which the PostgreSQL 16 server rejects. MG9 now uses version-matched tools: the host tools only when their major equals the server's, otherwise the database container's own (as DR-1 does). The match is asserted. It is validated with the real host tools and with a simulated newer host client.
+
+### M4-P1.2-ACCEPT-01 follow-up (documentation and tests only; no product change)
+
+The independent review (separate session, `bb155d3`) gave a CONDITIONAL ACCEPT. Its low-severity findings are corrected here without changing any migration, function or library behaviour:
+
+| Finding | Correction |
+|---|---|
+| 1. Restore claim false | §10 "Backup and restore" corrected; a logical restore changes tokens (fail closed). Rotate the key after restoring into a lower-trust environment |
+| 2. "Owner-only" ignored `SET ROLE` | Wording changed to owner-controlled. SD13 now asserts that exactly `si_migrator` may `SET ROLE si_owner` (and can then read the key, the documented exception), and that a reader cannot |
+| 3. AUD-13a had no refusal bound, and its wait branch never ran | At most 2 of 50 ordinary reads may be refused fail-closed, in both the production and the instrumented gate. A new deterministic step commits unrelated WAL asynchronously after each intent: the gate waits (5/5 in the first run, up to 400 ms), only for WAL beyond the read's own durable commit, and then releases |
+| 5. Retention-expiry scan semantics undocumented | Limitation 11: a successful scan is not a point-in-time snapshot |
+| 7. R-29 wording | Corrected in the risk register and §10 |
+
+R-28 and R-29 stay OPEN; no deterministic evidence resolves them.
+
+**FD21:** the independent review recommended final ratification for synthetic development only, and the M4-P2 instruction refers to the accepted FD21 contract. FD21 is therefore recorded as **accepted for synthetic development**. It is not accepted for real evidence, a pilot or production.
