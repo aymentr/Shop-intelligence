@@ -16,6 +16,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { readFileSync } from 'node:fs';
 import { asOwner, connect, control, pid, settle } from '../db/helpers.mjs';
 import { readEvidence, revokeReader } from '../../dist/persistence/reader.js';
 import { MIG10, provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
@@ -23,23 +24,68 @@ import { MIG10, provisionReaders, fresh, ready, READ, intent, asyncIntent, outco
 
 test.before(provisionReaders);
 
-/** n ordinary library reads, each classified exactly: fast (no refusal) or refused-then-retried (extra intents). */
-async function timedReads(x, a, src, n, records) {
-  const intents = async () => (await x.admin.query('SELECT count(*)::int AS n FROM si.read_intents')).rows[0].n;
-  const times = [], refused = [];
-  for (let i = 0; i < n; i++) {
-    const n0 = await intents();
-    const t0 = performance.now(); const p = await readEvidence(a, src); const ms = performance.now() - t0;
-    assert.equal(p.records.length, records);
-    const extra = (await intents()) - n0 - 1;                                 // intents beyond the one consumed = fail-closed refusals, retried
-    if (extra > 0) refused.push({ i, extra, ms: Math.round(ms) }); else times.push(ms);
-  }
-  return { times: times.sort((p, q) => p - q), refused };
+// ------------------------------------------------------------------------------------------------
+// M4-P1.2 (R3): direct measurement of the durability gate instead of a wall-clock bound.
+const MIG09 = readFileSync(new URL('../../db/migrations/0009_read_audit.up.sql', import.meta.url), 'utf8');
+const BEGIN_FN = fnText(MIG09, 'CREATE FUNCTION si.si_begin_read', 'END $begin_read$;').replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION');
+/** The production read with ONE added statement: a NOTICE reporting the gate's target, the flush position when the
+ *  target was taken, and the time spent in the wait loop. Everything else is the 0010 text, byte for byte. */
+const GATE_FN = mutate(mutate(mutate(READ_FN,
+  '  deadline timestamptz;\n', '  deadline timestamptz;\n  gate_f0 pg_lsn;\n  gate_t0 timestamptz;\n  gate_n int := 0;\n'),
+  '  target := pg_current_wal_insert_lsn();\n', '  target := pg_current_wal_insert_lsn();\n  gate_f0 := pg_current_wal_flush_lsn();\n'),
+  '  deadline := clock_timestamp() + interval \'1 second\';\n', '  gate_t0 := clock_timestamp();\n  deadline := clock_timestamp() + interval \'1 second\';\n')
+  .replace('    PERFORM pg_sleep(0.005);\n  END LOOP;\n', "    gate_n := gate_n + 1;\n    PERFORM pg_sleep(0.005);\n  END LOOP;\n  RAISE NOTICE 'SI_GATE %|%|%|%', target, gate_f0, gate_n, round(extract(epoch FROM clock_timestamp() - gate_t0) * 1000, 3);\n");
+/**
+ * n two-step reads, single attempt each (no retry hides anything). For each read: the flush position observed right
+ * after its intent committed (`f`), and, from the WAL itself (pg_walinspect), the end of that intent's COMMIT record.
+ * With the instrumented copy installed, also the gate's own report (target, flush at target, wait in ms).
+ */
+async function measuredReads(x, a, src, n, records) {
+  await x.admin.query('CREATE EXTENSION IF NOT EXISTS pg_walinspect');
+  const notices = [];
+  const onNotice = m => { if (/^SI_GATE /.test(m.message)) notices.push(m.message.slice(8).split('|')); };
+  a.on('notice', onNotice);
+  const start = (await x.admin.query('SELECT pg_current_wal_insert_lsn() AS l')).rows[0].l;
+  const reads = [];
+  try {
+    for (let i = 0; i < n; i++) {
+      const id = await intent(a, src);                                          // si_begin_read in autocommit: a synchronous commit
+      const f = (await x.admin.query('SELECT pg_current_wal_flush_lsn() AS f')).rows[0].f;
+      const before = notices.length;
+      const t0 = performance.now(); const r = await settle(a.query(READ, [src, id, null, 100])); const ms = performance.now() - t0;
+      reads.push({ id, f, ms, outcome: outcome(r), gate: notices.length > before ? notices[notices.length - 1] : null });
+    }
+  } finally { a.off('notice', onNotice); }
+  await x.admin.query('INSERT INTO public.flushme VALUES (0)');                // a synchronous commit: everything above is now flushed
+  const q = await x.admin.query(`                                               -- (pg_walinspect reads flushed WAL only; the measurements were taken before)
+    WITH c AS (SELECT xid::text AS xid, end_lsn FROM pg_get_wal_records_info($1::pg_lsn, pg_current_wal_flush_lsn())
+                WHERE resource_manager = 'Transaction' AND record_type LIKE 'COMMIT%'),
+         r AS (SELECT * FROM unnest($2::uuid[], $3::pg_lsn[], $4::pg_lsn[], $5::pg_lsn[]) AS u(id, f, target, f0))
+    SELECT r.id::text, c.end_lsn IS NOT NULL AS found, r.f >= c.end_lsn AS durable_before_read,
+           CASE WHEN r.f0 IS NULL THEN NULL ELSE r.f0 >= c.end_lsn END AS durable_at_gate,
+           CASE WHEN r.target IS NULL THEN NULL ELSE r.target >= c.end_lsn END AS target_covers_intent,
+           CASE WHEN r.target IS NULL THEN NULL ELSE r.f0 < r.target END AS unflushed_at_target
+      FROM r JOIN si.read_intents i ON i.intent_id = r.id
+      LEFT JOIN c ON c.xid = (i.created_xid::text::bigint % 4294967296)::text`,
+    [start, reads.map(r => r.id), reads.map(r => r.f), reads.map(r => r.gate?.[0] ?? null), reads.map(r => r.gate?.[1] ?? null)]);
+  const byId = new Map(q.rows.map(r => [r.id, r]));
+  for (const r of reads) Object.assign(r, byId.get(r.id), { waitLoops: r.gate ? Number(r.gate[2]) : null, gateMs: r.gate ? Number(r.gate[3]) : null });
+  return reads;
 }
-/** The AUD-13a latency property, with the documented fail-closed liveness exception counted exactly (see AUD-13a). */
-function assertOrdinaryReadsDoNotWait({ times, refused }, label) {
-  assert.ok(times.every(ms => ms < 500), `${label}: every read without a refusal is fast (max ${times[times.length - 1]?.toFixed(0)} ms)`);
-  assert.ok(refused.length <= 2 && refused.every(r => r.extra === 1), `${label}: at most two isolated single retries: ${JSON.stringify(refused)}`);
+/** AUD-13a's property, strictly: every read's own intent was durable before the read started and (with the copy) at the
+ *  gate; the gate's target covers the intent; every outcome is a release or a fail-closed refusal, never another error. */
+function assertGateNeverWaitsForOwnIntent(reads, records, label) {
+  for (const r of reads) {
+    assert.equal(r.found, true, `${label}: the intent's COMMIT record is in the WAL`);
+    assert.equal(r.durable_before_read, true, `${label}: the read's own intent was durable before the read (${JSON.stringify(r)})`);
+    if (r.gate) {
+      assert.equal(r.durable_at_gate, true, `${label}: own intent durable when the gate took its target`);
+      assert.equal(r.target_covers_intent, true, `${label}: the gate's target covers the intent's commit`);
+      // (one direction only: the flush can advance between taking the target and the loop's first check)
+      if (r.waitLoops > 0) assert.equal(r.unflushed_at_target, true, `${label}: the gate waits only while WAL beyond the read's own (durable) commit is unflushed`);
+    }
+    assert.ok([`ok:${records}`, 'SI_READ_INTENT_NOT_DURABLE'].includes(r.outcome), `${label}: ${r.outcome}`);
+  }
 }
 
 test('AUD-12b: flush timeout and uncertainty fail closed; a timed-out intent stays on record and reads once flushed', async t => {
@@ -108,11 +154,11 @@ test('AUD-FX: the WAL-writer fixture is verified both ways; reads right after a 
       const id = await asyncIntent(a, src);
       assert.equal(outcome(await settle(a.query(READ, [src, id, null, 100]))), 'SI_READ_INTENT_NOT_DURABLE', 'widened: an asynchronous intent fails closed');
     } finally { await writerDelay(null); }
-    const r = await timedReads(x, a, src, 20, 3);                            // no pause at all after the restore
-    worst.push(`${r.times[r.times.length - 1].toFixed(1)} ms, ${r.refused.length} refused`);
-    assertOrdinaryReadsDoNotWait(r, `cycle ${cycle}: right after the verified restore`);
+    const r = await measuredReads(x, a, src, 20, 3);                         // no pause at all after the restore
+    assertGateNeverWaitsForOwnIntent(r, 3, `cycle ${cycle}: right after the verified restore`);
+    worst.push(`own intent durable ${r.filter(z => z.durable_before_read).length}/20, refused ${r.filter(z => z.outcome !== 'ok:3').length}, max ${Math.max(...r.map(z => z.ms)).toFixed(1)} ms`);
   }
-  console.log(`# AUD-FX ordinary reads right after each verified restore (worst, refusals): ${worst.join(' / ')}`);
+  console.log(`# AUD-FX ordinary reads right after each verified restore: ${worst.join(' / ')}`);
 });
 
 test('AUD-13a: ordinary reads, explicit transactions and savepoints', async t => {
@@ -121,14 +167,25 @@ test('AUD-13a: ordinary reads, explicit transactions and savepoints', async t =>
   const { src } = await ready(x, 3);
   await warm(x, src);                                                         // absorb first-touch pruning of the fresh database
   const a = await x.c('si_reader_alice');
-  const { times, refused: refusedReads } = await timedReads(x, a, src, 50, 3);
-  console.log(`# AUD-13a ordinary two-step reads: median ${times[Math.floor(times.length / 2)].toFixed(1)} ms, max ${times[times.length - 1].toFixed(1)} ms ` +
-              `(${times.length} reads without refusal; refused-then-retried: ${JSON.stringify(refusedReads)})`);
-  // A read whose own intent committed synchronously never waits for it. The only permitted exception is the documented
-  // fail-closed liveness case: unrelated stray WAL (on-access pruning of read_intents pages as consumed rows accumulate)
-  // that a hibernating WAL writer has not flushed; it costs one bounded retry, is rare after the warm-up (0 in 1500
-  // measured), and is counted exactly here rather than hidden in a wall-clock maximum.
-  assertOrdinaryReadsDoNotWait({ times, refused: refusedReads }, 'AUD-13a');
+  // M4-P1.2 (R3): measure the gate directly. (1) The production function: for each of 50 single-attempt reads, the
+  // read's own intent commit (located in the WAL) was flushed before the read started, so the gate cannot wait for it.
+  const prod = await measuredReads(x, a, src, 50, 3);
+  assertGateNeverWaitsForOwnIntent(prod, 3, 'production gate');
+  // (2) A copy of the production function that differs by one NOTICE reports the gate's own view: the flush position at
+  // target capture covers the read's own commit on every read, and any wait is for WAL beyond it (unrelated).
+  await asOwner(x.admin, k => k.query(GATE_FN));
+  await warm(x, src);                     // replacing a function leaves dead pg_proc tuples: absorb their first-touch pruning (R4)
+  const inst = await measuredReads(x, a, src, 50, 3);
+  assert.equal(inst.filter(r => r.gate).length, inst.filter(r => r.outcome === 'ok:3').length, 'every released read reported its gate');
+  assertGateNeverWaitsForOwnIntent(inst, 3, 'instrumented gate');
+  await asOwner(x.admin, k => k.query(READ_FN));                               // restore the production function
+  await warm(x, src);                                                          // and again before the single-attempt reads below
+  const ms = prod.map(r => r.ms).sort((p, q) => p - q), waited = inst.filter(r => r.gate && r.waitLoops > 0);
+  const instRefused = inst.filter(r => r.outcome !== 'ok:3').length;
+  console.log(`# AUD-13a production: ${prod.length} reads, own intent durable before the read on ${prod.filter(r => r.durable_before_read).length}, ` +
+              `refused (fail closed) ${prod.filter(r => r.outcome !== 'ok:3').length}, median ${ms[25].toFixed(1)} ms, max ${ms[49].toFixed(1)} ms; ` +
+              `instrumented gate (${inst.length} reads, ${instRefused} refused fail-closed): own commit durable at target ${inst.filter(r => r.durable_at_gate).length}/${inst.filter(r => r.gate).length}, ` +
+              `gate waited on ${waited.length} (max ${Math.max(0, ...waited.map(r => r.gateMs)).toFixed(1)} ms, each for WAL beyond the read's own commit)`);
   // Inside an explicit transaction and a savepoint, a committed intent reads; one created in the transaction does not.
   const id = await intent(a, src);
   await a.query('BEGIN'); await a.query('SAVEPOINT s');
@@ -219,11 +276,21 @@ async function scnUncertain(x) {                                                
   const r = await settle(a.query(READ, [src, '00000000-ffff-fff0-8000-000000000000', null, 100]));
   return outcome(r) !== 'SI_READ_INTENT_INVALID';
 }
+async function scnAsyncIntentCommit(x) {                                        // detected = a read starts with its own intent not durable
+  const { src } = await ready(x);
+  await warm(x, src);
+  const a = await x.c('si_reader_alice');
+  await writerDelay('10s');                                                       // deterministic: nothing else flushes an async commit
+  try { const r = await measuredReads(x, a, src, 5, 2); return !r.every(z => z.durable_before_read); }
+  finally { await writerDelay(null); }
+}
 const MUTANTS = [
   { name: 'read-session synchronous_commit check removed', scenario: scnSession,
     sql: mutate(READ_FN, `CASE WHEN current_setting('synchronous_commit') = 'off' THEN 'synchronous_commit' END`, 'NULL') },
   { name: 'uncertain transaction id not mapped to a fixed code', scenario: scnUncertain,
-    sql: mutate(READ_FN, `  EXCEPTION WHEN OTHERS THEN`, `  EXCEPTION WHEN division_by_zero THEN`) }
+    sql: mutate(READ_FN, `  EXCEPTION WHEN OTHERS THEN`, `  EXCEPTION WHEN division_by_zero THEN`) },
+  { name: 'intent committed asynchronously (AUD-13a measurement, M4-P1.2 R3)', scenario: scnAsyncIntentCommit,
+    sql: mutate(BEGIN_FN, '  INSERT INTO si.read_intents', "  PERFORM set_config('synchronous_commit', 'off', true);\n  INSERT INTO si.read_intents") }
 ];
 for (const m of MUTANTS) {
   test(`AUD-DM (${m.name}): the baseline passes the scenario and the targeted mutant is detected`, async t => {

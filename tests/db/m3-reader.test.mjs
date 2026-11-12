@@ -406,7 +406,11 @@ async function paused(x, src, who = 'si_reader_alice') {
   for (let i = 0; ; i++) {
     const w = (await x.admin.query('SELECT wait_event, application_name FROM pg_stat_activity WHERE pid = $1', [cp])).rows[0];
     if (w?.wait_event === 'PgSleep' && w.application_name === 'si-test-paused') break;
-    assert.ok(i < 300, 'the read reached its pause');
+    if (i >= 300) {                                          // M4-P1.2 (R-29): say what the read did instead of pausing
+      const seen = await Promise.race([p.then(r => (r.status === 'ok' ? `returned ${r.value.length} rows` : `${r.code} ${String(r.message).slice(0, 80)}`)),
+                                       sleep(3000).then(() => 'still running after 3 s')]);
+      assert.fail(`the read reached its pause (it did not: ${seen}; last wait_event ${w?.wait_event ?? 'none'})`);
+    }
     await sleep(5);
   }
   return { c, cp, p, done };

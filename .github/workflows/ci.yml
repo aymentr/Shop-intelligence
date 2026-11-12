@@ -126,6 +126,8 @@ jobs:
       - run: npm run build
       - name: Real-deadline verification and expiry retention (VR-2, VR-3, RT-15, window mutant)
         run: node tests/db/run.mjs tests/slow/m3-deadline.test.mjs
+      - name: Rights version taking effect during a scan (M4-P1.2 R2; real 64 s schedule, plus the version-in-effect mutant)
+        run: node tests/db/run.mjs tests/slow/m4-scheduled-version.test.mjs
       - name: Disabled commit timestamps (VR-12)
         run: bash tests/slow/commit-ts-off.sh
       - name: Database logs on failure

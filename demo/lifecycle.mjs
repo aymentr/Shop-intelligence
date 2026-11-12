@@ -214,7 +214,7 @@ try {
     const t0 = performance.now();
     const applied = await migrateUp(mig);
     time('migrations', performance.now() - t0);
-    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 'the real migrations 0001-0012 are applied by the least-privilege migrator');
+    assert.deepEqual(applied, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], 'the real migrations 0001-0013 are applied by the least-privilege migrator');
     report.schema_version = codeSchemaVersion();
     report.postgres_version = (await A.query('SHOW server_version')).rows[0].server_version;
     assert.match(report.postgres_version, /^16\./, 'PostgreSQL 16');

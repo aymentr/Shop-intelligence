@@ -10,7 +10,7 @@
 // a retention deadline; mutated copies of the status function (database) or of the library (temporary copy).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { readFileSync, mkdtempSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,7 +23,7 @@ import * as INTEL from '../../dist/persistence/intelligence.js';
 
 const DIST = fileURLToPath(new URL('../../dist/persistence/', import.meta.url));
 const MIG11 = readFileSync(new URL('../../db/migrations/0011_reader_status.up.sql', import.meta.url), 'utf8');
-const MIG12 = readFileSync(new URL('../../db/migrations/0012_reader_availability.up.sql', import.meta.url), 'utf8');
+const MIG13 = readFileSync(new URL('../../db/migrations/0013_opaque_availability_state.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 let n = 0;
 
@@ -453,6 +453,22 @@ test('INT-21: availability changes during a multi-page scan never produce a misl
   const s1 = await three(), s2 = await three();
   await assert.rejects(INTEL.searchAdvertisers(interleaved(alice, once(k => k === 1 && control(x.si_rights_admin, s2, 'SUSPEND'))),
     { sources: [s1, s2], query: 'north' }, { pageSize: 1 }), UNAVAILABLE(s2, ['SUSPENDED']));
+  // M4-P1.2: concurrent changes from several sessions at once, between pages; never a successful truncated result.
+  const ra2 = await x.connect('si_rights_admin'), ra3 = await x.connect('si_rights_admin');
+  const combos = {
+    'suspend + new version + far retirement, lift later': async (src, k) => {
+      if (k === 1) await Promise.all([control(ra2, src, 'SUSPEND'), recordRights(ra3, src, { change_reason: 'concurrent' }), retire(x, src, "clock_timestamp() + interval '1 day'")]);
+      if (k === 0) await lift(x.si_rights_admin, src); },
+    'terminate racing a new version': async (src, k) => { if (k === 1) await Promise.all([control(ra2, src, 'TERMINATE_RETENTION'), recordRights(ra3, src, { change_reason: 'racing' }).catch(() => null)]); },
+    'retire within margin racing suspend': async (src, k) => { if (k === 1) await Promise.all([retire(x, src, "clock_timestamp() + interval '30 seconds'"), control(ra2, src, 'SUSPEND')]); }
+  };
+  for (const [label, step] of Object.entries(combos)) {
+    const src = await three();
+    let fired = 0;
+    const o = await libOutcome(scan(src, async k => { if (k === 1 || k === 0) fired++; await step(src, k); }));
+    assert.ok(fired >= 2, `${label}: the interleaving ran`);
+    assert.ok(o.startsWith('INTEL:AVAILABILITY_CHANGED') || o.startsWith('INTEL:SOURCE_UNAVAILABLE'), `${label}: ${o}`);
+  }
 });
 
 test('INT-22: the availability answer is content-free, audited, and its token changes exactly with availability-relevant state', async t => {
@@ -476,15 +492,84 @@ test('INT-22: the availability answer is content-free, audited, and its token ch
   assert.equal(raw, 4, 'every answer (four) has a completion record');
 });
 
+/** As the test superuser (never a reader): the exact token inputs of a source, and the key. */
+async function tokenTruth(x, src, who) {
+  const r = (await x.admin.query(`SELECT s.xmin::text AS xmin, (SELECT max(control_seq) FROM si.source_controls WHERE source_id = s.source_id) AS seq,
+     (SELECT rights_version_id FROM si.rights_versions WHERE source_id = s.source_id AND effective_from <= clock_timestamp() ORDER BY version DESC LIMIT 1) AS cur,
+     (SELECT max(version) FROM si.rights_versions WHERE source_id = s.source_id) AS ver,
+     (SELECT secret FROM si.availability_state_key WHERE key_id = 1) AS key FROM si.sources s WHERE source_id = $1`, [src])).rows[0];
+  const msg = ['v2', who, src, r.xmin, r.seq === null ? '-' : String(r.seq), r.cur === null ? '-' : String(r.cur)].join('|');
+  return { ...r, msg, hmac: r.key ? createHmac('sha256', r.key).update(msg, 'utf8').digest('hex').slice(0, 32) : null };
+}
+const sha32 = m => createHash('sha256').update(m, 'utf8').digest('hex').slice(0, 32);
+
+test('INT-23 (M4-P1.2, R1): the state token is an HMAC under the owner-only key, bound to reader and source; it cannot be inverted offline', async t => {
+  const x = await fresh(t);
+  const alice = await reader(x), bob = await x.connect('si_reader_bob');
+  const src = await source(x), other = await source(x);
+  await grantReader(x.si_rights_admin, 'si_reader_bob', src, 'second reader');
+  await control(x.si_rights_admin, src, 'SUSPEND');
+  const ta = (await INTEL.sourceAvailability(alice, src)).stateToken, tb = (await INTEL.sourceAvailability(bob, src)).stateToken;
+  const truth = await tokenTruth(x, src, 'si_reader_alice');
+  // 1. Exactly HMAC-SHA256(key, 'v2|reader|source|row version|control seq|version in effect'), truncated to 128 bits.
+  assert.equal(ta, truth.hmac, 'the token is the HMAC of the documented message under the stored key');
+  assert.equal(truth.key.length, 32);
+  // 2. Not any unkeyed digest of the true inputs (0012's layout, the 0013 layout, with or without the reader).
+  for (const m of [truth.msg, `v1|${src}|${truth.xmin}|${truth.seq}|${truth.ver}|${truth.cur}`, truth.msg.replace('|si_reader_alice', '')]) assert.notEqual(ta, sha32(m), m);
+  // 3. Reader-bound and source-bound: same state, different readers -> unrelated tokens; stable per reader.
+  assert.notEqual(ta, tb, 'two readers cannot compare tokens');
+  assert.equal((await INTEL.sourceAvailability(alice, src)).stateToken, ta, 'stable for an unchanged state');
+  assert.notEqual((await INTEL.sourceAvailability(alice, other)).stateToken, ta);
+  // 4. Offline inversion with every input a reader could bound (its own xid bound; small counters and ids), unkeyed
+  //    layouts of 0012 and 0013: nothing matches (the review recovered 0012's token in 0.3-0.6 s with this method).
+  const X = Number((await alice.query('SELECT pg_current_xact_id()::text::bigint AS x')).rows[0].x);
+  let tried = 0, found = null;
+  for (let xm = X; xm > 0 && !found; xm--) for (const sq of ['-', '1', '2']) for (let cu = 1; cu <= 8 && !found; cu++) {
+    for (const m of [`v2|si_reader_alice|${src}|${xm}|${sq}|${cu}`, `v1|${src}|${xm}|${sq}|1|${cu}`]) { tried++; if (sha32(m) === ta) found = m; }
+  }
+  assert.equal(found, null, `no unkeyed preimage among ${tried} candidates`);
+  // 5. Rotation (owner) changes every token without any state change; a scan across a rotation fails closed.
+  await asOwner(x.admin, a => a.query('SELECT si.si_rotate_availability_state_key()'));
+  const tr = (await INTEL.sourceAvailability(alice, src)).stateToken;
+  assert.notEqual(tr, ta);
+  assert.equal(tr, (await tokenTruth(x, src, 'si_reader_alice')).hmac);
+  const live = await source(x);
+  await collect(x, live, [1, 2].map(i => AD('Northwind Synthetic', `rot${i}`)));
+  await assert.rejects(INTEL.advertiserHistory(interleaved(alice, async k => { if (k === 1) await asOwner(x.admin, a => a.query('SELECT si.si_rotate_availability_state_key()')); }),
+    live, 'Northwind Synthetic', { pageSize: 1 }), CHANGED(live), 'a rotation during a scan fails closed');
+  // 6. Missing key (e.g. a restore without it): fail closed with a fixed message that names nothing secret; rotation restores.
+  await asOwner(x.admin, a => a.query('DELETE FROM si.availability_state_key'));
+  const raw = await settle(alice.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, await beginRead(alice, src, { cursor: INTEL.availabilityCursor(src), limit: 1 })]));
+  assert.deepEqual([raw.code, raw.message], ['55000', 'SI_READ_STATE_KEY_MISSING: the availability state key is not configured']);
+  await assert.rejects(INTEL.advertiserHistory(alice, live, 'Northwind Synthetic'), e => e instanceof ReadFailed, 'the library fails closed');
+  await asOwner(x.admin, a => a.query('SELECT si.si_rotate_availability_state_key()'));
+  assert.equal((await INTEL.advertiserHistory(alice, live, 'Northwind Synthetic')).observations.length, 2);
+  // 7. Readers cannot reach the key or the MAC.
+  await rejects(assert, alice.query('SELECT secret FROM si.availability_state_key'), { code: '42501' });
+  await rejects(assert, alice.query(`SELECT si.si_availability_mac('x')`), { code: '42501' });
+  await rejects(assert, alice.query(`SELECT si.si_rotate_availability_state_key()`), { code: '42501' });
+});
+
+test('INT-24 (M4-P1.2, R1): the in-database HMAC matches RFC 4231 test case 2 (disposable key)', async t => {
+  const x = await fresh(t);
+  // RFC 4231 4.3 uses a 4-byte key; our key is exactly 32 bytes, so check against Node's HMAC with a fixed 32-byte key
+  // and also the RFC construction (key zero-padded to the block), which is what both implement.
+  const key = Buffer.from('4a656665' + '00'.repeat(28), 'hex');           // "Jefe" padded to 32 bytes: same HMAC as RFC key "Jefe"
+  await asOwner(x.admin, a => a.query('UPDATE si.availability_state_key SET secret = $1 WHERE key_id = 1', [key]));
+  const got = (await asOwner(x.admin, a => a.query(`SELECT si.si_availability_mac('what do ya want for nothing?') AS m`))).rows[0].m;
+  assert.equal(got, '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843', 'RFC 4231 test case 2, HMAC-SHA-256');
+  assert.equal(got, createHmac('sha256', key).update('what do ya want for nothing?').digest('hex'));
+});
+
 // ------------------------------------------------------------------------------------------------
-// Negative-control mutants. Database: copies of the 0011 status / 0012 availability functions; library: a mutated
+// Negative-control mutants. Database: copies of the 0011 status / 0013 availability functions; library: a mutated
 // temporary copy. M4-P1.1 (D3): every scenario returns its EXACT outcome (libOutcome / sqlOutcome / a value), and
 // both the baseline and the mutant must produce exactly the expected one. An unrelated refusal, an unexpected
 // success, or a durability refusal that outlasts the bounded retry fails the test; nothing generic counts as clean.
 function fnText(mig, start, end) { const s = mig.indexOf(start); return mig.slice(s, mig.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`); return text.replace(from, to); }
 const STATUS_FN = fnText(MIG11, 'CREATE FUNCTION si.si_read_source_status', 'END $read_source_status$;');
-const AVAIL_FN = fnText(MIG12, 'CREATE FUNCTION si.si_read_source_availability', 'END $read_source_availability$;');
+const AVAIL_FN = fnText(MIG13, 'CREATE OR REPLACE FUNCTION si.si_read_source_availability', 'END $read_source_availability$;');
 /** A raw call made the way the library makes it: a fail-closed INTENT_NOT_DURABLE (unrelated unflushed WAL) is retried
  *  with a fresh intent, at most 3 attempts; `attempt` sets up and returns the settled result of one attempt. Nothing
  *  else is retried, and a third NOT_DURABLE is returned as the outcome (so it fails the exact assertion). */
@@ -549,6 +634,32 @@ async function scnAvailRowVersion(x, L = INTEL) {                            // 
     else if (step === 1 && k === 0) { step = 2; await retire(x, src, 'NULL'); }
   }), src, 'Northwind Synthetic', { pageSize: 1 }));
 }
+async function scnAvailControlSeq(x) {                                       // mutant: suspend -> (empty page) -> lift goes unnoticed
+  const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `cs${n}-${i}`)));
+  let step = 0;
+  return libOutcome(INTEL.advertiserHistory(interleaved(await reader(x), async k => {
+    if (step === 0 && k === 1) { step = 1; await control(x.si_rights_admin, src, 'SUSPEND'); }
+    else if (step === 1 && k === 0) { step = 2; await lift(x.si_rights_admin, src); }
+  }), src, 'Northwind Synthetic', { pageSize: 1 }));
+}
+async function scnAvailVersionInEffect(x) {                                  // mutant: a change of the version in effect is not reported
+  const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `ve${n}-${i}`)));
+  let done = false;                                                          // (fast contract check; the truncation case is tests/slow/m4-scheduled-version)
+  return libOutcome(INTEL.advertiserHistory(interleaved(await reader(x), async k => {
+    if (!done && k === 1) { done = true; await recordRights(x.si_rights_admin, src, { change_reason: 'same terms, new version' }); }
+  }), src, 'Northwind Synthetic', { pageSize: 1 }));
+}
+async function scnAvailKeyed(x) {                                            // mutant: the token is an unkeyed digest (R1)
+  const src = await source(x); const tok = (await INTEL.sourceAvailability(await reader(x), src)).stateToken;
+  const t = await tokenTruth(x, src, 'si_reader_alice');
+  return tok === sha32(t.msg) ? 'value:recoverable' : tok === t.hmac ? 'value:hmac' : 'value:other';
+}
+async function scnAvailReaderBound(x) {                                      // mutant: readers share tokens
+  const src = await source(x); await grantReader(x.si_rights_admin, 'si_reader_bob', src, 'second');
+  const a = (await INTEL.sourceAvailability(await reader(x), src)).stateToken, b = (await INTEL.sourceAvailability(await x.connect('si_reader_bob'), src)).stateToken;
+  return a === b ? 'value:shared' : 'value:distinct';
+}
+const MAC_EXPR = "si.si_availability_mac(concat_ws('|', 'v2', who, p_source_id, cs.row_version,\n                             coalesce(cs.last_seq::text, '-'), coalesce(cs.cur_id::text, '-')))";
 const DB_MUTANTS = [
   { name: 'status grant check omitted', scenario: scnStatusGrant, baseline: 'SI_READ_NOT_AUTHORIZED', mutant: 'ok:1',
     sql: mutate(STATUS_FN, 'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g') },
@@ -566,7 +677,15 @@ const DB_MUTANTS = [
   { name: 'availability SUSPENDED reason omitted', scenario: scnAvailReason, baseline: 'INTEL:SOURCE_UNAVAILABLE:SUSPENDED', mutant: 'INTEL:SOURCE_UNAVAILABLE:UNAVAILABLE',
     sql: mutate(AVAIL_FN, "      CASE WHEN cs.last_kind = 'SUSPEND' THEN 'SUSPENDED' END,", '') },
   { name: 'availability token ignores the source row version', scenario: scnAvailRowVersion, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:1',
-    sql: mutate(AVAIL_FN, "p_source_id, cs.row_version,", 'p_source_id,') }
+    sql: mutate(AVAIL_FN, "p_source_id, cs.row_version,", 'p_source_id,') },
+  { name: 'availability token ignores the control sequence', scenario: scnAvailControlSeq, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:1',
+    sql: mutate(AVAIL_FN, "coalesce(cs.last_seq::text, '-'), ", '') },
+  { name: 'availability token ignores the version in effect', scenario: scnAvailVersionInEffect, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:3',
+    sql: mutate(AVAIL_FN, ", coalesce(cs.cur_id::text, '-')", '') },
+  { name: 'availability token unkeyed (R1)', scenario: scnAvailKeyed, baseline: 'value:hmac', mutant: 'value:recoverable',
+    sql: mutate(AVAIL_FN, MAC_EXPR, MAC_EXPR.replace('si.si_availability_mac(', "encode(sha256(convert_to(").replace(/\)\)$/, "), 'UTF8')), 'hex')")) },
+  { name: 'availability token not bound to the reader', scenario: scnAvailReaderBound, baseline: 'value:distinct', mutant: 'value:shared',
+    sql: mutate(AVAIL_FN, "'v2', who, p_source_id", "'v2', p_source_id") }
 ];
 for (const m of DB_MUTANTS) {
   test(`INT-M db (${m.name}): the baseline gives exactly its refusal or value, the mutant exactly the defect`, async t => {

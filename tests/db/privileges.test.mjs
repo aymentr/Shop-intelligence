@@ -94,7 +94,9 @@ const EXPECTED_VOLATILITY = {
   // 0011 reader source status
   si_claim_read_intent: 'v', si_read_source_status: 'v',
   // 0012 reader source availability
-  si_read_source_availability: 'v'
+  si_read_source_availability: 'v',
+  // 0013 opaque availability state (owner-only: EXECUTE for nobody)
+  si_availability_mac: 's', si_rotate_availability_state_key: 'v'
 };
 
 let db, c;
@@ -118,6 +120,22 @@ test('G1: table privileges match the grant matrix exactly (every role x table x 
     SELECT c.relname FROM pg_class c, aclexplode(c.relacl) a
     WHERE c.relnamespace = 'si'::regnamespace AND a.grantee = 0`)).rows;
   assert.deepEqual(pub, [], 'nothing in si is granted to PUBLIC');
+});
+
+test('SD13 (0013): the availability state key, its MAC and its rotation are owner-only; no application or reader role reaches them', async () => {
+  const roles = ['si_reader', 'si_reader_alice', 'si_collector', 'si_rights_admin', 'si_retention', 'si_monitor', 'si_migrator'];
+  const known = (await c.admin.query(`SELECT rolname FROM pg_roles WHERE rolname = ANY ($1)`, [roles])).rows.map(r => r.rolname);
+  for (const r of known) {
+    for (const priv of ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER']) {
+      assert.equal((await c.admin.query('SELECT has_table_privilege($1, $2, $3) AS h', [r, 'si.availability_state_key', priv])).rows[0].h, false, `${r} ${priv} key`);
+    }
+    for (const f of ['si.si_availability_mac(text)', 'si.si_rotate_availability_state_key()']) {
+      assert.equal((await c.admin.query('SELECT has_function_privilege($1, $2, $3) AS h', [r, f, 'EXECUTE'])).rows[0].h, false, `${r} EXECUTE ${f}`);
+    }
+  }
+  const acl = (await c.admin.query(`SELECT relacl::text AS a, pg_get_userbyid(relowner) AS o FROM pg_class WHERE oid = 'si.availability_state_key'::regclass`)).rows[0];
+  assert.equal(acl.o, 'si_owner');
+  assert.ok(acl.a === null || !/=[a-zA-Z]*\//.test(acl.a.replace(/si_owner=[a-zA-Z]*\/si_owner/, '')), `owner-only ACL: ${acl.a}`);
 });
 
 test('G1 (0002 step 1): no application role holds any column-level write privilege on the run tables', async () => {

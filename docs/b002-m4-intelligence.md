@@ -3,13 +3,15 @@
 **Status:**
 - **M4-P1** was implemented on branch `claude/b002-m4-p1` (`c041c1f`, tests `d775dee`) from the accepted baseline `d3726d6`.
 - **M4-P1-ACCEPT-01** conditionally accepted M4-P1 for synthetic development, under conditions D1–D3.
-- **M4-P1.1** (branch `claude/b002-m4-p1-1`, migration 0012) corrects D1–D3; see §9. It is pending independent acceptance.
+- **M4-P1.1** (branch `claude/b002-m4-p1-1`, migration 0012) corrects D1–D3; see §9.
+- **M4-P1.1-ACCEPT-01** conditionally accepted M4-P1.1 for synthetic development, under conditions R1–R4.
+- **M4-P1.2** (branch `claude/b002-m4-p1-2`, migration 0013) resolves R1–R4; see §10. It is pending independent review.
 
 **Data:** synthetic only. No real advertising source, no customer display, export or mirroring, and no LLM.
 
 **Decisions** (recorded in `docs/b002-m3-design.md` §2.1):
 - The BD1 amendment for the status function is **FD20: APPROVED, for synthetic development only.**
-- The BD1 amendment for the M4-P1.1 availability function is **FD21: PROPOSED.**
+- The BD1 amendment for the M4-P1.1 availability function is **FD21: CONDITIONALLY AUTHORIZED for synthetic development; final ratification is pending independent verification of R1** (the opaque state token, §10).
 
 ## 1. What was reused (Phase 1 inspection)
 
@@ -65,15 +67,17 @@ advertiserHistory · searchAdvertisers · freshness   (pure functions over what 
   - `RETENTION_RESTRICTED`: the version in effect does not allow retention;
   - `NOT_SYNTHETIC`: cannot occur under the schema;
   - `UNAVAILABLE`: a fail-closed fallback if the predicate is false for no listed reason;
-- `state_token`: a 32-hex digest of the source row version (`xmin`), the latest control sequence, the latest rights version and the version in effect.
+- `state_token`: 32 hex characters.
+  - **Since 0013:** an HMAC-SHA256 under an owner-only 256-bit key, over the reader, the source, the source row version (`xmin`), the latest control sequence and the version in effect (§10).
+  - **Under 0012:** an unkeyed digest that also covered the latest rights version. It could be inverted offline (R1).
 
 How it is gated and what the token guarantees:
 - **Gate.** It is gated like the status function: identity, session, a committed crash-durable intent with scope `v1|<source>|availability` and limit 1, the 0010 gate, the grant under the source lock, consumption and a completion row.
 - **Scope separation.** Its scope is rejected by `si_read_evidence` (`BAD_CURSOR`) and by the status function (`INTENT_INVALID`), and it accepts no other scope.
 - **Who gets an answer.** An unknown source and an ungranted source both get `SI_READ_NOT_AUTHORIZED` **before** any availability fact is computed, so reasons reach granted readers only.
-- **Why the token works.** Controls and rights versions are append-only, and any update of the source row changes its `xmin`. So equal tokens mean nothing that decides availability was committed in between.
+- **Why the token works.** Controls and rights versions are append-only, and any update of the source row changes its `xmin`. So equal tokens mean nothing that decides availability was committed in between. The key makes the token opaque without changing that property (§10).
 - **Monotone in time.** With equal tokens, availability can only change over time towards unavailable: retirement, expiry and validity windows only end, and a version taking effect changes the token. Therefore "available at both ends with equal tokens" means available throughout.
-- **Nothing else changes.** `si_read_evidence`, `si_read_source_status`, `si_claim_read_intent` and `si_begin_read` are byte-identical (M1l). `si_reader` gains EXECUTE on this function and USAGE on `si.source_availability_row` only (SR-0, SD1, G1, AUD-8).
+- **Nothing else changes.** `si_read_evidence`, `si_read_source_status`, `si_claim_read_intent` and `si_begin_read` are byte-identical (M1l, and M1m for 0013). `si_reader` gains EXECUTE on this function and USAGE on `si.source_availability_row` only (SR-0, SD1, G1, AUD-8).
 
 ## 3. Product contract
 
@@ -241,7 +245,8 @@ Every output is labelled *SYNTHETIC DATA — not live market conditions*. In CI 
 6. **Fail-closed refusals.** `INTENT_NOT_DURABLE` can occur when unrelated unflushed WAL exists. The library retries with a fresh intent, at most 3 attempts.
    - Measured in M4-P1.1: the **first** gated request on a freshly cloned database trips over first-touch pruning while the idle WAL writer hibernates (25 × `wal_writer_delay`). This happened on 25 of 25 fresh databases and cost about 1 s for the retry.
    - Later requests rarely do (0 of 1,500 after one warm-up request).
-   - Dead catalog tuples make it worse: tuples left by GRANT/REVOKE are pruned on first access. The test template is therefore vacuumed after migrating.
+   - **Corrected in M4-P1.2.** This happens on an unvacuumed template at migration 0011 and at 0012 alike: the first single-attempt read was refused on 8/8 clones at 0011 and 7/8 at 0012, and on 0/8 for each after `VACUUM`. It was not introduced by 0012.
+   - The test template is vacuumed after migrating, so the regular suite measures what it claims. COLD-1/COLD-2 keep the cold case covered: on cold clones the library recovers using only its bounded retry, typically with two refused attempts and about 2 s.
    - The same applies to any real deployment after DDL or grants (R-26).
 9. **Reliability metric exclusions.** `collectionReliability` counts COMPLETED and FAILED runs finished in the period only:
    - T1 preflight refusals (`REJECTED`: no rights, suspended, attempt cap and so on) are excluded, because they are refusals to start, not collection attempts;
@@ -270,14 +275,104 @@ The historical acceptance evidence (M4-P1-ACCEPT-01 and CI #119–#123) is not c
 |---|---|---|---|---|
 | **D1** An unavailable source silently appears empty | `si_read_evidence` filters each run through `si_evidence_readable`, so an unavailable source yields empty pages. A reader had no other way to learn availability (the status function refused without a reason), and a scan ended at the first empty page whether the cause was a change of availability or the end of the data | Migration 0012 `si_read_source_availability` (one content-free, audited answer with fixed reason codes and a state token). The library checks before and after every scan: unavailable means typed `SOURCE_UNAVAILABLE` with reasons; a changed token means `AVAILABILITY_CHANGED`; success carries an explicit `AVAILABLE` state | History and search of a suspended, terminated, retired or rights-restricted source returned zero observations. A suspend→lift between pages returned 1 of 3 records as success (lib mutant "state-token comparison omitted", `ok:1`) | Typed failures with reasons for all reasons and transitions (INT-5/6, INT-20, INT-21); lib mutant "scan availability checks omitted" reproduces the original defect (`ok:0`) and is killed |
 | **D2** The WAL-writer reset contaminates the next test | Two causes, both measured. (1) `writerDelay(null)` slept a fixed 300 ms and never verified that the WAL writer was back on the default interval. (2) The first gated request on a fresh database trips over its own first-touch pruning while the idle writer hibernates (25 of 25 fresh databases). That, not only the reset, made AUD-13a's single wall-clock maximum exceed 500 ms | `writerDelay` returns only once a new backend reports the requested setting and stray WAL behaves accordingly: restore needs three consecutive flushes within 600 ms; widen needs a record to stay unflushed for at least 500 ms; otherwise it throws within 30 s. `warm()` performs one gated read per fresh database before timing or single-attempt assertions. AUD-12c and AUD-13a establish the verified default writer first. AUD-13a counts every fail-closed retry exactly instead of hiding it in a maximum. AUD-FX tests the fixture both ways, three cycles, with no pause after each restore | The d775dee durability files, 5 runs: run 5 failed AUD-12c and AUD-13a (max 1,007.9 ms) right after AUD-12b's restore. With the verified restore only, AUD-13a still once reached 1,024.1 ms | The full three-file durability step: 14/14 in each of 5 consecutive runs (AUD-13a max 12.6–15.1 ms, 0 refusals; AUD-FX 0 refusals in every cycle), and again after the template vacuum below |
-| (found while verifying D2) Dead catalog tuples in the test template | `tests/db/run.mjs` migrated the template and cloned it as is. 0012's GRANT/REVOKE statements left dead `pg_proc`/`pg_type` tuples, which every clone pruned on first access. That pruning WAL was unflushed while the WAL writer hibernated, so the clones' first raw single-attempt reads (AUD-1/2/5/6/7/10, RD-14, RC-9) failed closed | `VACUUM (FREEZE, ANALYZE)` on the template after migrating, so clones start with nothing to prune | Branch `m3-audit`: 10/15 alone; full suite 308/317 on a fresh container (the 0011 baseline passed only because its catalog state happened to leave less to prune) | `m3-audit` 15/15 three times; full suite 317/317 three times |
+| (found while verifying D2) Dead catalog tuples in the test template | `tests/db/run.mjs` migrated the template and cloned it as is. 0012's GRANT/REVOKE statements left dead `pg_proc`/`pg_type` tuples, which every clone pruned on first access. That pruning WAL was unflushed while the WAL writer hibernated, so the clones' first raw single-attempt reads (AUD-1/2/5/6/7/10, RD-14, RC-9) failed closed | `VACUUM (FREEZE, ANALYZE)` on the template after migrating, so clones start with nothing to prune | Branch `m3-audit`: 10/15 alone; full suite 308/317 on a fresh container. **Erratum (M4-P1.2):** the attribution to 0012's GRANT/REVOKE and the claim that "the 0011 baseline happened to leave less to prune" are not supported. A controlled measurement shows the same first-read refusals on unvacuumed templates at 0011 (8/8) and 0012 (7/8), and none after `VACUUM` (§10, R4) | `m3-audit` 15/15 three times; full suite 317/317 three times |
 | **D3** Mutant baselines accept any refusal | Scenarios returned `status !== 'ok'` booleans, so any refusal, including an unrelated error or a persistent `NOT_DURABLE`, counted as a clean baseline | Exact-outcome scenarios with an expected baseline and an expected mutant outcome for every mutant. The bounded retry is kept for `INTENT_NOT_DURABLE` only, and a third one is reported as the outcome, so it fails | During development, the unmutated baseline of "status availability check omitted" returned `READ:INTERNAL` (an unrelated failure of the then-broken availability function). The boolean scheme would have counted it as clean; the exact assertion failed it | 14 mutants, each with an exact baseline and an exact mutant outcome (§5) |
 
 **FD20** is approved for synthetic development only. It does not extend to real evidence, customer display, export or production.
 
-**Remaining production blockers** are unchanged by M4-P1.1:
+**Remaining production blockers** are unchanged by M4-P1.1 (and by M4-P1.2, §10):
 - the Milestone 3 blockers: disclosure audit, D8/G3 independent review, D5b, D7 enforcement, the durability operating conditions, and restored-copy binding;
 - the schema allows synthetic sources only;
 - the client-side scan (R-22) and name-only identity (R-23);
-- FD21 is undecided;
+- FD21 is conditionally authorized only, with ratification pending independent verification of R1 (§10);
 - there is no end-user authentication, display, export or mirroring rights.
+
+## 10. M4-P1.2 corrections (conditions R1–R4 of M4-P1.1-ACCEPT-01)
+
+The historical evidence of M4-P1.1 and its review is not changed, apart from the marked erratum in §9 that R4 requires.
+
+### R1: opaque availability state (migration 0013)
+
+**Defect.** The 0012 token was `left(sha256('v1|source|xmin|last_seq|max_version|cur_id'), 32)`. It reproduced at `5649a18`: a granted reader, bounding the inputs with its own transaction id, recovered every input offline in 0.3 s:
+- the source row's last-update transaction id;
+- the control count;
+- the rights-version count;
+- the **global** `rights_version_id`.
+
+**Options evaluated.**
+- **Server-side comparison.** The pre-check stores the state inputs under an unguessable handle, and the post-check compares against it. It can detect every change, ABA included, and reveals nothing. But it needs a new table written on every scan, plus its own retention and cleanup path inside the gated read path, where every extra write adds WAL (R-26).
+- **Keyed token (chosen).** One owner-only row, no per-call writes, and no change to the gate, lock, predicate or library contract.
+
+**Construction.** `left(HMAC-SHA256(K, 'v2|<reader>|<source>|<xmin>|<last control seq>|<version in effect id>'), 32)`.
+- `K` is 32 bytes from two `gen_random_uuid()` values (`pg_strong_random`, 244 random bits), stored in `si.availability_state_key`.
+- The table and the functions `si_availability_mac` and `si_rotate_availability_state_key` are owner-only. No role, reader or application, gains anything (SD13).
+
+**Security properties and their evidence:**
+
+| Property | Why it holds | Evidence |
+|---|---|---|
+| Opacity | Without `K` the token is a pseudorandom function of its inputs. The low entropy of the inputs no longer matters, because the search space includes the 244-bit key | The review's inversion attack: *not found*; 7.0 M unkeyed candidates in 0013's own layouts: *not found*; INT-23 (4) in-suite |
+| Correct construction | — | INT-23 (1): the token equals Node's `createHmac` over the documented message and the stored key. INT-24: the in-database HMAC equals RFC 4231 test case 2 |
+| No reader correlation | The reader is an input | INT-23 (3): two readers get unrelated tokens for the same state; the mutant "not bound to the reader" is killed |
+| No cross-source correlation | The source is an input, and the global `rights_version_id` is no longer recoverable | — |
+| What a reader still learns | Exactly the contract: whether this source's availability state changed between two of its own requests (FD21, R-25) | — |
+| No exposure | The key never appears as a literal in a statement, log line or error. A missing key fails with a fixed message naming nothing secret (`SI_READ_STATE_KEY_MISSING`, 55000) | INT-23 (6), (7) |
+
+**Secret lifecycle:**
+- **Rotation.** `si_rotate_availability_state_key()`, owner only. Every token changes, so a scan in flight across a rotation fails closed with `AVAILABILITY_CHANGED` (INT-23 (5)).
+- **Backup and restore.** The key is schema data, so dumps are as confidential as the key, and a restored copy keeps producing the same tokens (DR-1 restores it with the schema). A restore without the row fails closed until the owner rotates.
+- **Down 0013** restores 0012's function byte for byte and drops the key (M1m).
+
+**The "latest rights version" input is dropped as redundant.** A rights version recorded during a scan either:
+- takes effect at once, which changes the version in effect;
+- takes effect within the 60 s publish margin, which ends the current version's window, so the source is unavailable at the post-check, or the version takes effect and changes the version in effect;
+- or takes effect later than the margin, which cannot change readability during the scan.
+
+No scenario distinguishes this input from the remaining ones, so it could have no meaningful mutant. The remaining three inputs each have one (R2).
+
+### R2: token regression coverage
+
+**SV-1 / SV-M** (`tests/slow/m4-scheduled-version.test.mjs`, slow CI job) is a real-time product path. Version v2 is scheduled 64 s ahead *before* the scan. Page 2 runs inside v1's margin and is empty; v2 takes effect before the post-check.
+- Real 0013: `AVAILABILITY_CHANGED`.
+- Mutant without the version in effect: **`ok:1`, the truncated success**, so it is killed.
+
+Mutants for every token input, each with an exact behavioural assertion (`tests/db/m4-intelligence.test.mjs`):
+
+| Input | Scenario | Baseline | Mutant |
+|---|---|---|---|
+| Source row version | Retired within the margin, then un-retired, mid-scan | `AVAILABILITY_CHANGED` | `ok:1` |
+| Control sequence | Suspended, empty page, lifted | `AVAILABILITY_CHANGED` | `ok:1` |
+| Version in effect | New version mid-scan (fast contract check; SV-M is the truncation case) | `AVAILABILITY_CHANGED` | `ok:3` |
+| Key | — | `value:hmac` | `value:recoverable` |
+| Reader binding | — | `value:distinct` | `value:shared` |
+
+INT-21 adds concurrent changes from several sessions between pages, never a successful truncated result:
+- suspend, new version and retirement, with a later lift;
+- termination racing a new version;
+- retirement within the margin racing a suspension.
+
+### R3: AUD-13a measures the gate directly
+
+The 500 ms wall-clock bound, with up to two tolerated refusals, is replaced by measurements:
+- **Production function, 50 single-attempt reads.** For every read, the flush position observed right after its intent committed is compared with the end of that intent's COMMIT record, located in the WAL (`pg_walinspect`). "The gate never waits for the read's own intent" is asserted on **every** read. Every outcome is a release or a fail-closed `NOT_DURABLE`, never another error.
+- **The gate's own view.** A copy of the production function that differs by one NOTICE reports the target, the flush position at the target and the number of wait iterations. On every read the flush position at the target covers the read's own commit, and the target covers the intent. Any wait happens only while WAL beyond the read's own durable commit is unflushed.
+- **Sensitivity.** The new AUD-DM mutant "intent committed asynchronously" is detected under the verified 10 s writer.
+- **Unchanged.** The real 1 s timeout and the fail-closed refusal stay enforced and tested (AUD-12b).
+- **AUD-FX** uses the same measurement.
+
+### R4: template recovery
+
+- §9 and limitation 6 are corrected: the first-read behaviour exists at 0011 and 0012 alike.
+- `tests/db/m4-cold-template.test.mjs` builds its own unvacuumed template and six clones:
+  - **COLD-1:** a raw single-attempt first read either releases or fails closed with the intent left OPEN. It fails if the cold condition never occurs.
+  - **COLD-2:** the library recovers with at most `3 × (NOT_DURABLE_ATTEMPTS − 1)` refused attempts per history and every request consumed once.
+- The regular suite keeps the vacuumed template.
+
+### Governance (M4-P1.2)
+
+- **FD21:** conditionally authorized for synthetic development; final ratification pending independent verification of R1.
+- **R7** (any source-row update or new rights version refuses an in-flight scan) is recorded as accepted conservative behaviour (R-27).
+- **R5** (RT-13 failed once, unexplained) stays OPEN (R-28).
+- **R-29 (new, OPEN):** RD-M "source lock omitted" (an M3 test, unchanged) failed once in three fresh-container suite runs and did not reproduce in 20 targeted runs. Its barrier now records what the read did.
+- **Found and fixed during the M4-P1.2 regression (DR-1):** the new AUD-13a replaces the read function twice (instrumented copy, then the original). Each DDL leaves dead `pg_proc` tuples whose first-touch pruning made a later single-attempt read fail closed on the restored cluster. AUD-13a now warms the database after each replacement: the R4 mechanism, applied to the test itself.
+- All real-evidence pilot and production blockers above are unchanged.
