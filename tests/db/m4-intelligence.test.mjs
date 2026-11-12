@@ -543,7 +543,13 @@ test('INT-23 (M4-P1.2, R1): the state token is an HMAC under the owner-only key,
     live, 'Northwind Synthetic', { pageSize: 1 }), CHANGED(live), 'a rotation during a scan fails closed');
   // 6. Missing key (e.g. a restore without it): fail closed with a fixed message that names nothing secret; rotation restores.
   await asOwner(x.admin, a => a.query('DELETE FROM si.availability_state_key'));
-  const raw = await settle(alice.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, await beginRead(alice, src, { cursor: INTEL.availabilityCursor(src), limit: 1 })]));
+  // A raw call, with the library's bounded fresh-intent retry on INTENT_NOT_DURABLE only (CI #127: unrelated unflushed WAL
+  // refused the single attempt fail-closed before it reached the key check, the R-26 behaviour).
+  let raw;
+  for (let i = 0; i < 3; i++) {
+    raw = await settle(alice.query('SELECT * FROM si.si_read_source_availability($1, $2)', [src, await beginRead(alice, src, { cursor: INTEL.availabilityCursor(src), limit: 1 })]));
+    if (!/^SI_READ_INTENT_NOT_DURABLE/.test(String(raw.message))) break;
+  }
   assert.deepEqual([raw.code, raw.message], ['55000', 'SI_READ_STATE_KEY_MISSING: the availability state key is not configured']);
   await assert.rejects(INTEL.advertiserHistory(alice, live, 'Northwind Synthetic'), e => e instanceof ReadFailed, 'the library fails closed');
   await asOwner(x.admin, a => a.query('SELECT si.si_rotate_availability_state_key()'));
