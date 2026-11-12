@@ -52,7 +52,8 @@ serving), no live collection, no production deployment.
 | 0010 | crash-durable read intent: no evidence until the intent's commit is flushed to WAL (bounded, fail closed) | M3-AUD-03, conditionally accepted by M3-AUD-04 |
 | 0011 | reader source status: content-free per-source, per-period run and verdict counts for freshness and reliability, gated like an evidence page | M4-P1, conditionally accepted for synthetic development by M4-P1-ACCEPT-01 (FD20 approved, synthetic only) |
 | 0012 | reader source availability: available or not, fixed reason codes and a state token, so that history and search never present an unavailable source as empty | M4-P1.1 (D1), conditionally accepted for synthetic development by M4-P1.1-ACCEPT-01 |
-| 0013 | opaque availability state: the token becomes an HMAC under an owner-only key, bound to reader and source (no recoverable metadata) | M4-P1.2 (R1), pending independent review (FD21 conditionally authorized) |
+| 0013 | opaque availability state: the token becomes an HMAC under an owner-only key, bound to reader and source (no recoverable metadata) | M4-P1.2 (R1), conditionally accepted by M4-P1.2-ACCEPT-01 (FD21 accepted for synthetic development) |
+| 0014 | server-side audited advertiser search and history: bounded, keyset-paged, one audited request per page binding the complete request; replaces the client-side 5,000-record scan | M4-P2, pending independent acceptance (FD22 proposed) |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1

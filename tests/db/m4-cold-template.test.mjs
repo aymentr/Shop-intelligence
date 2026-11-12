@@ -75,12 +75,12 @@ test('COLD-2: the library recovers on cold clones using only its bounded NOT_DUR
     const rd = await connect({ user: 'si_reader_alice', database: db });
     try {
       const t0 = performance.now();
-      const h = await INTEL.advertiserHistory(rd, 'cold-src', 'Northwind Synthetic');     // availability + page + availability
+      const h = await INTEL.advertiserHistory(rd, 'cold-src', 'Northwind Synthetic');     // M4-P2: one server-side page (availability inside)
       const ms = performance.now() - t0;
       assert.deepEqual([h.observations.length, h.availability.state], [0, 'AVAILABLE']);
       const c = await intents(db);
-      assert.equal(c.consumed, 3, 'three audited requests, each consumed exactly once');
-      assert.ok(c.n - c.consumed <= 3 * (NOT_DURABLE_ATTEMPTS - 1), `refused attempts within the bound: ${c.n - c.consumed}`);
+      assert.equal(c.consumed, 1, 'one audited request, consumed exactly once');
+      assert.ok(c.n - c.consumed <= NOT_DURABLE_ATTEMPTS - 1, `refused attempts within the bound: ${c.n - c.consumed}`);
       report.push(`${c.n - c.consumed} refused/${Math.round(ms)} ms`);
     } finally { await rd.end(); }
   }

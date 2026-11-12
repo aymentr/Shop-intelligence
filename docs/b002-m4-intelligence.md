@@ -402,3 +402,88 @@ The independent review (separate session, `bb155d3`) gave a CONDITIONAL ACCEPT. 
 R-28 and R-29 stay OPEN; no deterministic evidence resolves them.
 
 **FD21:** the independent review recommended final ratification for synthetic development only, and the M4-P2 instruction refers to the accepted FD21 contract. FD21 is therefore recorded as **accepted for synthetic development**. It is not accepted for real evidence, a pilot or production.
+
+## 11. M4-P2: server-side audited advertiser search and history (migration 0014)
+
+**Status:** IMPLEMENTED on branch `claude/b002-m4-p2` from the accepted baseline `bb155d3`, pending independent acceptance. Synthetic data only; no display, export or deployment.
+
+### Architecture
+
+```
+src/persistence/intelligence.ts
+   searchAdvertisers(sources, query, …)   per source, per page ──► si_begin_read + si_search_advertisers   (0014)
+   advertiserHistory(source, name, …)     per page              ──► si_begin_read + si_advertiser_history  (0014)
+   sourceAvailability / sourceStatus / freshness                ──► unchanged (0011-0013)
+   *ClientScan (M4-P1 client-side scan)                         ──► kept as the reference oracle and performance baseline only
+```
+
+- The 5,000-record client-side scan is no longer on the product path.
+- History returns the summary plus the requested advertiser's observations only, keyset-paged at up to 100 per page.
+- Search returns aggregated advertiser hits, up to 50 per page.
+
+### Security contract (every page)
+
+| Property | Implementation | Evidence |
+|---|---|---|
+| Dedicated reader, READ COMMITTED, safe session | Same checks as every reader function | SRV-3, SRV-6 |
+| Committed, crash-durable request intent | `si_claim_read_intent` (the 0010 gate), one intent per page | SRV-6; mutant "history intent claim omitted" |
+| The complete request is audited | Scope `v1|<source>|search|<sha256>` or `|history|`. The digest covers every argument, length-prefixed in UTF-8 bytes: query or name exactly as sent, networks, period, page position and inclusivity; the page size is the intent limit | SRV-2: each of 8 changed fields gives `INTENT_INVALID`; mutants "scope does not bind the query / the period" |
+| No scope substitution | Evidence, status, availability, search and history scopes are mutually refused (`INTENT_INVALID` / `BAD_CURSOR`) | SRV-2 |
+| Authorization before results | Grant checked under the source lock; unknown, ungranted, ungranted-and-suspended and other-reader sources fail identically (`NOT_AUTHORIZED`, or `INTENT_INVALID` with a foreign intent) | SRV-3; mutants "search / history grant check omitted" |
+| Availability (FD21) | Evaluated inside each page under the lock (`si_availability_state`, the 0013 predicate, reasons and keyed token, unchanged). Unavailable gives `SOURCE_UNAVAILABLE` with fixed reasons, never an empty result. The page token equals the FD21 availability token | SRV-4; mutants "availability check omitted", "server state token ignores the row version" |
+| Only readable evidence | Runs filtered by `si_evidence_readable` (VALID verdict, retention, controls, rights, networks) | SRV-1, SRV-5; mutant "readable-evidence predicate omitted" |
+| No cross-source aggregation | One source per call. The library merges hit lists without merging identities; one unauthorized or unavailable source fails the whole search | SRV-3; lib mutant "page position not inclusive" |
+| Bounded resources | Page size 1–50 (search) or 1–100 (history). At most 200,000 candidate observations per call (`SCAN_LIMIT`), at most 1 MiB per response (`RESULT_TOO_LARGE`), at most 10 spellings per hit (`namesTruncated`). Query or name at most 300 characters; at most 5 networks, canonical; period at most 366 days at millisecond precision | SRV-2, SRV-7 (bounds enforced through lowered limits in copies) |
+| No direct access | Readers gain EXECUTE on the two functions only. Every helper (normalizer, scope, availability state, argument checks) is owner-only; readers still have no table privilege | SRV-3; SR-0, SD1, AUD-8 |
+| Request audit only | Consumption plus a completion row naming the hits or observations released. **This is a request audit, not proof of delivery** | SRV-6 |
+
+**Identity and normalization.**
+- An advertiser is (source, `si_normalize_advertiser(name)`).
+- The server normalizes authoritatively: NFKC with the server's Unicode tables, trimming and collapsing the JavaScript `\s` whitespace set, and lower-casing with the ICU root locale.
+- The library sends the raw text, and the scope binds that exact text.
+- The JavaScript helper `normalizeAdvertiser` matched the SQL normalizer on a 42-string corpus and on 3,999 of 4,000 random strings. The one difference involved characters treated differently by the two Unicode versions; that is why the server is authoritative.
+- Similar names are never merged.
+- Ordering and keysets use `COLLATE "C"` (code-point order).
+- An expression index `observations_by_source_advertiser (source_id, si_normalize_advertiser(advertiser_name))` serves history. It must be rebuilt with `REINDEX` after a PostgreSQL or ICU upgrade that changes Unicode tables.
+
+### Consistency (what is and is not guaranteed)
+
+**Each page** is computed in one statement under the source lock, so it is consistent within itself. **No snapshot spans pages.** The library distinguishes:
+
+| Situation | Outcome |
+|---|---|
+| The source becomes unavailable (suspended, terminated, retired, rights or retention restricted) | `SOURCE_UNAVAILABLE` with reasons, on the next page |
+| Availability changes and recovers between pages (suspend→lift, new rights version, retire→un-retire, key rotation) | `AVAILABILITY_CHANGED`: the state token differs between pages |
+| An individual record expires (or new evidence arrives) between history pages | `RESULT_CHANGED`: the summary or count differs between pages. Retry for a consistent result |
+| Search results change between pages | The keyset continues after the last name: no duplicates and no skipped later names. A name sorting before the position appears only in a new search, and later pages' aggregates reflect their own time |
+| Nothing matches | An explicit AVAILABLE result with zero observations or hits |
+
+All of these are tested in SRV-5.
+
+### Performance (synthetic, one source, 500 advertisers; local PostgreSQL 16.15 container; medians)
+
+| Observations in source | Client scan, history | Server history | Client scan, search page | Server search page | Server search, all 10 pages | Audited requests (client → server) |
+|---|---|---|---|---|---|---|
+| 1,000 | 83 ms | **6 ms** | 64 ms | **11 ms** | 226 ms | 13 → 1 |
+| 5,000 | 300 ms | **9.5 ms** | 324 ms | **32 ms** | 700 ms | 53 → 1 |
+| 20,000 | `SCAN_LIMIT` (cap 5,000) | **26 ms** | `SCAN_LIMIT` | **131 ms** | 2.5 s | — → 1 |
+| 50,000 | `SCAN_LIMIT` | **58 ms** | `SCAN_LIMIT` | **305 ms** | 6.5 s | — → 1 |
+
+**Plans and costs** (`EXPLAIN (ANALYZE, BUFFERS)` of the core queries):
+- **History** uses the expression index: an Index Scan on `observations_by_source_advertiser` returning only the advertiser's rows (100 rows at 50,000), with a hash of the readable runs. Execution takes 48 ms and 6,718 shared buffers at 50,000, all hits; sort memory is 75 kB.
+- **Search** reads every readable run's observations: a Bitmap Heap Scan per run that discards non-matching names. Execution takes 314 ms and 9,804 buffers at 50,000; sort memory is 125 kB. It costs roughly linear time in the source's observations per page, and every page re-aggregates.
+- **Variants tried:** a single evaluation of the normalizer per row and an inlinable variant did not reduce the cost (measured 148–211 ms against 117 ms for the normalizer step), so none was adopted.
+- **Per-page overhead:** the request intent (a synchronous commit) costs about 1 ms. Authorization, availability and the durability gate are within the 10–14 ms of a page at 1,000 observations.
+- **Bound:** the 200,000-candidate cap limits the worst case at about 1.2 s per page by this profile.
+
+### Limitations (M4-P2)
+
+1. **Search cost.** Search is O(observations of the source) per page. Substring matching cannot use a btree. A trigram index would need the `pg_trgm` extension, which is not adopted.
+2. **No cross-page snapshot.** See the consistency table. History fails closed on any change between pages; search pages reflect their own time.
+3. **Normalization depends on the server's Unicode version and ICU.** Upgrades require `REINDEX`, and identities could split or merge across an upgrade.
+4. **Spellings are capped** at 10 per search hit and 50 in a history summary, with a truncation flag.
+5. **Inherited limits are unchanged:** request audit rather than disclosure audit, no exactly-once delivery, R-26 cold-catalog liveness, and the durability operating conditions.
+6. **Not production.** Synthetic data only. All Milestone 3 real-evidence pilot and production blockers remain.
+
+**Governance:** the new reader privilege (EXECUTE on `si_search_advertisers` and `si_advertiser_history`) is recorded as **FD22 (PROPOSED)**. R-22 (the client-side scan) is resolved on the product path by 0014.
+

@@ -9,6 +9,7 @@
 //   page 2                   EMPTY: the scan would end here with 1 of 3 records
 //   wait until E + 0.5 s     v2 in effect                             -> available again
 //   post-check               AVAILABLE, token(v2)
+// (SV-1/SV-M run the client-scan oracle path, which uses si_read_source_availability; SV-2/SV-2M run the server-side path.)
 // Only the version-in-effect input of the state token distinguishes the two ends: no control, no source-row change
 // and no new version is committed during the scan. Without it the scan returns a truncated success (ok:1).
 import test from 'node:test';
@@ -27,7 +28,10 @@ assert.equal(FN.split(ANCHOR).length, 2, 'exactly one anchor');
 let n = 0;
 test.before(async () => { const a = await connect(); try { await provisionReaderPrincipal(a, 'si_reader_alice', cfg.rolePassword); } finally { await a.end(); } });
 
-async function scenario(t, mutantSql) {
+const MIG14 = readFileSync(new URL('../../db/migrations/0014_server_side_intelligence.up.sql', import.meta.url), 'utf8');
+const STATE_FN = (() => { const s = MIG14.indexOf('CREATE FUNCTION si.si_availability_state'); const e = 'END $availability_state$;'; return MIG14.slice(s, MIG14.indexOf(e, s) + e.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); })();
+
+async function scenario(t, mutantSql, kind = 'client') {
   const db = await freshDatabase(t, 'm4sched');
   const x = await roles(t, db, ['admin', 'si_rights_admin', 'si_collector', 'si_monitor']);
   if (mutantSql) await asOwner(x.admin, a => a.query(mutantSql));
@@ -53,15 +57,23 @@ async function scenario(t, mutantSql) {
   let page = 0;
   const client = { query: async (...q) => {
     const r = await alice.query(...q);
-    if (typeof q[0] === 'string' && q[0].includes('si.si_read_evidence(')) {
+    if (kind === 'client' && typeof q[0] === 'string' && q[0].includes('si.si_read_evidence(')) {
       page++;
       if (page === 1) await until(eff - 59000);                                  // into v1's margin
       if (page === 2) { page2.push(r.rows.length); await until(eff + 500); }      // v2 in effect before the post-check
     }
+    if (kind === 'server' && typeof q[0] === 'string' && q[0].includes('si.si_advertiser_history(')) {
+      page++;
+      if (page === 1) { page2.push(r.rows[0].doc.observations.length); await until(eff + 500); }   // v2 in effect before page 2
+    }
     return r;
   } };
   let outcome;
-  try { const h = await INTEL.advertiserHistory(client, src, 'Northwind Synthetic', { pageSize: 1 }); outcome = `ok:${h.observations.length}`; }
+  try {
+    const h = kind === 'client' ? await INTEL.advertiserHistoryClientScan(client, src, 'Northwind Synthetic', { pageSize: 1 })
+                                : await INTEL.advertiserHistory(client, src, 'Northwind Synthetic', { pageSize: 1 });
+    outcome = `ok:${h.observations.length}`;
+  }
   catch (e) { outcome = e?.name === 'IntelligenceFailed' ? `INTEL:${e.code}` : `${e?.name}:${e?.code}`; }
   return { outcome, page2: page2[0] };
 }
@@ -78,4 +90,20 @@ test('SV-M: mutant — token without the version in effect returns the truncated
   console.log(`# SV-M page 2 rows: ${r.page2}; outcome ${r.outcome}`);
   assert.equal(r.page2, 0);
   assert.equal(r.outcome, 'ok:1', 'the defect: a successful but incomplete result');
+});
+
+// M4-P2: the server-side path. Each page is computed atomically under the source lock, so a page never returns a
+// silently empty result; the version-in-effect input of the server state token (si_availability_state) is what makes
+// the second page refuse a changed state (here: v2 took effect between pages).
+test('SV-2: real 0014 — a version that takes effect between server-side history pages fails AVAILABILITY_CHANGED', async t => {
+  const r = await scenario(t, null, 'server');
+  console.log(`# SV-2 page 1 observations: ${r.page2}; outcome ${r.outcome}`);
+  assert.equal(r.page2, 1);
+  assert.equal(r.outcome, 'INTEL:AVAILABILITY_CHANGED');
+});
+
+test('SV-2M: mutant — server state token without the version in effect accepts the changed state (killed)', async t => {
+  const r = await scenario(t, STATE_FN.replace(ANCHOR, ''), 'server');
+  console.log(`# SV-2M page 1 observations: ${r.page2}; outcome ${r.outcome}`);
+  assert.equal(r.outcome, 'ok:3', 'the defect: a change of the version in effect between pages is not reported');
 });

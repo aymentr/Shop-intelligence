@@ -49,11 +49,12 @@ const EXPECTED_EXECUTE = {
   si_grant_reader: ['si_rights_admin'], si_revoke_reader: ['si_rights_admin'],                         // 0008 (internal reads)
   si_read_evidence: ['si_reader'], si_begin_read: ['si_reader'],                                      // 0009 (committed read intent)
   si_read_source_status: ['si_reader'],                                                                 // 0011 (content-free source status)
-  si_read_source_availability: ['si_reader']                                                            // 0012 (content-free source availability)
+  si_read_source_availability: ['si_reader'],                                                           // 0012 (content-free source availability)
+  si_search_advertisers: ['si_reader'], si_advertiser_history: ['si_reader']                             // 0014 (server-side intelligence)
 };
-const EXPECTED_DEFINER = ['si_begin_read', 'si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_purge_due',
+const EXPECTED_DEFINER = ['si_advertiser_history', 'si_begin_read', 'si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_purge_due',
                           'si_purge_failures', 'si_read_evidence', 'si_read_source_availability', 'si_read_source_status', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
-                          'si_record_source_control', 'si_record_verification_failure', 'si_retention_status', 'si_revoke_reader',
+                          'si_record_source_control', 'si_record_verification_failure', 'si_retention_status', 'si_revoke_reader', 'si_search_advertisers',
                           'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_purge_check',
                           'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
                           'trg_runs_publish_check', 'trg_runs_purge_check'];
@@ -96,7 +97,10 @@ const EXPECTED_VOLATILITY = {
   // 0012 reader source availability
   si_read_source_availability: 'v',
   // 0013 opaque availability state (owner-only: EXECUTE for nobody)
-  si_availability_mac: 's', si_rotate_availability_state_key: 'v'
+  si_availability_mac: 's', si_rotate_availability_state_key: 'v',
+  // 0014 server-side intelligence (helpers owner-only)
+  si_normalize_advertiser: 'i', si_intelligence_scope: 'i', si_availability_state: 'v', si_intelligence_iso: 'i',
+  si_intelligence_check_args: 'i', si_search_advertisers: 'v', si_advertiser_history: 'v'
 };
 
 let db, c;
@@ -210,7 +214,7 @@ test('SD1: SECURITY DEFINER contract — owner, fixed search_path, no PUBLIC EXE
   for (const f of fns) {
     assert.equal(f.owner, 'si_owner', f.proname);
     // 0008: the read function also pins a bounded lock wait (it must never queue behind emergency controls).
-    assert.deepEqual(f.proconfig, ['si_read_evidence', 'si_read_source_status', 'si_read_source_availability'].includes(f.proname) ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
+    assert.deepEqual(f.proconfig, ['si_read_evidence', 'si_read_source_status', 'si_read_source_availability', 'si_search_advertisers', 'si_advertiser_history'].includes(f.proname) ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
                                                                    : ['search_path=pg_catalog, pg_temp'], `${f.proname} search_path`);
     assert.equal(f.default_acl, false, `${f.proname}: a NULL ACL would mean PUBLIC EXECUTE`);
     assert.equal(f.public_grant, false, `${f.proname}: PUBLIC must not have EXECUTE`);
@@ -346,8 +350,11 @@ test('SR-0 (0008, 0009): si_reader is a NOLOGIN group with no table privilege an
   }
   const fns = (await c.admin.query(`SELECT p.oid::regprocedure::text AS f FROM pg_proc p WHERE p.pronamespace = 'si'::regnamespace
                                      AND has_function_privilege('si_reader', p.oid, 'EXECUTE')`)).rows.map(x => x.f);
-  assert.deepEqual(fns.sort(), ['si.si_begin_read(text,text,integer)', 'si.si_read_evidence(text,uuid,text,integer)',
+  assert.deepEqual(fns.sort(), [
+                                'si.si_advertiser_history(text,uuid,text,text[],timestamp with time zone,timestamp with time zone,text,integer)',
+                                'si.si_begin_read(text,text,integer)', 'si.si_read_evidence(text,uuid,text,integer)',
                                 'si.si_read_source_availability(text,uuid)',
-                                'si.si_read_source_status(text,uuid,timestamp with time zone,timestamp with time zone)']);
+                                'si.si_read_source_status(text,uuid,timestamp with time zone,timestamp with time zone)',
+                                'si.si_search_advertisers(text,uuid,text,text[],timestamp with time zone,timestamp with time zone,text,boolean,integer)'].sort());
   assert.deepEqual((await c.admin.query(`SELECT setconfig FROM pg_db_role_setting WHERE setrole = 'si_reader'::regrole`)).rows, [], 'group settings are not inherited; principals carry their own');
 });

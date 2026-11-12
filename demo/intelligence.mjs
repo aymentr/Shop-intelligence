@@ -4,7 +4,7 @@
 // Nothing here represents live market conditions, real advertisers or real campaigns, and nothing is
 // displayed to a customer, exported or mirrored. There is no network collection.
 //
-// Drives the REAL implementation (migrations 0001-0013, persistence library in dist/) against a disposable
+// Drives the REAL implementation (migrations 0001-0014, persistence library in dist/) against a disposable
 // PostgreSQL 16.15 container started by demo/run.sh (DEMO_PROGRAM=demo/intelligence.mjs). The reader uses only
 // si_begin_read + si_read_evidence + si_read_source_status + si_read_source_availability, through
 // src/persistence/intelligence.ts.
@@ -69,13 +69,13 @@ const HISTORY = [
   [-1, []]                                                                   // the collector ran yesterday and found nothing
 ];
 try {
-  await scenario('E1', 'Disposable PostgreSQL 16 with migrations 0001-0013 and a dedicated reader', async () => {
+  await scenario('E1', 'Disposable PostgreSQL 16 with migrations 0001-0014 and a dedicated reader', async () => {
     const root = await conn('si_bootstrap', 'postgres');
     await bootstrapCluster(root, { passwords: Object.fromEntries(LOGIN_ROLES.map(r => [r, ROLE_PW])) });
     await provisionReaderPrincipal(root, READER, ROLE_PW);
     await root.query(`DROP DATABASE IF EXISTS ${DB}`); await root.query(`CREATE DATABASE ${DB}`);
     A = await conn('si_bootstrap'); await bootstrapDatabase(A);
-    assert.deepEqual(await migrateUp(await conn('si_migrator')), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert.deepEqual(await migrateUp(await conn('si_migrator')), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
     report.schema_version = codeSchemaVersion();
     [col, ra, mon, rd] = await Promise.all(['si_collector', 'si_rights_admin', 'si_monitor', READER].map(u => conn(u)));
     await A.query('BEGIN'); await A.query('SET LOCAL ROLE si_owner');

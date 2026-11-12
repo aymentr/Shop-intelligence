@@ -93,6 +93,8 @@ function interleaved(client, after) {
   return { query: async (...args) => {
     const r = await client.query(...args);
     if (typeof args[0] === 'string' && args[0].includes('si.si_read_evidence(')) await after(r.rows.length);
+    else if (typeof args[0] === 'string' && args[0].includes('si.si_advertiser_history(')) await after(r.rows[0].doc.observations.length);
+    else if (typeof args[0] === 'string' && args[0].includes('si.si_search_advertisers(')) await after(r.rows[0].doc.hits.length);
     return r;
   } };
 }
@@ -315,16 +317,16 @@ test('INT-17: request audit — one committed intent per page and per status; ca
   const h = await INTEL.advertiserHistory(alice, src, 'Northwind Synthetic', { pageSize: 2, period: period(-300, 60), withStatus: true });
   assert.equal(h.observations.length, 3);
   const audit = await count();
-  assert.equal(audit.c, 6, '2 availability checks (before and after) + 3 evidence pages (2 + 1 + empty) + 1 status: each its own consumed request');
+  assert.equal(audit.c, 3, 'M4-P2: 2 server-side history pages (2 + 1 observations; availability evaluated inside each) + 1 status: each its own consumed request');
   assert.equal(audit.k, audit.n, 'every request record is committed');
   // An unconsumed extra intent can only come from the bounded fresh-intent retry on INTENT_NOT_DURABLE (unrelated
   // unflushed WAL, e.g. catalog pruning in a freshly cloned database): at most two retries per request.
-  assert.ok(audit.n >= 6 && audit.n <= 18, `intents: ${audit.n}`);
+  assert.ok(audit.n >= 3 && audit.n <= 9, `intents: ${audit.n}`);
   const digest = c => createHash('sha256').update(c, 'utf8').digest('hex');
   const scoped = async c => (await x.admin.query(`SELECT count(*)::int AS n FROM si.read_intents WHERE cursor_sha256 = $1 AND read_limit = 1
                                                     AND state = 'CONSUMED' AND rows_returned = 1 AND bytes_returned > 0`, [digest(c)])).rows[0].n;
   assert.equal(await scoped(INTEL.statusCursor(src, period(-300, 60))), 1, 'one status request, its period in the audited scope');
-  assert.equal(await scoped(INTEL.availabilityCursor(src)), 2, 'two availability requests');
+  assert.equal(await scoped(INTEL.availabilityCursor(src)), 0, 'no separate availability request on the server-side path');
   // Inside a caller transaction nothing is released at all.
   await alice.query('BEGIN');
   const err = await INTEL.advertiserHistory(alice, src, 'Northwind Synthetic').catch(e => e);
@@ -415,7 +417,9 @@ test('INT-21: availability changes during a multi-page scan never produce a misl
   const x = await fresh(t);
   const alice = await reader(x);
   const three = async () => { const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `m${n}-${i}`))); return src; };
-  const scan = (src, after) => INTEL.advertiserHistory(interleaved(alice, after), src, 'Northwind Synthetic', { pageSize: 1 });
+  // M4-P2: these interleavings target the evidence-page scan (scanEvidence, used by the client-scan oracle). The server-side
+  // path has its own mid-pagination tests in tests/db/m4-server-intelligence.test.mjs.
+  const scan = (src, after) => INTEL.advertiserHistoryClientScan(interleaved(alice, after), src, 'Northwind Synthetic', { pageSize: 1 });
   const once = fn => { let done = false; return async k => { if (!done && (await fn(k)) !== false) done = true; }; };
   // Suspended after the first page and still suspended: SOURCE_UNAVAILABLE (pages after it were empty).
   const a = await three();
@@ -451,7 +455,7 @@ test('INT-21: availability changes during a multi-page scan never produce a misl
   assert.ok(h.observations.length >= 3 && h.availability.state === 'AVAILABLE');
   // Search over two sources, one suspended mid-way through its own scan: the whole search fails, typed.
   const s1 = await three(), s2 = await three();
-  await assert.rejects(INTEL.searchAdvertisers(interleaved(alice, once(k => k === 1 && control(x.si_rights_admin, s2, 'SUSPEND'))),
+  await assert.rejects(INTEL.searchAdvertisersClientScan(interleaved(alice, once(k => k === 1 && control(x.si_rights_admin, s2, 'SUSPEND'))),
     { sources: [s1, s2], query: 'north' }, { pageSize: 1 }), UNAVAILABLE(s2, ['SUSPENDED']));
   // M4-P1.2: concurrent changes from several sessions at once, between pages; never a successful truncated result.
   const ra2 = await x.connect('si_rights_admin'), ra3 = await x.connect('si_rights_admin');
@@ -624,12 +628,12 @@ async function scnAvailIntent(x) {                                           // 
 }
 async function scnAvailReason(x) {                                           // mutant: a suspension is reported without its reason
   const src = await source(x); await control(x.si_rights_admin, src, 'SUSPEND');
-  return libOutcome(INTEL.advertiserHistory(await reader(x), src, 'Northwind Synthetic'));
+  return libOutcome(INTEL.advertiserHistoryClientScan(await reader(x), src, 'Northwind Synthetic'));
 }
-async function scnAvailRowVersion(x, L = INTEL) {                            // mutant: retirement moved into the margin and back mid-scan goes unnoticed
+async function scnAvailRowVersion(x, L = INTEL) {                            // (client-scan path: it uses si_read_source_availability)                            // mutant: retirement moved into the margin and back mid-scan goes unnoticed
   const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `rv${n}-${i}`)));
   let step = 0;
-  return libOutcome(L.advertiserHistory(interleaved(await reader(x), async k => {
+  return libOutcome(L.advertiserHistoryClientScan(interleaved(await reader(x), async k => {
     if (step === 0 && k === 1) { step = 1; await retire(x, src, "clock_timestamp() + interval '30 seconds'"); }
     else if (step === 1 && k === 0) { step = 2; await retire(x, src, 'NULL'); }
   }), src, 'Northwind Synthetic', { pageSize: 1 }));
@@ -637,7 +641,7 @@ async function scnAvailRowVersion(x, L = INTEL) {                            // 
 async function scnAvailControlSeq(x) {                                       // mutant: suspend -> (empty page) -> lift goes unnoticed
   const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `cs${n}-${i}`)));
   let step = 0;
-  return libOutcome(INTEL.advertiserHistory(interleaved(await reader(x), async k => {
+  return libOutcome(INTEL.advertiserHistoryClientScan(interleaved(await reader(x), async k => {
     if (step === 0 && k === 1) { step = 1; await control(x.si_rights_admin, src, 'SUSPEND'); }
     else if (step === 1 && k === 0) { step = 2; await lift(x.si_rights_admin, src); }
   }), src, 'Northwind Synthetic', { pageSize: 1 }));
@@ -645,7 +649,7 @@ async function scnAvailControlSeq(x) {                                       // 
 async function scnAvailVersionInEffect(x) {                                  // mutant: a change of the version in effect is not reported
   const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `ve${n}-${i}`)));
   let done = false;                                                          // (fast contract check; the truncation case is tests/slow/m4-scheduled-version)
-  return libOutcome(INTEL.advertiserHistory(interleaved(await reader(x), async k => {
+  return libOutcome(INTEL.advertiserHistoryClientScan(interleaved(await reader(x), async k => {
     if (!done && k === 1) { done = true; await recordRights(x.si_rights_admin, src, { change_reason: 'same terms, new version' }); }
   }), src, 'Northwind Synthetic', { pageSize: 1 }));
 }
@@ -711,29 +715,29 @@ async function mutatedLibrary(t, edits) {
 }
 async function lscnDistinct(L, x) {                                          // mutant: distinct ads counts observations
   const src = await source(x); await collect(x, src, [AD('Northwind Synthetic', 'd1')]); await collect(x, src, [AD('Northwind Synthetic', 'd1')]);
-  return `value:${(await L.advertiserHistory(await reader(x), src, 'Northwind Synthetic')).distinctAds}`;
+  return `value:${(await L.advertiserHistoryClientScan(await reader(x), src, 'Northwind Synthetic')).distinctAds}`;
 }
 async function lscnBoundary(L, x) {                                          // mutant: a record exactly at `to` is included
   const src = await source(x); const r = await collect(x, src, [AD('Northwind Synthetic', 'edge')]); await at(x, r, day(14).toISOString());
-  return libOutcome(L.advertiserHistory(await reader(x), src, 'Northwind Synthetic', { period: period(10, 14) }));
+  return libOutcome(L.advertiserHistoryClientScan(await reader(x), src, 'Northwind Synthetic', { period: period(10, 14) }));
 }
 async function lscnMerge(L, x) {                                             // mutant: one advertiser hit merges two sources
   const a = await source(x), b = await source(x);
   await collect(x, a, [AD('Shared Synthetic', 'a1')]); await collect(x, b, [AD('Shared Synthetic', 'b1')]);
-  return libOutcome(L.searchAdvertisers(await reader(x), { sources: [a, b], query: 'shared' }));
+  return libOutcome(L.searchAdvertisersClientScan(await reader(x), { sources: [a, b], query: 'shared' }));
 }
 async function lscnIdentity(L, x) {                                          // mutant: history of "Acme" includes "Acme Labs"
   const src = await source(x); await collect(x, src, [AD('Acme Synthetic', 'a'), AD('Acme Synthetic Labs', 'b')]);
-  return libOutcome(L.advertiserHistory(await reader(x), src, 'Acme Synthetic'));
+  return libOutcome(L.advertiserHistoryClientScan(await reader(x), src, 'Acme Synthetic'));
 }
 async function lscnUnavailableEmpty(L, x) {                                  // mutant (D1 itself): a suspended source reads as empty history
   const src = await source(x); await collect(x, src, [AD('Northwind Synthetic', 'u1')]); await control(x.si_rights_admin, src, 'SUSPEND');
-  return libOutcome(L.advertiserHistory(await reader(x), src, 'Northwind Synthetic'));
+  return libOutcome(L.advertiserHistoryClientScan(await reader(x), src, 'Northwind Synthetic'));
 }
 async function lscnSuspendLift(L, x) {                                       // mutant: suspend + lift during the scan returns a truncated success
   const src = await source(x); await collect(x, src, [1, 2, 3].map(i => AD('Northwind Synthetic', `sl${n}-${i}`)));
   let step = 0;
-  return libOutcome(L.advertiserHistory(interleaved(await reader(x), async k => {
+  return libOutcome(L.advertiserHistoryClientScan(interleaved(await reader(x), async k => {
     if (step === 0 && k === 1) { step = 1; await control(x.si_rights_admin, src, 'SUSPEND'); }
     else if (step === 1 && k === 0) { step = 2; await lift(x.si_rights_admin, src); }
   }), src, 'Northwind Synthetic', { pageSize: 1 }));
@@ -753,7 +757,7 @@ const LIB_MUTANTS = [
   { name: 'scan state-token comparison omitted', scenario: lscnSuspendLift, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:1',
     edits: [["    if (after.stateToken !== before.stateToken)\n        throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });\n", '']] }
 ];
-for (const m of LIB_MUTANTS) {
+for (const m of LIB_MUTANTS) {                                               // M4-P2: these guard the client-scan oracle; the server path has its own
   test(`INT-M lib (${m.name}): the baseline gives exactly the correct outcome, the mutant exactly the defect`, async t => {
     const base = await m.scenario(INTEL, await fresh(t, 'm4lb'));
     const L = await mutatedLibrary(t, m.edits);

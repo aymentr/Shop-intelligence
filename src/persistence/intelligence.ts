@@ -29,7 +29,8 @@ export const MAX_SCAN_RECORDS = 5000;
 export const MAX_SEARCH_RESULTS = 50;
 export const MAX_SOURCES_PER_REQUEST = 10;
 
-export type IntelligenceFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'SCAN_LIMIT' | 'SOURCE_UNAVAILABLE' | 'AVAILABILITY_CHANGED';
+export type IntelligenceFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'SCAN_LIMIT' | 'SOURCE_UNAVAILABLE' | 'AVAILABILITY_CHANGED'
+  | 'RESULT_CHANGED' | 'RESULT_TOO_LARGE';
 /** Why a granted reader may not read a source now (migration 0012), in this fixed order. */
 export const UNAVAILABILITY_REASONS = ['RETIRED', 'TERMINATED', 'SUSPENDED', 'RIGHTS_RESTRICTED', 'RETENTION_RESTRICTED',
                                        'NOT_SYNTHETIC', 'UNAVAILABLE'] as const;
@@ -130,9 +131,9 @@ export const availabilityCursor = (sourceId: string): string => `v1|${sourceId}|
 /** One content-free, audited request (its own committed, crash-durable intent), with the library's bounded fresh-intent
  *  retry on INTENT_NOT_DURABLE only. `onError` may map a database error to a typed failure first. */
 async function auditedCall(client: ClientBase, sourceId: string, cursor: string, sql: string, params: unknown[],
-  onError: (message: string) => Error | null = () => null): Promise<Record<string, unknown> | undefined> {
+  onError: (message: string) => Error | null = () => null, limit = 1): Promise<Record<string, unknown> | undefined> {
   for (let attempt = 1; ; attempt++) {
-    const intentId = await beginRead(client, sourceId, { cursor, limit: 1 });
+    const intentId = await beginRead(client, sourceId, { cursor, limit });
     try {
       return (await client.query(sql, [sourceId, intentId, ...params])).rows[0];
     } catch (err) {
@@ -173,7 +174,7 @@ export interface Observation {
 }
 export interface AdvertiserHistory {
   sourceId: string;
-  advertiser: { normalizedName: string; names: string[] };
+  advertiser: { normalizedName: string; names: string[]; namesTruncated?: boolean };
   observations: Observation[];
   firstObservedAt: string | null;                                             // earliest verified collection containing it
   lastObservedAt: string | null;                                              // latest verified collection containing it
@@ -191,7 +192,12 @@ export interface AdvertiserHistory {
 const NOTE_ABSENCE = 'Absence of observations after lastObservedAt does not show that an advertisement stopped running.';
 const NOTE_SCOPE = 'Synthetic evidence only. No performance, spend, reach, impressions or conversions are available or inferred.';
 
-export async function advertiserHistory(client: ClientBase, sourceId: string, advertiserName: string,
+/**
+ * M4-P1 client-side implementation (scans every readable record of the source through si_read_evidence, at most
+ * MAX_SCAN_RECORDS). Since M4-P2 it is kept only as the reference oracle for the server-side advertiserHistory and as
+ * the performance baseline; it is not used by the product path.
+ */
+export async function advertiserHistoryClientScan(client: ClientBase, sourceId: string, advertiserName: string,
   opts: { period?: Period; pageSize?: number; maxRecords?: number; withStatus?: boolean } = {}): Promise<AdvertiserHistory> {
   if (typeof advertiserName !== 'string' || normalizeAdvertiser(advertiserName).length === 0 || advertiserName.length > 300) {
     throw new IntelligenceFailed('BAD_ARGUMENT');
@@ -233,7 +239,7 @@ export async function advertiserHistory(client: ClientBase, sourceId: string, ad
 export interface SearchQuery { sources: string[]; query: string; period?: Period; networks?: string[]; limit?: number; cursor?: string | null }
 export interface AdvertiserHit {
   sourceId: string; normalizedName: string; names: string[]; observations: number; distinctAds: number;
-  runsWithEvidence: number; firstObservedAt: string; lastObservedAt: string; networks: string[];
+  runsWithEvidence: number; firstObservedAt: string; lastObservedAt: string; networks: string[]; namesTruncated?: boolean;
 }
 /** `sources`: every requested source, each AVAILABLE throughout its scan (otherwise the whole search fails, typed). */
 export interface SearchPage { hits: AdvertiserHit[]; nextCursor: string | null; scannedPages: number; sources: AvailableSource[] }
@@ -260,7 +266,8 @@ const cmp = (a: [string, string], b: [string, string]) => (a[0] < b[0] ? -1 : a[
  * (normalizedName, sourceId). Filters: collection period [from, to), networks. Keyset pagination; a cursor
  * is bound to the exact query and is never an authorization (every call re-reads through the boundary).
  */
-export async function searchAdvertisers(client: ClientBase, q: SearchQuery,
+/** M4-P1 client-side search (reference oracle and performance baseline since M4-P2; not the product path). */
+export async function searchAdvertisersClientScan(client: ClientBase, q: SearchQuery,
   opts: { pageSize?: number; maxRecords?: number } = {}): Promise<SearchPage> {
   if (!q || !Array.isArray(q.sources) || q.sources.length < 1 || q.sources.length > MAX_SOURCES_PER_REQUEST ||
       !q.sources.every(s => typeof s === 'string' && SOURCE_ID.test(s)) || typeof q.query !== 'string' || q.query.length > 300) {
@@ -303,6 +310,203 @@ export async function searchAdvertisers(client: ClientBase, q: SearchQuery,
   const hits = rest.slice(0, limit);
   const last = hits[hits.length - 1];
   return { hits, nextCursor: rest.length > limit && last ? encodeCursor(key, [last.normalizedName, last.sourceId]) : null, scannedPages, sources: checked };
+}
+
+// ------------------------------------------------------------------------------------------------
+// D. Server-side search and history (M4-P2, migration 0014): the product path.
+//
+// Each page is ONE audited request (its own committed, crash-durable intent) whose scope binds the complete request.
+// The database computes the result from currently readable evidence of one source, under the source lock, after the
+// grant and availability checks; an unavailable source is a typed SOURCE_UNAVAILABLE with reasons. Pages are separate
+// requests: there is no snapshot across pages. The library refuses a change of availability between pages
+// (AVAILABILITY_CHANGED, via the state token each page returns) and, for history, any change of the summary or of the
+// observation count between pages (RESULT_CHANGED). Normalization is the server's (authoritative); the library sends
+// the raw query or name exactly as given, and that exact text is what the request scope binds.
+
+export const MAX_HISTORY_PAGE = 100;
+export const MAX_HISTORY_OBSERVATIONS = 5000;
+const NETWORKS = ['GOOGLE', 'META', 'OTHER', 'PINTEREST', 'TIKTOK'];
+
+/** Code point order (the server's COLLATE "C"): compare UTF-8 bytes. */
+const cpCompare = (a: string, b: string): number => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
+const isoUs = (d: Date | null): string | null => (d ? d.toISOString().replace(/\.(\d{3})Z$/, '.$1000Z') : null);
+const toMs = (v: unknown): string | null => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/.test(v) ? v.replace(/(\.\d{3})\d{3}Z$/, '$1Z') : null);
+
+/** The audited scope of a server-side request: exactly si.si_intelligence_scope (migration 0014). */
+export function intelligenceScope(kind: 'search' | 'history', sourceId: string, fields: (string | null)[]): string {
+  const canon = fields.map(f => (f === null ? 'N' : `${Buffer.byteLength(f, 'utf8')}:${f}`)).join('|');
+  return `v1|${sourceId}|${kind}|${createHash('sha256').update(canon, 'utf8').digest('hex')}`;
+}
+function canonicalNetworks(n: string[] | undefined): string[] {
+  const list = n === undefined ? [] : [...new Set(n)].sort(cpCompare);
+  if (list.length > 5 || !list.every(x => typeof x === 'string' && NETWORKS.includes(x))) throw new IntelligenceFailed('BAD_ARGUMENT');
+  return list;
+}
+function serverError(sourceId: string) {
+  return (m: string): Error | null => {
+    const u = /^SI_READ_SOURCE_UNAVAILABLE: ([A-Z_,]+)$/.exec(m);
+    if (u) {
+      const reasons = (u[1] as string).split(',');
+      if (reasons.length > 0 && reasons.every(r => (UNAVAILABILITY_REASONS as readonly string[]).includes(r))) {
+        return new IntelligenceFailed('SOURCE_UNAVAILABLE', { sourceId, reasons: reasons as UnavailabilityReason[] });
+      }
+      return new ReadFailed('INTERNAL', null);
+    }
+    if (m.startsWith('SI_READ_SCAN_LIMIT:')) return new IntelligenceFailed('SCAN_LIMIT', { sourceId });
+    if (m.startsWith('SI_READ_RESULT_TOO_LARGE:')) return new IntelligenceFailed('RESULT_TOO_LARGE', { sourceId });
+    if (m.startsWith('SI_READ_BAD_CURSOR:')) return new IntelligenceFailed('BAD_CURSOR', { sourceId });
+    return null;
+  };
+}
+interface ServerDoc { source_id: string; as_of: string; state_token: string }
+function checkDoc(doc: unknown, sourceId: string): ServerDoc & Record<string, unknown> {
+  const d = doc as Record<string, unknown> | null;
+  if (!d || typeof d !== 'object' || d.source_id !== sourceId || typeof d.state_token !== 'string' || !/^[0-9a-f]{32}$/.test(d.state_token) ||
+      toMs(d.as_of) === null) throw new ReadFailed('INTERNAL', null);
+  return d as ServerDoc & Record<string, unknown>;
+}
+
+/** One server-side search page for ONE source (one audited request). */
+export async function searchSourcePage(client: ClientBase, sourceId: string,
+  r: { query: string; networks: string[]; period: Period | undefined; after: string | null; afterInclusive: boolean; limit: number }) {
+  const from = isoUs(r.period?.from ?? null), to = isoUs(r.period?.to ?? null);
+  const cursor = intelligenceScope('search', sourceId, [r.query, r.networks.join(','), from, to, r.after, String(r.afterInclusive)]);
+  const row = await auditedCall(client, sourceId, cursor,
+    'SELECT si.si_search_advertisers($1, $2::uuid, $3, $4::text[], $5::timestamptz, $6::timestamptz, $7, $8, $9) AS doc',
+    [r.query, r.networks, from, to, r.after, r.afterInclusive, r.limit], serverError(sourceId), r.limit);
+  const d = checkDoc(row?.doc, sourceId);
+  const hits = d.hits;
+  if (!Array.isArray(hits) || typeof d.has_more !== 'boolean' || hits.length > r.limit) throw new ReadFailed('INTERNAL', null);
+  return {
+    asOf: toMs(d.as_of) as string, stateToken: d.state_token, hasMore: d.has_more,
+    hits: hits.map((h: Record<string, unknown>): AdvertiserHit => {
+      const first = toMs(h.first_observed_at), last = toMs(h.last_observed_at);
+      if (typeof h.normalized_name !== 'string' || !Array.isArray(h.names) || !first || !last) throw new ReadFailed('INTERNAL', null);
+      return { sourceId, normalizedName: h.normalized_name, names: h.names as string[], namesTruncated: h.names_truncated === true,
+               observations: Number(h.observations), distinctAds: Number(h.distinct_ads), runsWithEvidence: Number(h.runs_with_evidence),
+               firstObservedAt: first, lastObservedAt: last, networks: h.networks as string[] };
+    })
+  };
+}
+
+interface SearchCursorV2 { v: 2; k: string; a: [string, string]; t: Record<string, string> }
+function encodeCursorV2(c: SearchCursorV2): string { return Buffer.from(JSON.stringify(c), 'utf8').toString('base64url'); }
+function decodeCursorV2(c: string, key: string, sources: string[]): SearchCursorV2 {
+  try {
+    if (c.length > 4096) throw new Error('long');
+    const o = JSON.parse(Buffer.from(c, 'base64url').toString('utf8'));
+    if (o?.v === 2 && o.k === key && Array.isArray(o.a) && o.a.length === 2 && o.a.every((x: unknown) => typeof x === 'string') &&
+        o.t && typeof o.t === 'object' && sources.every(s => typeof o.t[s] === 'string' && /^[0-9a-f]{32}$/.test(o.t[s]))) return o as SearchCursorV2;
+  } catch { /* fall through */ }
+  throw new IntelligenceFailed('BAD_CURSOR');
+}
+
+/**
+ * Advertisers whose normalized name contains the normalized query, per explicitly named source, ordered by
+ * (normalizedName, sourceId) in code point order. Computed by the database (si_search_advertisers): one audited request
+ * per source per page, never merged across sources. The cursor is bound to the exact query, carries each source's state
+ * token, and is never an authorization: every page is re-authorized; a change of any source's availability between
+ * pages fails AVAILABILITY_CHANGED.
+ */
+export async function searchAdvertisers(client: ClientBase, q: SearchQuery, _opts: { pageSize?: number; maxRecords?: number } = {}): Promise<SearchPage> {
+  if (!q || !Array.isArray(q.sources) || q.sources.length < 1 || q.sources.length > MAX_SOURCES_PER_REQUEST ||
+      !q.sources.every(s => typeof s === 'string' && SOURCE_ID.test(s)) || typeof q.query !== 'string' || q.query.length > 300 ||
+      normalizeAdvertiser(q.query).length < 1) {
+    throw new IntelligenceFailed('BAD_ARGUMENT');
+  }
+  const limit = q.limit ?? 20;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_SEARCH_RESULTS) throw new IntelligenceFailed('BAD_ARGUMENT');
+  const networks = canonicalNetworks(q.networks);
+  const period = checkPeriod(q.period);
+  const sources = [...new Set(q.sources)].sort(cpCompare);
+  const key = createHash('sha256').update(JSON.stringify({ s: sources, q: q.query, f: isoUs(period?.from ?? null), t: isoUs(period?.to ?? null), n: networks }))
+    .digest('hex').slice(0, 32);
+  const cur = q.cursor ? decodeCursorV2(q.cursor, key, sources) : null;
+  const all: AdvertiserHit[] = [], tokens: Record<string, string> = {}, checked: AvailableSource[] = [];
+  let more = false, calls = 0;
+  for (const sourceId of sources) {                                           // each source: its own authorization and availability
+    const after = cur ? cur.a[0] : null, afterInclusive = cur ? cpCompare(sourceId, cur.a[1]) > 0 : false;
+    const page = await searchSourcePage(client, sourceId, { query: q.query, networks, period, after, afterInclusive, limit });
+    calls++;
+    if (cur && cur.t[sourceId] !== page.stateToken) throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });
+    tokens[sourceId] = page.stateToken;
+    checked.push({ sourceId, state: 'AVAILABLE', checkedFrom: page.asOf, asOf: page.asOf });
+    all.push(...page.hits);
+    if (page.hasMore) more = true;
+  }
+  all.sort((a, b) => cpCompare(a.normalizedName, b.normalizedName) || cpCompare(a.sourceId, b.sourceId));
+  const hits = all.slice(0, limit);
+  const last = hits[hits.length - 1];
+  const next = (all.length > limit || more) && last ? encodeCursorV2({ v: 2, k: key, a: [last.normalizedName, last.sourceId], t: tokens }) : null;
+  return { hits, nextCursor: next, scannedPages: calls, sources: checked };
+}
+
+/**
+ * History of one advertiser (the server-normalized name) in one source, computed by the database (si_advertiser_history):
+ * a summary over all currently readable matching evidence, and the observations with provenance, keyset-paged (one
+ * audited request per page). Fails closed if availability (state token) or the result (summary, count) changes between
+ * pages, or above `maxRecords` observations (SCAN_LIMIT).
+ */
+export async function advertiserHistory(client: ClientBase, sourceId: string, advertiserName: string,
+  opts: { period?: Period; pageSize?: number; maxRecords?: number; withStatus?: boolean; networks?: string[] } = {}): Promise<AdvertiserHistory> {
+  if (typeof sourceId !== 'string' || !SOURCE_ID.test(sourceId)) throw new IntelligenceFailed('BAD_ARGUMENT');
+  if (typeof advertiserName !== 'string' || normalizeAdvertiser(advertiserName).length === 0 || advertiserName.length > 300) {
+    throw new IntelligenceFailed('BAD_ARGUMENT');
+  }
+  const period = checkPeriod(opts.period);
+  const networks = canonicalNetworks(opts.networks);
+  const limit = opts.pageSize ?? MAX_HISTORY_PAGE, max = opts.maxRecords ?? MAX_HISTORY_OBSERVATIONS;
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_HISTORY_PAGE || !Number.isInteger(max) || max < 1 || max > MAX_HISTORY_OBSERVATIONS) {
+    throw new IntelligenceFailed('BAD_ARGUMENT');
+  }
+  const from = isoUs(period?.from ?? null), to = isoUs(period?.to ?? null);
+  const observations: Observation[] = [];
+  let after: string | null = null, first: (ServerDoc & Record<string, unknown>) | null = null, lastAsOf = '';
+  for (;;) {
+    const cursor = intelligenceScope('history', sourceId, [advertiserName, networks.join(','), from, to, after]);
+    const row = await auditedCall(client, sourceId, cursor,
+      'SELECT si.si_advertiser_history($1, $2::uuid, $3, $4::text[], $5::timestamptz, $6::timestamptz, $7, $8) AS doc',
+      [advertiserName, networks, from, to, after, limit], serverError(sourceId), limit);
+    const d = checkDoc(row?.doc, sourceId);
+    const page = d.observations;
+    if (!Array.isArray(page) || page.length > limit || typeof d.summary !== 'object' || d.summary === null) throw new ReadFailed('INTERNAL', null);
+    if (!first) first = d;
+    else {
+      if (d.state_token !== first.state_token) throw new IntelligenceFailed('AVAILABILITY_CHANGED', { sourceId });
+      if (JSON.stringify(d.summary) !== JSON.stringify(first.summary) || d.normalized_name !== first.normalized_name) {
+        throw new IntelligenceFailed('RESULT_CHANGED', { sourceId });
+      }
+    }
+    lastAsOf = toMs(d.as_of) as string;
+    for (const o of page as Record<string, unknown>[]) {
+      const collectedAt = toMs(o.collected_at), seenAt = toMs(o.seen_at);
+      if (typeof o.run_id !== 'string' || !collectedAt || !seenAt) throw new ReadFailed('INTERNAL', null);
+      observations.push({ sourceId, runId: o.run_id, ordinal: Number(o.ordinal), collectedAt, seenAt, network: String(o.network),
+        nativeAdId: String(o.native_ad_id), title: (o.title as string | null) ?? null, sourceUrl: String(o.source_url),
+        contentSha256: String(o.content_sha256), verification: 'VALID' });
+      if (observations.length > max) throw new IntelligenceFailed('SCAN_LIMIT', { sourceId });
+    }
+    const next = d.next_after;
+    if (next === null || next === undefined) break;
+    if (typeof next !== 'string' || page.length !== limit) throw new ReadFailed('INTERNAL', null);
+    after = next;
+  }
+  const f = first as ServerDoc & Record<string, unknown>;
+  const s = f.summary as Record<string, unknown>;
+  if (Number(s.observations) !== observations.length) throw new IntelligenceFailed('RESULT_CHANGED', { sourceId });
+  const status = opts.withStatus && period ? await sourceStatus(client, sourceId, period) : null;
+  return {
+    sourceId,
+    advertiser: { normalizedName: String(f.normalized_name), names: (s.names as string[]) ?? [], namesTruncated: s.names_truncated === true },
+    observations,
+    firstObservedAt: toMs(s.first_observed_at), lastObservedAt: toMs(s.last_observed_at),
+    sourceReportedFirstSeen: toMs(s.source_reported_first_seen), sourceReportedLastSeen: toMs(s.source_reported_last_seen),
+    distinctAds: Number(s.distinct_ads), runsWithEvidence: Number(s.runs_with_evidence), networks: (s.networks as string[]) ?? [],
+    endOfActivity: 'UNKNOWN',
+    availability: { sourceId, state: 'AVAILABLE', checkedFrom: toMs(f.as_of) as string, asOf: lastAsOf },
+    sourceVerification: status,
+    notes: [NOTE_ABSENCE, NOTE_SCOPE]
+  };
 }
 
 // ------------------------------------------------------------------------------------------------

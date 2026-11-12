@@ -212,4 +212,10 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^INT-(1|3|17|20)/?[^0-9]' tests/db/m4-intelligence.test.mjs
 echo 'DR-1 restored advertiser history, cross-source isolation, request audit and explicit source availability of intelligence reads PASS'
+# Migration 0014 on the restored cluster: server-side audited search and history (authorization, availability, audit).
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^SRV-(3|4|6):' tests/db/m4-server-intelligence.test.mjs
+echo 'DR-1 restored server-side search and history: authorization, availability and request audit PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'
