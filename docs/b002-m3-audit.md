@@ -128,6 +128,7 @@ The two gates compare `flush >= si_durability_target(T)`. That is the only line 
 |---|---|
 | `tests/db/wal-boundary.mjs` | Builds and verifies exact WAL layouts with logical messages |
 | `tests/db/m3-r35-wal-boundary.test.mjs` | R35-1 target arithmetic; R35-2/3 both gate copies at page and segment boundaries, 8 bytes before a boundary and across one; R35-4 rolled-back, uncommitted, replayed and concurrent intents at a boundary; R35-M the old-target mutant |
+| `tests/db/gate-integrity.test.mjs` | M3-R35.1 (C2): the harnesses' gate texts are the latest definitions; no test extracts a gate from an older migration except the labelled R35-M comparison; every baseline asserts the gate it runs |
 | `tests/crash/m3-r35-durability.test.mjs` | WAL writer delayed to 10 s by the verified fixture. R35-U1..U3 unflushed WAL mid-page, ending on a boundary, and after a flushed boundary; R35-N negative controls; R35-C1..C3 crash recovery |
 
 The negative controls are three mutants that weaken durability: wait skipped, target floored to its page, small page offsets normalized. Each releases unflushed WAL in exactly its scenario.
@@ -135,7 +136,23 @@ The negative controls are three mutants that weaken durability: wait skipped, ta
 The crash cases:
 - **C1:** a release at a flushed boundary survives recovery.
 - **C2:** an unwritten asynchronous intent is refused and lost; the wait-skipped mutant releases it and loses it.
-- **C3:** an intent on a written-but-unflushed page is refused.
+- **C3 (redesigned in M3-R35.1, condition C1 of M3-R35-ACCEPT-01):** the intent's *own* commit is verifiably unflushed while the WAL ends on a page boundary. The WAL writer process is stopped (SIGSTOP, checked in `/proc`) and autovacuum is off after a `CHECKPOINT`, so nothing flushes WAL unless a session commits synchronously, which the test does not. The intent's session reads the insert position L inside its transaction just before its asynchronous `COMMIT`; the commit record starts at or after L, so `flush <= L` proves it is unflushed. The test requires `flush <= L` before the read and again after the refusal, the read refused `INTENT_NOT_DURABLE`, the intent OPEN and no access-log row; if any precondition cannot be established the test fails (no retry, no void). Run with `fsync=off` (compose) and `fsync=on` (disk volume): 3/3 each. The crash outcome is recorded, not asserted: the intent was lost in every run, because with the WAL writer stopped its WAL never reached the operating system. The earlier C3 checked only a stray record and, as the review showed, could pass with the intent already flushed.
+- **What the crash tests do and do not show.** A SIGKILL of a backend leaves the operating-system page cache intact: written-but-unfsynced WAL survives it. They show that a *release* implies a flushed commit and that unwritten intents are not released; they are not evidence of physical durability (power loss) or standby failover, which were not tested.
+
+**Test integrity (M3-R35.1, condition C2 of M3-R35-ACCEPT-01).** Until M3-R35.1, several harnesses built their copies of `si_read_evidence` from the 0010 text and installed them in their test databases, so those tests ran the pre-0017 gate. `si_claim_read_intent` was never replaced by a test.
+
+| Site | Purpose | Classification | Now |
+|---|---|---|---|
+| `tests/db/durability-fixtures.mjs` `READ_FN` | shared base text | stale "production" text | the latest migration's definition (`latestDefinition`), with `CLAIM_FN`, `TARGET` and `assertGate` |
+| `tests/crash/m3-durability-fixtures.test.mjs` `GATE_FN` (AUD-13a) | instrumented production copy | accidental base | instruments the active gate (anchored on `TARGET`) |
+| same file, "restore the production function" | restore after instrumentation | **accidental rollback** to 0010 | restores the active text and asserts it |
+| same file and `tests/crash/m3-durability-crash.test.mjs`, AUD-DM | intentional mutations and paused baselines | accidental base | mutate the active gate (target-line mutants anchored on `TARGET`); baselines assert the 0017 gate |
+| `tests/db/m3-reader.test.mjs` RC-1..RC-6 and RD-M | instrumented copy and intentional mutations | accidental base (own 0010 copy) | shared active text; asserted |
+| `tests/db/m3-audit.test.mjs` AUD-M | intentional mutations | accidental base (own 0010 copy) | shared active text; baseline asserted |
+| `demo/lifecycle.mjs` grant mutant | intentional mutation (demo negative control) | accidental base | latest definition |
+| `tests/db/wal-boundary.mjs` `OLD_READ` / `OLD_CLAIM` | the pre-0017 gate for R35-M | **intentional historical** | unchanged, labelled |
+
+`tests/db/gate-integrity.test.mjs` fails if a test extracts a gate from an older migration outside that labelled comparison (run over the pre-M3-R35.1 tree, it flags all four files above that did), if the shared texts are not the latest definitions, or if a harness installs a copy without asserting which gate its baseline runs.
 
 ### 2.3 Durability conditions (part of the guarantee)
 

@@ -17,12 +17,12 @@ import { asOwner, cfg, connect, control, createSources, freshDatabase, lift, pid
          waitUntilBlocked } from './helpers.mjs';
 import { migrateDown, migrateUp } from '../../dist/persistence/migrate.js';
 import { provisionReaderPrincipal } from '../../dist/persistence/bootstrap.js';
+import { READ_FN, assertGate } from './durability-fixtures.mjs';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { beginRead, readEvidence, grantReader, revokeReader, ReadFailed } from '../../dist/persistence/reader.js';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 // The read function as last defined (0010 replaces the 0009 read with the durability gate).
-const MIG10 = readFileSync(new URL('../../db/migrations/0010_read_durability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 let n = 0;
 
@@ -416,7 +416,7 @@ function mutate(text, from, to) {
   assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`);
   return text.replace(from, to);
 }
-const READ_FN = fnText(MIG10, 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
+// M3-R35.1 (C2): mutants of the ACTIVE gate (latest migration, 0017), shared with the durability fixtures.
 const ok = async p => { const r = await settle(p); return r.status === 'ok' && r.value.length > 0; };
 const MUTANTS = [
   { name: 'committed-intent check omitted', sql: mutate(READ_FN, `  IF st <> 'committed' THEN`, '  IF false THEN'),
@@ -460,6 +460,7 @@ const MUTANTS = [
 for (const m of MUTANTS) {
   test(`AUD-M (${m.name}): the baseline passes the scenario and the targeted mutant is detected`, async t => {
     const bx = await fresh(t, 'm3audb');
+    await assertGate(bx.admin, 'active');                                      // the baseline runs the 0017 gate
     const base = await m.scenario(bx);
     const x = await fresh(t, 'm3audm');
     await asOwner(x.admin, a => a.query(m.sql));

@@ -14,7 +14,7 @@
 // stored retention deadline and disturbs a receipt identity under session_replication_role = replica.
 // Source rows are inserted as si_owner (sources have no write function; provisioning is an owner task).
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { randomBytes, createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -186,10 +186,20 @@ function fnText(file, start, end) {
   return t.slice(s, t.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION');
 }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, 'mutation anchor'); return text.replace(from, to); }
+/** The ACTIVE definition of a function: the latest migration that defines it (M3-R35.1: si_read_evidence is 0017's). */
+function latestFnText(name, end) {
+  const dir = new URL('../db/migrations/', import.meta.url);
+  for (const f of readdirSync(dir).filter(f => /^\d{4}_.*\.up\.sql$/.test(f)).sort().reverse()) {
+    const t = readFileSync(new URL(f, dir), 'utf8');
+    const m = new RegExp(`CREATE (OR REPLACE )?FUNCTION si\\.${name}\\(`).exec(t);
+    if (m) return fnText(f, m[0], end);
+  }
+  throw new Error(`no migration defines si.${name}`);
+}
 const MUTANTS = {
   // Both reader entry points check the grant (0009): the mutant disables it in both.
   grant: () => [
-    mutate(fnText('0010_read_durability.up.sql', 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;'),
+    mutate(latestFnText('si_read_evidence', 'END $read_evidence$;'),
       'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g'),
     mutate(fnText('0009_read_audit.up.sql', 'CREATE FUNCTION si.si_begin_read', 'END $begin_read$;'),
       '     OR NOT EXISTS (SELECT 1 FROM si.reader_grants g', '     OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g')].join('\n'),

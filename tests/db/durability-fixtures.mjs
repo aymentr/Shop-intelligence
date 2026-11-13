@@ -1,6 +1,6 @@
 // Shared fixtures for the durability tests (tests/crash/*.test.mjs: M3-AUD-03 and M4-P1 INT-19). Not a test file.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -10,7 +10,6 @@ import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-has
 import { grantReader } from '../../dist/persistence/reader.js';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
-export const MIG10 = readFileSync(new URL('../../db/migrations/0010_read_durability.up.sql', import.meta.url), 'utf8');
 let n = 0;
 
 export async function provisionReaders() {
@@ -162,7 +161,43 @@ export function mutate(text, from, to) {
   assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`);
   return text.replace(from, to);
 }
-export const READ_FN = fnText(MIG10, 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
 export const WAIT = `  WHILE pg_current_wal_flush_lsn() < target LOOP`;
+// M3-R35.1 (C2): the ACTIVE gate texts, i.e. the latest migration that defines each function (0017 today). Every
+// instrumented copy and every mutant starts from these; a historical text is used only where a test says so
+// (tests/db/wal-boundary.mjs OLD_READ / OLD_CLAIM, R35-M). tests/db/gate-integrity.test.mjs guards this.
+const MIGDIR = new URL('../../db/migrations/', import.meta.url);
+export function latestDefinition(name, endMarker) {
+  const files = readdirSync(MIGDIR).filter(f => /^\d{4}_.*\.up\.sql$/.test(f)).sort().reverse();
+  for (const f of files) {
+    const t = readFileSync(new URL(f, MIGDIR), 'utf8');
+    const m = new RegExp(`CREATE (OR REPLACE )?FUNCTION si\\.${name}\\(`).exec(t);
+    if (m) return { file: f, text: fnText(t, m[0], endMarker).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION') };
+  }
+  throw new Error(`no migration defines si.${name}`);
+}
+export const READ_DEF = latestDefinition('si_read_evidence', 'END $read_evidence$;');
+export const CLAIM_DEF = latestDefinition('si_claim_read_intent', 'END $claim_read_intent$;');
+export const READ_FN = READ_DEF.text;
+export const CLAIM_FN = CLAIM_DEF.text;
+/** The active gate's target line (mutation and instrumentation anchor). */
+export const TARGET = (() => { const m = READ_FN.match(/^  target := .*$/m); if (!m) throw new Error('no target line'); return m[0]; })();
+const bodyOf = text => { const m = /AS \$([a-z_]+)\$([\s\S]*)\$\1\$;$/.exec(text); if (!m) throw new Error('no body'); return m[2]; };
+/**
+ * Which gate a database runs (from pg_proc): 'active' = exactly the active texts of both functions; 'instrumented' =
+ * the active claim gate and a si_read_evidence that still contains the active target line (production plus test-only
+ * statements); anything else throws. Used before every baseline that installs an instrumented copy.
+ */
+export async function assertGate(client, expected = 'active') {
+  const r = Object.fromEntries((await client.query(`SELECT proname, prosrc FROM pg_proc
+      WHERE oid IN ('si.si_read_evidence(text, uuid, text, int)'::regprocedure, 'si.si_claim_read_intent(text, text, uuid, text, int)'::regprocedure)`)).rows
+      .map(x => [x.proname, x.prosrc]));
+  const claimActive = r.si_claim_read_intent === bodyOf(CLAIM_FN);
+  const readActive = r.si_read_evidence === bodyOf(READ_FN);
+  const readInstrumented = !readActive && r.si_read_evidence.includes(`\n${TARGET}\n`) && r.si_read_evidence.includes(WAIT);
+  const ok = expected === 'active' ? (claimActive && readActive) : (claimActive && readInstrumented);
+  if (!ok) throw new Error(`gate integrity: expected the ${expected} 0017 gate (${READ_DEF.file}/${CLAIM_DEF.file}); ` +
+    `si_read_evidence ${readActive ? 'active' : readInstrumented ? 'instrumented' : 'NOT the active gate'}, si_claim_read_intent ${claimActive ? 'active' : 'NOT the active gate'}`);
+  return expected;
+}
 export const PAUSE_AT = `  BEGIN\n    xid_of_intent :=`;
 export const withPause = fn => mutate(fn, PAUSE_AT, `  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float8);\n${PAUSE_AT}`);

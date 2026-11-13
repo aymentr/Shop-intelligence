@@ -16,8 +16,8 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { asOwner, connect, control, pid, settle } from '../db/helpers.mjs';
 import { readEvidence, revokeReader } from '../../dist/persistence/reader.js';
-import { MIG10, provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
-         fnText, mutate, READ_FN, WAIT, PAUSE_AT, withPause } from '../db/durability-fixtures.mjs';
+import { provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
+         fnText, mutate, READ_FN, TARGET, WAIT, PAUSE_AT, withPause, assertGate } from '../db/durability-fixtures.mjs';
 
 test.before(provisionReaders);
 
@@ -78,14 +78,15 @@ const MUTANTS = [
   { name: 'timeout fails open', scenario: scnCrash,
     sql: mutate(READ_FN, `      RAISE EXCEPTION 'SI_READ_INTENT_NOT_DURABLE: the read intent is not yet durable; start a new read' USING ERRCODE = 'object_not_in_prerequisite_state';`, '      EXIT;') },
   { name: 'target weakened to the flush position', scenario: scnCrash,
-    sql: mutate(READ_FN, '  target := pg_current_wal_insert_lsn();', '  target := pg_current_wal_flush_lsn();') },
+    sql: mutate(READ_FN, TARGET, '  target := pg_current_wal_flush_lsn();') },
   { name: 'target taken before the commit is observed', scenario: scnOrder, pause: true,
-    sql: withPause(mutate(mutate(READ_FN, '  target := pg_current_wal_insert_lsn();\n', ''), PAUSE_AT, `  target := pg_current_wal_insert_lsn();\n${PAUSE_AT}`)) }
+    sql: withPause(mutate(mutate(READ_FN, `${TARGET}\n`, ''), PAUSE_AT, `${TARGET}\n${PAUSE_AT}`)) }
 ];
 for (const m of MUTANTS) {
   test(`AUD-DM (${m.name}): the baseline passes the scenario and the targeted mutant is detected`, async t => {
     const bx = await fresh(t, 'm3durb');
     if (m.pause) await asOwner(bx.admin, a => a.query(withPause(READ_FN)));
+    await assertGate(bx.admin, m.pause ? 'instrumented' : 'active');   // the baseline runs the 0017 gate
     const base = await m.scenario(bx);
     const x = await fresh(t, 'm3durm');
     await asOwner(x.admin, a => a.query(m.sql));

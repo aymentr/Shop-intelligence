@@ -17,13 +17,13 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { asOwner, cfg, connect, control, createSources, freshDatabase, lift, pid, recordRights, rejects, roles, settle,
          waitUntilBlocked } from './helpers.mjs';
 import { provisionReaderPrincipal } from '../../dist/persistence/bootstrap.js';
+import { READ_FN, assertGate } from './durability-fixtures.mjs';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { readEvidence, grantReader, revokeReader, ReadFailed, MAX_READ_BYTES } from '../../dist/persistence/reader.js';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 const MIG7 = readFileSync(new URL('../../db/migrations/0007_receipt_verification.up.sql', import.meta.url), 'utf8');
 // The read function as last defined (0010 replaces the 0009 read with the durability gate).
-const MIG10 = readFileSync(new URL('../../db/migrations/0010_read_durability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 const FIELDS = ['run_id', 'ordinal', 'collected_at', 'network', 'native_ad_id', 'advertiser_name', 'countries', 'seen_at', 'source_url',
                 'title', 'source_reported_first_seen', 'source_reported_last_seen', 'content_sha256', 'next_cursor'];
@@ -106,7 +106,7 @@ function mutate(text, from, to) {
   assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 60)}`);
   return text.replace(from, to);
 }
-const READ_FN = fnText(MIG10, 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
+// M3-R35.1 (C2): the ACTIVE gate (latest migration, 0017), shared with the durability fixtures.
 const READABLE_FN = fnText(MIG7, 'CREATE FUNCTION si.si_evidence_readable', '$evidence_readable$;\n');
 const PAUSE_ANCHOR = '    END IF;\n    FOR rec IN';
 // The pause marks itself in application_name, so it cannot be confused with the durability gate's own short sleeps (0010).
@@ -418,6 +418,7 @@ async function paused(x, src, who = 'si_reader_alice') {
 async function instrumented(t) {
   const x = await fresh(t, 'm3rdc');
   await asOwner(x.admin, a => a.query(withPause(READ_FN)));
+  await assertGate(x.admin, 'instrumented');                                  // RC-1..RC-6 run the 0017 gate
   return x;
 }
 const CHANGES = {
@@ -588,6 +589,7 @@ for (const m of MUTANTS) {
   test(`RD-M (${m.name}): the baseline passes the scenario and the targeted mutant is detected`, async t => {
     const bx = await fresh(t, 'm3rdmb');
     if (m.pause) await asOwner(bx.admin, a => a.query(withPause(READ_FN)));
+    await assertGate(bx.admin, m.pause ? 'instrumented' : 'active');           // the baseline runs the 0017 gate
     const base = await m.scenario(bx);
     const x = await fresh(t, 'm3rdmm');
     await asOwner(x.admin, a => a.query(m.sql));

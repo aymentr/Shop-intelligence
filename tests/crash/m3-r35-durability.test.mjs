@@ -12,17 +12,22 @@
 //           cluster recovers: the intent exists (release implies durability)
 //   R35-C2  an ASYNCHRONOUSLY committed intent whose commit is not even written: refused, and lost in the crash; the
 //           wait-skipped mutant releases rows for it and loses it (S13)
-//   R35-C3  an asynchronous intent on a page completed by a boundary record: written but not flushed -> refused (the
-//           gate requires the flush, which also covers an OS crash; this cluster runs fsync = off)
+//   R35-C3  an intent whose OWN commit is verifiably unflushed (WAL writer stopped, flush <= the position before its
+//           commit, before and after the read) while the WAL ends on a page boundary: refused, nothing consumed; the
+//           crash outcome is recorded per fsync mode, not asserted
 //   R35-N   negative controls weakening durability (wait skipped; target floored to its page; small offsets normalized)
 //           are each detected by exactly the scenario built for them.
 // A scenario counts only if the unflushed WAL is still unflushed after the read (an unrelated flush, e.g. an autovacuum
 // commit, voids it and it is rebuilt); a background flush can never produce a pass or a kill.
 import test from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import { asOwner, connect, pid, settle } from '../db/helpers.mjs';
 import { fresh, ready, intent, asyncIntent, READ, outcome, provisionReaders, warm, writerDelay, crash, intentExists, mutate } from '../db/durability-fixtures.mjs';
 import { str, lsn, positions, stray, layout, NEW_READ } from '../db/wal-boundary.mjs';
+
+const REPO = fileURLToPath(new URL('../../', import.meta.url));
 
 test.before(async () => { await provisionReaders(); await writerDelay('10s'); });
 test.after(() => writerDelay(null));
@@ -140,22 +145,77 @@ test('R35-C2: an unwritten asynchronous intent is refused and lost; the wait-ski
   assert.deepEqual([mut.released, mut.survived], [true, false], 'the mutant releases rows whose request record is lost (S13)');
 });
 
-// The boundary variant: the asynchronous intent's page is completed by a record ending on the boundary, so the page
-// is WRITTEN (it survives a PostgreSQL crash with this test cluster's fsync = off) but not FLUSHED. The gate requires
-// the flush (the stronger, OS-crash-safe condition): refused. Release always implies survival.
-test('R35-C3: an asynchronous intent on a page completed by a boundary record is refused (written, not flushed)', async t => {
+// R35-C3 (M3-R35.1, C1): the intent's OWN commit is unflushed while the WAL ends on a page boundary. Preconditions are
+// established and verified, never assumed or retried; if one cannot be established the test FAILS (no void, no retry):
+//   - the WAL writer process is stopped (SIGSTOP, verified in /proc) and autovacuum is off (verified), after a
+//     CHECKPOINT: nothing in the cluster flushes WAL unless a session commits synchronously, which this test does not;
+//   - L = pg_current_wal_insert_lsn() read by the intent's own session inside its transaction just before its
+//     asynchronous COMMIT: the commit record starts at or after L, so flush <= L proves the commit is NOT flushed;
+//   - a non-transactional record then ends exactly on a page boundary (insert = boundary + 24);
+//   - flush <= L before the read and again after the refusal (flush only grows: it held throughout);
+//   - the intent stays OPEN and no access-log row exists.
+// After the checks, the reader's backend is killed. Whether the intent survives recovery depends on whether its WAL
+// reached the OS (fsync = off, or a process kill that leaves the page cache): RECORDED per fsync mode, never asserted
+// as durability (release, not survival, is what the gate controls).
+const sh = args => execFileSync('docker', ['compose', 'exec', '-T', 'db', ...args], { cwd: REPO, encoding: 'utf8' });
+async function walWriter(admin) { return Number((await admin.query(`SELECT pid FROM pg_stat_activity WHERE backend_type = 'walwriter'`)).rows[0].pid); }
+const procState = p => sh(['sh', '-c', `cut -d' ' -f3 /proc/${p}/stat`]).trim();
+async function autovacuum(admin, on) {
+  await admin.query(on ? 'ALTER SYSTEM RESET autovacuum' : 'ALTER SYSTEM SET autovacuum = off');
+  await admin.query('SELECT pg_reload_conf()');
+  for (let i = 0; i < 200; i++) {
+    const k = await connect();
+    try { if ((await k.query(`SELECT current_setting('autovacuum') AS v`)).rows[0].v === (on ? 'on' : 'off')) return; } finally { await k.end(); }
+    await new Promise(r => setTimeout(r, 25));
+  }
+  throw new Error('fixture: autovacuum setting not in force');
+}
+
+test('R35-C3: an intent whose own commit is unflushed, with WAL ending on a page boundary, is refused and nothing is consumed', async t => {
+  const fsync = await (async () => { const k = await connect(); try { return (await k.query(`SELECT current_setting('fsync') AS f`)).rows[0].f; } finally { await k.end(); } })();
   const results = [];
   for (let i = 0; i < 3; i++) {
-    const { x, src } = await setup(t);
-    const a = await connect({ user: 'si_reader_alice', database: x.db });
-    const id = await asyncIntent(a, src);
-    await a.end();
-    const p = await layout(x.admin, 'page', 'no');
-    const w = await writeLsn(x);
-    const res = await readThenCrash(x, src, id);
-    results.push(`${res.outcome} released:${res.released} survived:${res.survived} (write ${str(w)}, flush ${str(p.flush)}, insert ${str(p.insert)})`);
-    assert.equal(res.released, false, 'not released: the boundary is not flushed');
-    assert.ok(!res.released || res.survived, 'release implies durability');
+    const { x, src, alice } = await setup(t);
+    await layout(x.admin, 'page', 'writer');                                  // calibrates the layout fixture (flushes) before the scenario
+    const a = await x.c('si_reader_alice');
+    const r = await connect({ user: 'si_reader_alice', database: x.db });
+    await settle(r.query(READ, [src, '00000000-0000-0000-0000-000000000000', null, 100]));  // warm the reading session
+    const rp = await pid(r);
+    await autovacuum(x.admin, false);
+    await x.admin.query('CHECKPOINT');
+    const ww = await walWriter(x.admin);
+    sh(['kill', '-STOP', String(ww)]);
+    let stopped = true;
+    try {
+      assert.equal(procState(ww), 'T', 'fixture: the WAL writer is stopped');
+      await a.query('BEGIN');
+      const id = (await a.query('SELECT si.si_begin_read($1, NULL, 100) AS id', [src])).rows[0].id;
+      await a.query('SET LOCAL synchronous_commit = off');
+      const L = lsn((await a.query('SELECT pg_current_wal_insert_lsn()::text AS l')).rows[0].l);
+      await a.query('COMMIT');
+      const U = (await positions(x.admin)).insert;
+      const p0 = await positions(x.admin);
+      if (!(p0.flush <= L)) assert.fail(`fixture precondition not established: the intent's commit is flushed (flush ${str(p0.flush)} > L ${str(L)})`);
+      const lay = await layout(x.admin, 'page', 'no');
+      const p1 = await positions(x.admin);
+      if (!(p1.flush <= L && p1.insert % 8192n === 24n)) assert.fail(`fixture precondition not established before the read: flush ${str(p1.flush)}, L ${str(L)}, insert ${str(p1.insert)}`);
+      await r.query('BEGIN');
+      const got = await settle(r.query(READ, [src, id, null, 100]));
+      const p2 = await positions(x.admin);
+      const audit = (await x.admin.query(`SELECT i.state, (SELECT count(*)::int FROM si.reader_access_log l WHERE l.intent_id = i.intent_id) AS logged
+                                            FROM si.read_intents i WHERE i.intent_id = $1`, [id])).rows[0];
+      if (!(p2.flush <= L)) assert.fail(`fixture precondition broken during the read: flush ${str(p2.flush)} > L ${str(L)}`);
+      assert.equal(outcome(got), 'SI_READ_INTENT_NOT_DURABLE', 'refused: the intent is not durable');
+      assert.deepEqual(audit, { state: 'OPEN', logged: 0 }, 'nothing consumed, nothing logged');
+      await crash(rp);                                                         // also ends the stopped WAL writer
+      stopped = false;
+      await r.end().catch(() => {}); await a.end().catch(() => {});
+      const survived = await intentExists(x.db, id);
+      results.push(`refused; L ${str(L)} < commit end <= U ${str(U)}; flush ${str(p2.flush)} (before ${str(p1.flush)}); boundary ${str(lay.end)}, insert ${str(p1.insert)}; after the crash (fsync=${fsync}): intent ${survived ? 'survived' : 'lost'}`);
+    } finally {
+      if (stopped) { try { sh(['kill', '-CONT', String(ww)]); } catch { /* gone */ } }
+      const k = await connect(); try { await autovacuum(k, true); } finally { await k.end(); }
+    }
   }
-  console.log(`# R35-C3 ${results.join('; ')}`);
+  console.log(`# R35-C3 (fsync=${fsync})\n# ${results.join('\n# ')}`);
 });

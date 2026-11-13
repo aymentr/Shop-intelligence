@@ -19,8 +19,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { readFileSync } from 'node:fs';
 import { asOwner, connect, control, pid, settle } from '../db/helpers.mjs';
 import { readEvidence, revokeReader } from '../../dist/persistence/reader.js';
-import { MIG10, provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
-         fnText, mutate, READ_FN, WAIT, PAUSE_AT, withPause, strayWalFlushMs, warm } from '../db/durability-fixtures.mjs';
+import { provisionReaders, fresh, ready, READ, intent, asyncIntent, outcome, crash, writerDelay, intentExists, releaseThenCrash,
+         fnText, mutate, READ_FN, TARGET, WAIT, PAUSE_AT, withPause, strayWalFlushMs, warm, assertGate } from '../db/durability-fixtures.mjs';
 
 test.before(provisionReaders);
 
@@ -29,10 +29,10 @@ test.before(provisionReaders);
 const MIG09 = readFileSync(new URL('../../db/migrations/0009_read_audit.up.sql', import.meta.url), 'utf8');
 const BEGIN_FN = fnText(MIG09, 'CREATE FUNCTION si.si_begin_read', 'END $begin_read$;').replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION');
 /** The production read with ONE added statement: a NOTICE reporting the gate's target, the flush position when the
- *  target was taken, and the time spent in the wait loop. Everything else is the 0010 text, byte for byte. */
+ *  target was taken, and the time spent in the wait loop. Everything else is the ACTIVE text (0017), byte for byte. */
 const GATE_FN = mutate(mutate(mutate(READ_FN,
   '  deadline timestamptz;\n', '  deadline timestamptz;\n  gate_f0 pg_lsn;\n  gate_t0 timestamptz;\n  gate_n int := 0;\n'),
-  '  target := pg_current_wal_insert_lsn();\n', '  target := pg_current_wal_insert_lsn();\n  gate_f0 := pg_current_wal_flush_lsn();\n'),
+  `${TARGET}\n`, `${TARGET}\n  gate_f0 := pg_current_wal_flush_lsn();\n`),
   '  deadline := clock_timestamp() + interval \'1 second\';\n', '  gate_t0 := clock_timestamp();\n  deadline := clock_timestamp() + interval \'1 second\';\n')
   .replace('    PERFORM pg_sleep(0.005);\n  END LOOP;\n', "    gate_n := gate_n + 1;\n    PERFORM pg_sleep(0.005);\n  END LOOP;\n  RAISE NOTICE 'SI_GATE %|%|%|%', target, gate_f0, gate_n, round(extract(epoch FROM clock_timestamp() - gate_t0) * 1000, 3);\n");
 /**
@@ -190,7 +190,8 @@ test('AUD-13a: ordinary reads, explicit transactions and savepoints', async t =>
   const strayWaited = stray.filter(r => r.gate && r.waitLoops > 0);
   assert.ok(strayWaited.length >= 1, `the wait branch is exercised: ${JSON.stringify(stray.map(r => [r.outcome, r.waitLoops, r.unflushed_at_target]))}`);
   for (const r of strayWaited) assert.equal(r.unflushed_at_target, true, 'every wait was for WAL beyond the read\'s own durable commit');
-  await asOwner(x.admin, k => k.query(READ_FN));                               // restore the production function
+  await asOwner(x.admin, k => k.query(READ_FN));                               // restore the ACTIVE production function (0017)
+  await assertGate(x.admin, 'active');
   await warm(x, src);                                                          // and again before the single-attempt reads below
   // Refusal bound (follow-up): ordinary single-attempt reads after the warm-up may be refused fail-closed only rarely;
   // a partial liveness regression (e.g. 30 % refusals) fails here. 0 of 1,500 such reads were refused when measured.
@@ -314,6 +315,7 @@ for (const m of MUTANTS) {
   test(`AUD-DM (${m.name}): the baseline passes the scenario and the targeted mutant is detected`, async t => {
     const bx = await fresh(t, 'm3durb');
     if (m.pause) await asOwner(bx.admin, a => a.query(withPause(READ_FN)));
+    await assertGate(bx.admin, m.pause ? 'instrumented' : 'active');   // the baseline runs the 0017 gate
     const base = await m.scenario(bx);
     const x = await fresh(t, 'm3durm');
     await asOwner(x.admin, a => a.query(m.sql));
