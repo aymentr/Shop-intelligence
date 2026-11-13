@@ -104,8 +104,8 @@ const EXPECTED_VOLATILITY = {
   // 0015 intelligence remediation (index key, owner-only)
   si_advertiser_key: 'i'
 };
-// 0015 (D3): resource bounds pinned on the two server-side reader functions.
-const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB'.split('|')];
+// 0015 (D3): resource bounds pinned on the two server-side reader functions; 0016 (N1b): plan_cache_mode pinned too.
+const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB|plan_cache_mode=force_custom_plan'.split('|')];
 
 let db, c;
 const cleanups = [];

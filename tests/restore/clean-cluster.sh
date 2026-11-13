@@ -225,4 +225,11 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^REM-(1|3) ' tests/db/m4-remediation.test.mjs
 echo 'DR-1 restored intelligence remediation: pinned resource bounds and the exact response bound PASS'
+# Migration 0016 on the restored cluster (pg_restore restores no planner statistics): cold history and search pages,
+# the pinned plan_cache_mode and the typed identity conflict.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^(COLD-1|COLD-3|IDG-1) ' tests/db/m4-cold-identity.test.mjs
+echo 'DR-1 restored cold-database reliability and identity conflict (0016): PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

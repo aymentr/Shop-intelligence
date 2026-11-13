@@ -20,7 +20,9 @@ import * as INTEL from '../../dist/persistence/intelligence.js';
 const DIST = fileURLToPath(new URL('../../dist/persistence/', import.meta.url));
 const MIG14 = readFileSync(new URL('../../db/migrations/0014_server_side_intelligence.up.sql', import.meta.url), 'utf8');
 // The production text of the two reader functions is 0015's (M4-P2.1); si_availability_state is still 0014's.
-const MIG15 = readFileSync(new URL('../../db/migrations/0015_intelligence_remediation.up.sql', import.meta.url), 'utf8');
+// M4-P2.2: the production text of the two reader functions is now 0016's (0015's with the readable runs selected first and a
+// pinned plan_cache_mode); copies and mutants are built from it.
+const MIG_FN = readFileSync(new URL('../../db/migrations/0016_cold_query_reliability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 let n = 0;
 test.before(async () => {
@@ -360,7 +362,7 @@ test('SRV-7: bounds — candidate cap, response cap and spelling cap fail closed
   const src = await source(x);
   await collect(x, src, Array.from({ length: 12 }, (_, i) => AD(`Northwind Synthetic${' '.repeat(i % 2)}${i > 5 ? '' : ''}`, `b${i}`, { advertiserName: `NorthWind ${String.fromCharCode(65 + i)}`.replace(/ [A-L]$/, m => m) })));
   const alice = await reader(x);
-  const fn = (name, end) => { const s = MIG15.indexOf(`CREATE OR REPLACE FUNCTION si.${name}`); return MIG15.slice(s, MIG15.indexOf(end, s) + end.length); };
+  const fn = (name, end) => { const s = MIG_FN.indexOf(`CREATE OR REPLACE FUNCTION si.${name}`); return MIG_FN.slice(s, MIG_FN.indexOf(end, s) + end.length); };
   const SEARCH_FN = fn('si_search_advertisers', 'END $search$;'), HISTORY_FN = fn('si_advertiser_history', 'END $history$;');
   await asOwner(x.admin, a => a.query(SEARCH_FN.replace('max_candidates constant int := 200000;', 'max_candidates constant int := 3;')));
   assert.equal(await libOutcome(INTEL.searchAdvertisers(alice, { sources: [src], query: 'northwind' })), 'INTEL:SCAN_LIMIT');
@@ -381,7 +383,7 @@ test('SRV-7: bounds — candidate cap, response cap and spelling cap fail closed
 // ------------------------------------------------------------------------------------------------
 // Negative-control mutants of the new invariants. Each scenario returns its EXACT outcome; baseline and mutant must
 // each equal the expected one (an unrelated refusal, an unexpected success, or a persisting NOT_DURABLE fails).
-function fnText(start, end, mig = MIG15) { const s = mig.indexOf(start); return mig.slice(s, mig.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); }
+function fnText(start, end, mig = MIG_FN) { const s = mig.indexOf(start); return mig.slice(s, mig.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 70)}`); return text.replace(from, to); }
 const SEARCH_FN = fnText('CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;');
 const HISTORY_FN = fnText('CREATE OR REPLACE FUNCTION si.si_advertiser_history', 'END $history$;');
@@ -437,7 +439,7 @@ const DB_MUTANTS = [
   { name: 'history availability check omitted', scenario: scnHistorySuspended, baseline: 'INTEL:SOURCE_UNAVAILABLE:SUSPENDED', mutant: 'ok:0',
     sql: mutate(HISTORY_FN, '    IF st.available IS NOT TRUE THEN', '    IF false THEN') },
   { name: 'history readable-evidence predicate omitted', scenario: scnReadable, baseline: 'ok:1', mutant: 'ok:2',
-    sql: mutate(HISTORY_FN, '         AND si.si_evidence_readable(r.run_id)),\n    mine AS (', '         AND true),\n    mine AS (') },
+    sql: mutate(HISTORY_FN, '       AND si.si_evidence_readable(r.run_id);', '       AND true;') },             // 0016: the readable-run statement
   { name: 'search scope does not bind the query', scenario: scnSearchScopeQuery, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok',
     sql: mutate(SEARCH_FN, "cur := si.si_intelligence_scope('search', p_source_id, ARRAY[p_query,", "cur := si.si_intelligence_scope('search', p_source_id, ARRAY['contoso',") },
   { name: 'history scope does not bind the period', scenario: scnHistoryScopePeriod, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok',

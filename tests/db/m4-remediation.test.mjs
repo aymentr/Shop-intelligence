@@ -26,7 +26,9 @@ import { grantReader, revokeReader, beginRead } from '../../dist/persistence/rea
 import * as INTEL from '../../dist/persistence/intelligence.js';
 
 const DIST = fileURLToPath(new URL('../../dist/persistence/', import.meta.url));
-const MIG15 = readFileSync(new URL('../../db/migrations/0015_intelligence_remediation.up.sql', import.meta.url), 'utf8');
+// M4-P2.2: the production text of the two reader functions is now 0016's (0015's with the readable runs selected first and a
+// pinned plan_cache_mode); copies and mutants are built from it.
+const MIG_FN = readFileSync(new URL('../../db/migrations/0016_cold_query_reliability.up.sql', import.meta.url), 'utf8');
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 const AUDIT_LIMIT = 262144;
 let n = 0;
@@ -194,7 +196,7 @@ test('REM-2 (D2): a history above the library bound is refused after one page', 
 });
 
 // ------------------------------------------------------------------------------------------------
-const fnText = (start, end) => { const s = MIG15.indexOf(start); return MIG15.slice(s, MIG15.indexOf(end, s) + end.length); };
+const fnText = (start, end) => { const s = MIG_FN.indexOf(start); return MIG_FN.slice(s, MIG_FN.indexOf(end, s) + end.length); };
 const mutate = (text, from, to) => { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 70)}`); return text.replace(from, to); };
 const SEARCH_FN = fnText('CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;');
 const HISTORY_FN = fnText('CREATE OR REPLACE FUNCTION si.si_advertiser_history', 'END $history$;');
@@ -206,7 +208,7 @@ test('REM-3 (D3): pinned resource settings are effective inside the definer func
   const s = await source(x);
   await collect(x, s, [AD('Northwind Synthetic', 'r1')]);
   const cfgOf = async f => (await x.admin.query(`SELECT proconfig FROM pg_proc WHERE oid = $1::regprocedure`, [f])).rows[0].proconfig;
-  const want = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB'.split('|')];
+  const want = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB|plan_cache_mode=force_custom_plan'.split('|')];
   assert.deepEqual(await cfgOf('si.si_search_advertisers(text, uuid, text, text[], timestamptz, timestamptz, text, boolean, int)'), want);
   assert.deepEqual(await cfgOf('si.si_advertiser_history(text, uuid, text, text[], timestamptz, timestamptz, text, int)'), want);
   const alice = await reader(x);
@@ -392,8 +394,9 @@ async function scnIdentityGuard(x, sql = COLLIDING) {
 /** The source lock: a SUSPEND issued while a search page is being computed must wait for it (instrumented pause). Without the
  *  lock the SUSPEND commits mid-page and the page, checked AVAILABLE, silently releases nothing (ok:0): the FD21 defect. */
 async function scnSearchLock(x, mutantSql) {
-  const pause = "  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float);\n    WITH readable AS (";
-  await asOwner(x.admin, a => a.query(mutate(mutantSql ?? SEARCH_FN, '    WITH readable AS (', pause)));
+  // 0016: the pause is before the readable-run statement (after the lock and the availability check).
+  const pause = "  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float);\n    SELECT coalesce(array_agg(r.run_id), ";
+  await asOwner(x.admin, a => a.query(mutate(mutantSql ?? SEARCH_FN, '    SELECT coalesce(array_agg(r.run_id), ', pause)));
   const s = await source(x); await collect(x, s, [AD('Northwind Synthetic', 'lk')]);
   const alice = await reader(x); await alice.query(`SET si.test_pause = '1.5'`);
   // Barrier: the reader's backend is inside the instrumented pause, i.e. past the lock and the availability check.
@@ -417,7 +420,7 @@ const DB_MUTANTS = [
     lock: true, sql: mutate(SEARCH_FN, 'PERFORM 1 FROM si.sources x WHERE x.source_id = p_source_id FOR SHARE;', 'PERFORM 1 FROM si.sources x WHERE x.source_id = p_source_id;') },
   { name: 'response bound above the audit bound (0014 value)', scenario: scnResponseBound, baseline: 'SI_READ_RESULT_TOO_LARGE', mutant: 'SQLSTATE:23514',
     sql: mutate(SEARCH_FN, 'max_bytes constant int := 262144;', 'max_bytes constant int := 1048576;') },
-  { name: 'history identity guard omitted (simulated key collision)', scenario: x => scnIdentityGuard(x), baseline: 'READ:INTERNAL', mutant: 'ok:2',
+  { name: 'history identity guard omitted (simulated key collision)', scenario: x => scnIdentityGuard(x), baseline: 'INTEL:IDENTITY_CONFLICT', mutant: 'ok:2',
     copy: scnIdentityGuard, sql: mutate(COLLIDING, 'IF same_identity IS NOT TRUE THEN', 'IF false THEN') }
 ];
 for (const m of DB_MUTANTS) {

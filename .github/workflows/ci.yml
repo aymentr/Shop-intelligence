@@ -30,7 +30,7 @@ jobs:
   integration:
     # PostgreSQL 16 integration tests against the same compose.yaml developers use.
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -130,6 +130,8 @@ jobs:
         run: node tests/db/run.mjs tests/slow/m4-scheduled-version.test.mjs
       - name: Server-side intelligence at the candidate cap (M4-P2.1 D2/D3; 200,000 observations)
         run: node tests/db/run.mjs tests/slow/m4-remediation-scale.test.mjs
+      - name: Concentrated history on a database without planner statistics (M4-P2.2 N1; 200,000 observations, plus the 0015 mutant)
+        run: node tests/db/run.mjs tests/slow/m4-cold-scale.test.mjs
       - name: Disabled commit timestamps (VR-12)
         run: bash tests/slow/commit-ts-off.sh
       - name: Database logs on failure

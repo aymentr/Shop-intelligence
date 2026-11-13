@@ -30,7 +30,7 @@ export const MAX_SEARCH_RESULTS = 50;
 export const MAX_SOURCES_PER_REQUEST = 10;
 
 export type IntelligenceFailureCode = 'BAD_ARGUMENT' | 'BAD_CURSOR' | 'SCAN_LIMIT' | 'SOURCE_UNAVAILABLE' | 'AVAILABILITY_CHANGED'
-  | 'RESULT_CHANGED' | 'RESULT_TOO_LARGE' | 'RESOURCE_LIMIT';
+  | 'RESULT_CHANGED' | 'RESULT_TOO_LARGE' | 'RESOURCE_LIMIT' | 'IDENTITY_CONFLICT';
 /** Why a granted reader may not read a source now (migration 0012), in this fixed order. */
 export const UNAVAILABILITY_REASONS = ['RETIRED', 'TERMINATED', 'SUSPENDED', 'RIGHTS_RESTRICTED', 'RETENTION_RESTRICTED',
                                        'NOT_SYNTHETIC', 'UNAVAILABLE'] as const;
@@ -347,6 +347,7 @@ function canonicalNetworks(n: string[] | undefined): string[] {
   if (list.length > 5 || !list.every(x => typeof x === 'string' && NETWORKS.includes(x))) throw new IntelligenceFailed('BAD_ARGUMENT');
   return list;
 }
+const IDENTITY_CONFLICT_MESSAGE = 'SI_READ_IDENTITY_CONFLICT: the advertiser key selects another normalized name';
 function serverError(sourceId: string) {
   return (m: string, sqlstate: string | null): Error | null => {
     const u = /^SI_READ_SOURCE_UNAVAILABLE: ([A-Z_,]+)$/.exec(m);
@@ -364,6 +365,9 @@ function serverError(sourceId: string) {
     // the reader session's statement_timeout (at most 10 s, enforced by the session check) -> 57014.
     if (m.startsWith('SI_READ_RESOURCE_LIMIT:')) return new IntelligenceFailed('RESOURCE_LIMIT', { sourceId });
     if (sqlstate === '57014' && m === 'canceling statement due to statement timeout') return new IntelligenceFailed('RESOURCE_LIMIT', { sourceId });
+    // M4-P2.2 (N3): the history identity guard (0015) refused a page whose advertiser key also selected another normalized
+    // name. Typed and content-free: no name, key or count of the other identity is carried. Exact message and SQLSTATE only.
+    if (sqlstate === '22000' && m === IDENTITY_CONFLICT_MESSAGE) return new IntelligenceFailed('IDENTITY_CONFLICT', { sourceId });
     return null;
   };
 }
