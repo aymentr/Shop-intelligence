@@ -54,7 +54,8 @@ serving), no live collection, no production deployment.
 | 0012 | reader source availability: available or not, fixed reason codes and a state token, so that history and search never present an unavailable source as empty | M4-P1.1 (D1), conditionally accepted for synthetic development by M4-P1.1-ACCEPT-01 |
 | 0013 | opaque availability state: the token becomes an HMAC under an owner-only key, bound to reader and source (no recoverable metadata) | M4-P1.2 (R1), conditionally accepted by M4-P1.2-ACCEPT-01 (FD21 accepted for synthetic development) |
 | 0014 | server-side audited advertiser search and history: bounded, keyset-paged, one audited request per page binding the complete request; replaces the client-side 5,000-record scan | M4-P2, conditionally accepted (M4-P2-ACCEPT-01); FD22 conditionally authorized |
-| 0015 | intelligence remediation: response bound = audit bound (262,144 bytes, typed refusal); resource bounds pinned on the reader functions (work_mem, temp_file_limit; requires the bootstrap parameter grant); names up to 1,000 characters (index on a digest of the normalized name) | M4-P2.1, pending independent acceptance |
+| 0015 | intelligence remediation: response bound = audit bound (262,144 bytes, typed refusal); resource bounds pinned on the reader functions (work_mem, temp_file_limit; requires the bootstrap parameter grant); names up to 1,000 characters (index on a digest of the normalized name) | M4-P2.1, accepted by M4-P2.1-ACCEPT-01 (synthetic development) |
+| 0016 | cold-database query reliability: readable runs selected once per page before the page statement (no join whose plan depends on statistics), `plan_cache_mode` pinned to custom plans; same predicate, gate and bounds | M4-P2.2, pending independent acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1

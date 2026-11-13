@@ -639,3 +639,113 @@ Workloads of M4-P2-ACCEPT-01: source A holds 200,000 observations of one adverti
 | REM-M "search source lock omitted" baseline failed once in three fresh-container passes (`suspend,search:ok:1`) | The scenario compared the completion order of two responses that arrive within milliseconds once the lock is released, after a fixed 500 ms head start | Barrier on the reader's pause and the control's measured wait instead of completion order; 10/10 afterwards |
 | RC-1..RC-6 (M3, unchanged) failed once in six fresh-container passes | Its barrier diagnostic: the single-attempt read was refused `SI_READ_INTENT_NOT_DURABLE` before reaching its pause (R-26 mechanism; fail closed) | Not reproduced: 0/15 on `61bda9d`, 0/15 on M4-P2.1; recorded under R-29 |
 | `pg_stat_database.temp_bytes` attributed temporary files to the next request | Statistics reporting lag | Figures reported from paired readings (§12.10) |
+
+## 13. M4-P2.2: cold-database query reliability and identity hardening (migration 0016)
+
+**Status:** IMPLEMENTED on branch `claude/b002-m4-p2-2` from the accepted `d0a318a` (M4-P2.1-ACCEPT-01: ACCEPT), pending independent acceptance. It resolves N1, N2 and N3 of that review. Synthetic data only. FD21/FD22 boundaries unchanged: same functions, signatures, privileges, gate, lock, grant and availability checks, evidence predicate, identity guard and bounds. No limit is raised.
+
+### 13.1 Reproduction on the baseline (d0a318a, disposable databases)
+
+"Cold" = a clone with autovacuum disabled on the `si` tables and no `ANALYZE` (fixture). That is the state of a source right after bulk ingestion until autovacuum analyzes it, of a freshly migrated database, and of a `pg_restore`d one (PostgreSQL 16 does not restore statistics; measured: 0 `pg_stats` rows after restore). `track_functions = 'all'` counts `si_evidence_readable` calls.
+
+| Workload (one source) | Cold, 0015 | Warm, 0015 |
+|---|---|---|
+| 5,000 observations of one advertiser (10 runs): one history page | **statement timeout (10 s), 13,438 readability evaluations** | 34 ms, 10 evaluations |
+| Same, library history (50 pages) | `RESOURCE_LIMIT` | 7.1 s (generic plan from page 6: 140 ms/page instead of 30) |
+| 1,000 of 50,000 observations (100 runs): one history page | **statement timeout, 12,013 evaluations** | 95 ms, 100 evaluations |
+| 200,000 observations of one advertiser (400 runs): first history page | **statement timeout** | 1.3–1.4 s |
+| `pg_restore`d copy of a warm 5,000-observation database: library history | **`RESOURCE_LIMIT` (11 s)** | — |
+| Search pages | complete (cold 4.8 s at 200,000 candidates, 2.9 s no match) | 3.2 s / 1.3 s |
+
+`EXPLAIN (ANALYZE, BUFFERS)` of the cold history statement: the readable-run scan of `collection_runs` (filter `si_evidence_readable(run_id)`) is the inner side of a Nested Loop under the key-index scan of `observations` (estimated 1 row, actual 5,000), so it ran 5,000 times (16.7 s without the statement timeout).
+
+**N2:** an identity guard checking only the first spelling (`unnest(a.names[1:1])`) was not killed by any test. **N3:** `SI_READ_IDENTITY_CONFLICT` reached the library caller as `ReadFailed INTERNAL`.
+
+### 13.2 N1 — approaches measured
+
+| Approach | Cold 5,000 / one page | Cold 200,000 / first page | Accepted? |
+|---|---|---|---|
+| 0015 (readable-run CTE joined in the page statement) | timeout, 13,438 evaluations | timeout | — |
+| `WITH readable AS MATERIALIZED` (the review's proposal) | 50 ms, 10 evaluations | **timeout**: evaluated once per run, but the cold join still compared every observation with every run (Nested Loop over the CTE scan, 80 million comparisons) | No |
+| **0016: readable runs selected first into an array; page filters `run_id = ANY (array)`; `finished_at` by primary key** | 47 ms, 10 evaluations | **1.6–1.8 s**, `SCAN_LIMIT` after one page (as warm) | Yes |
+
+Why 0016 does not depend on statistics: the page statement has no join to choose. Membership is a scalar-array test (hashed, because with custom plans the array is a constant) and each matched observation's collection time is a primary-key lookup of its run (a correlated subquery, which has no alternative plan). The readable-run statement is a single scan of the source's runs: `si_evidence_readable` is evaluated once per candidate run, never per observation.
+
+**N1b (found while reproducing):** with statistics, PL/pgSQL switches to a generic plan after five executions in a session; for the history statement it was 4–5x slower (140 vs 30 ms per page), and a reader could force it with `SET plan_cache_mode = force_generic_plan`. 0016 pins `plan_cache_mode = force_custom_plan` on both functions, like the 0015 resource settings. 0016 also needs it: the array must be a constant for the hashed test.
+
+### 13.3 What 0016 changes in the statement structure (and why it is safe)
+
+A page now runs, under the source lock (`FOR SHARE`, taken after the intent claim): the grant check, the availability state, **the readable-run selection** (new statement), then the page statement. Before 0016 the availability state was already a separate statement under the same lock.
+
+- Every change of controls (SUSPEND, TERMINATE_RETENTION, LIFT), rights versions, grants and source rows locks the source row `FOR UPDATE`, so none of them can commit between the two statements.
+- Changes that do not take the source lock, and their effect between the two statements:
+  - A new verification verdict that makes a run readable: excluded from this page (conservative).
+  - A purge of a run's observations: they no longer exist for the page statement.
+  - A retention deadline passing by the clock: `si_evidence_readable` already requires 60 s of margin (`si_publish_margin`), more than the 10 s statement bound, so a run selected as readable cannot be released after its retention end.
+- The evidence predicate is the 0015 text, verbatim, and appears exactly once in each function (M1p).
+- Cold results equal the client-side oracle over INVALID, UNVERIFIABLE, pending and expired evidence (COLD-2), and equal the warm results (COLD-1).
+
+### 13.4 N2 — identity guard coverage
+
+COLLISION fixture: an instrumented copy of the history function that selects by the first character of the normalized name; the identity guard is the production text.
+- Spellings `ACME`, `Acme` and a colliding `Azure Synthetic` sorting **after** them; and a colliding `AAA Synthetic` sorting **before**.
+- Both are refused `IDENTITY_CONFLICT` with page size 100 and 1. Nothing is released and the intent stays OPEN (IDG-1).
+- A filter that excludes the colliding rows (networks) returns exactly `a1, a2, a1` across pages. An advertiser without a colliding name is unaffected.
+- Search, which compares full normalized names, reports `acme:3, azure synthetic:1, bravo synthetic:1`.
+- Mutant "identity guard checks only the first spelling" (collider sorts after): baseline `INTEL:IDENTITY_CONFLICT`, mutant `ok:3` (merged). Killed (COLD-M).
+
+### 13.5 N3 — typed identity conflict
+
+- The library maps exactly SQLSTATE `22000` with the exact message `SI_READ_IDENTITY_CONFLICT: the advertiser key selects another normalized name` to `IntelligenceFailed('IDENTITY_CONFLICT')`, with the source id and no reasons.
+- The error carries no name, key or count: its message is `INTELLIGENCE_FAILED: IDENTITY_CONFLICT`. IDG-1 asserts that neither the error, its string form nor its stack mentions either identity.
+- Tested on the real database-to-library path. Mutant "mapping removed": `READ:INTERNAL`, killed (IDG-M lib).
+
+### 13.6 Cold and warm performance (local PostgreSQL 16.15 container, medians of single runs)
+
+| Workload | 0015 cold | 0015 warm | 0016 cold | 0016 warm |
+|---|---|---|---|---|
+| 5,000 obs / 10 runs: history page | timeout | 34 ms | 47–67 ms | 33–40 ms |
+| Same: library history, 50 pages | `RESOURCE_LIMIT` | 7.1 s | 1.7–2.1 s | 1.6–2.0 s |
+| Same: concentrated search page | 75 ms | 73 ms | 76–88 ms | 81–92 ms |
+| 1,000 of 50,000 obs / 100 runs: history page | timeout | 95 ms | 112 ms | 105 ms |
+| Same: library history (10 pages) | `RESOURCE_LIMIT` | 1.1 s | 0.94 s | 0.95 s |
+| Same: search page / no match | 715 / 564 ms | 395 / 399 ms | 400 / 368 ms | 449 / 382 ms |
+| 200,000 obs / 400 runs: history page | timeout | 1.3–1.4 s | 1.6–1.8 s | 1.7 s |
+| Same: concentrated search / no match | 4.8 / 3.0 s | 3.2 / 1.3 s | 3.8–4.3 / 1.3–1.6 s | 3.6 / 1.3 s |
+| `pg_restore`d copy, 5,000 obs: library history | `RESOURCE_LIMIT` (11 s) | — | **5,000 in 3.3 s** | — |
+
+- Readability evaluations per page with 0016 equal the source's run count, cold and warm.
+- The warm 200,000-observation history page is about 20% slower than 0015's: 200,000 primary-key lookups replace a hash join. That is the price of a plan that does not depend on statistics.
+- Temporary files are unchanged (89.6 MB per 200,000-candidate history page, 41.6 MB per search page).
+
+### 13.7 Tests
+
+| Test | What it shows |
+|---|---|
+| COLD-1 (`tests/db/m4-cold-identity.test.mjs`) | Cold 5,000-observation history within a 2 s statement timeout. Exactly 10 readability evaluations per page and 500 for 50 pages. Cold search. 5,001 refused after one page (`SCAN_LIMIT`, not a timeout). Results equal the warm ones after `ANALYZE` |
+| COLD-2 | Cold results equal the client-side oracle over INVALID, UNVERIFIABLE, pending and expired evidence |
+| COLD-3 | `plan_cache_mode` pinned; a reader's `force_generic_plan` is not in effect inside |
+| IDG-1 | §13.4 and §13.5 |
+| COLD-M db | 0015-shape history (cold page: `ok:readable-calls=10` → `SQLSTATE:57014`); `plan_cache_mode` unpinned (`force_custom_plan` → `force_generic_plan`); partial identity guard (`INTEL:IDENTITY_CONFLICT` → `ok:3`) |
+| IDG-M lib | Conflict mapping removed: `INTEL:IDENTITY_CONFLICT` → `READ:INTERNAL` |
+| SCALE-2 / SCALE-2M (`tests/slow/m4-cold-scale.test.mjs`, slow CI job) | Cold 200,000-observation source: history refused after one page (1.8 s), concentrated search 4.3 s, no-match search 1.6 s. The 0015 history function on the same workload: `RESOURCE_LIMIT` (10 s), killed |
+| M1p (`migrations.test.mjs`) | 0016 changes exactly the two functions. ACLs unchanged; the only setting added is `plan_cache_mode`. No join with the readable runs; the predicate appears once. Down restores the exact 0015 catalog; up re-applies identically |
+| DR-1 | COLD-1, COLD-3 and IDG-1 also run on the restored cluster |
+
+Tests built from the production function text (SRV, REM) now use 0016's text. Anchors that named the 0015 CTE were moved to the readable-run statement. The REM-M "identity guard omitted" baseline is now the typed `INTEL:IDENTITY_CONFLICT`.
+
+### 13.8 Regression findings during M4-P2.2, each investigated
+
+| Finding | Root cause | Resolution |
+|---|---|---|
+| MG2 and MG9 failed in the first fresh-container pass | Two expectations in `migrator.test.mjs` still listed migrations `1..15` and a count of 15 | Updated to 16; the full suite was re-run from the start |
+| RT-13 (M3 purge-contention timing) failed once in the first run (`maximum purge batch 8201 ms <= 5000 ms`) | Pre-existing (R-28): reproduced 1/8 on `d0a318a` and 0/8 on M4-P2.2; it does not use the reader functions | R-28 stays open |
+| AUD-12c failed once in the crash suite (`SI_READ_INTENT_NOT_DURABLE`) | The R-26/R-32 gate-liveness family; the test reads through `si_read_evidence`, which 0016 does not touch | Not reproduced: 0/25 on `d0a318a`, 0/25 on M4-P2.2. AUD-12b, same family: 3/25 on `d0a318a`, 2/25 on M4-P2.2. R-32 stays open |
+| SCALE-2M was not killed once (the 0015 function took 8.5 s, under the 10 s timeout) | The mutant's slowness varies between 8.5 s and more than 10 s | Both history calls of SCALE-2 now run under a 4 s reader statement timeout (0016: 1.4–1.8 s; 0015: at least 8.5 s): 2/2 since |
+
+### 13.9 Limitations (unchanged or new)
+
+1. Search remains O(observations of the source) per page (§12.4), and every page re-evaluates readability for every run of the source (O(runs)).
+2. The warm 200,000-candidate history page is about 20% slower (§13.6).
+3. The per-page readable-run array grows with the number of runs of a source in the period (400 at the measured cap).
+4. R-26, R-28, R-29 and R-32 remain open. All Milestone 3 real-evidence, pilot and production NO-GOs remain.
