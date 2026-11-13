@@ -1,5 +1,5 @@
 -- B-002 migration 0017: M3-R35 — durability gate at WAL page boundaries (synthetic only).
--- Contract: docs/b002-m3-audit.md §R-35. Replaces exactly si_read_evidence (0010) and si_claim_read_intent (0011),
+-- Contract: docs/b002-m3-audit.md §2.4. Replaces exactly si_read_evidence (0010) and si_claim_read_intent (0011),
 -- each in ONE line: the gate's target. Signatures, privileges, checks, lock order, audit and the bounded wait are
 -- unchanged; migrations 0001-0016 and every other function are unchanged.
 --
@@ -12,7 +12,7 @@
 -- (SI_READ_INTENT_NOT_DURABLE after 1 s) until unrelated WAL was written and flushed.
 --
 -- Correction: si_durability_target(T) = the page (segment) start when T is exactly that start plus its page-header
--- size, otherwise T unchanged. Safe because (docs §R-35.2):
+-- size, otherwise T unchanged. Safe because (docs §2.4):
 --   - page-header bytes never contain record data: at such a T every reserved record (the intent's commit record
 --     included) ends at or before the page start, so flush >= page start implies that all of them are durable;
 --   - every other position, including any offset inside or just after a header that a record end can take, keeps the
