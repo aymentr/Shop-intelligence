@@ -80,12 +80,18 @@ async function libOutcome(promise, count = v => v?.observations?.length ?? v?.hi
 }
 const sqlOutcome = r => (r.status === 'ok' ? 'ok' : (String(r.message).match(/^SI_[A-Z_]+/)?.[0] ?? `SQLSTATE:${r.code}`));
 /** Counts the server-side requests a client makes and runs `after(page)` after each successful page. */
+/** Counts the audited page requests a client makes (`requests`) and runs `after(page)` after each released page.
+ *  An attempt refused SI_READ_INTENT_NOT_DURABLE is counted apart (`notDurable`): the library repeats that same page
+ *  with a fresh intent (its bounded retry), and the durability gate can refuse any single attempt fail-closed
+ *  (M4-P2.2 CI-131: a WAL page boundary, R-35), so exact request counts exclude it. Every other failure counts. */
 function counting(client, after = async () => {}) {
-  const c = { requests: 0, pages: 0, query: async (...args) => {
+  const c = { requests: 0, notDurable: 0, pages: 0, query: async (...args) => {
     const sql = typeof args[0] === 'string' ? args[0] : '';
     const server = sql.includes('si.si_advertiser_history(') || sql.includes('si.si_search_advertisers(');
     if (server) c.requests++;
-    const r = await client.query(...args);
+    let r;
+    try { r = await client.query(...args); }
+    catch (e) { if (server && /^SI_READ_INTENT_NOT_DURABLE:/.test(String(e?.message))) { c.requests--; c.notDurable++; } throw e; }
     if (server) { c.pages++; await after(c.pages); }
     return r;
   } };
@@ -123,6 +129,27 @@ const ctl = (k, variant) => `${variant}${String(k).padStart(2, '0')}${'\u0001'.r
 const variants = word => Array.from({ length: 2 ** word.length }, (_, m) => [...word].map((ch, i) => (m >> i) & 1 ? ch.toUpperCase() : ch).join(''));
 
 // ------------------------------------------------------------------------------------------------
+test('REM-0: request counts exclude an attempt refused NOT_DURABLE (the library repeats that page), and only that', async t => {
+  const x = await fresh(t);
+  const s = await source(x);
+  await collect(x, s, [AD('Northwind Synthetic', 'n0')]);
+  const alice = await reader(x);
+  let injected = 0;
+  const refusing = { query: async (...args) => {                              // the first server call is refused like the gate does
+    if (String(args[0]).includes('si.si_advertiser_history(') && injected++ === 0) {
+      throw Object.assign(new Error('SI_READ_INTENT_NOT_DURABLE: the read intent is not yet durable; start a new read'), { code: '55000' });
+    }
+    return alice.query(...args);
+  } };
+  const c = counting(refusing);
+  assert.equal(await libOutcome(INTEL.advertiserHistory(c, s, 'Northwind Synthetic')), 'ok:1');
+  assert.deepEqual([c.requests, c.notDurable, c.pages], [1, 1, 1], 'one audited request; the refused attempt is counted apart');
+  const other = { query: async (...args) => { if (String(args[0]).includes('si.si_advertiser_history(')) throw Object.assign(new Error('SI_READ_BUSY: x'), { code: '55P03' }); return alice.query(...args); } };
+  const d = counting(other);
+  assert.equal(await libOutcome(INTEL.advertiserHistory(d, s, 'Northwind Synthetic')), 'READ:BUSY');
+  assert.deepEqual([d.requests, d.notDurable], [1, 0], 'any other refusal still counts');
+});
+
 test('REM-1 (D1): the real history function at the exact audit bound — 262,144 bytes released and audited, 262,145 refused typed', async t => {
   const x = await fresh(t);
   const alice = await reader(x);
