@@ -87,7 +87,7 @@ With the transaction id taken from the id itself, observing the commit needs no 
 
 1. **Commit order.** `RecordTransactionCommit` inserts the commit record first (`XactLogCommitRecord` → `XLogInsert`). It reserves `[start, end)` by advancing `Insert->CurrBytePos` under `insertpos_lck`. It then flushes, but only if `synchronous_commit > off` at commit time. Then it updates the clog (`TransactionIdCommitTree` or `TransactionIdAsyncCommitTree`). `ProcArrayEndTransaction` runs last.
 2. **What `pg_xact_status` sees.** It returns `committed` only if the transaction is no longer in the proc array **and** the clog says committed. Both happen after the commit record's space is reserved.
-3. **The target bounds the commit record.** `pg_current_wal_insert_lsn()` (`GetXLogInsertRecPtr`) reads `CurrBytePos` under the same spinlock, so T ≥ the end of the commit record.
+3. **The target bounds the commit record.** `pg_current_wal_insert_lsn()` (`GetXLogInsertRecPtr`) reads `CurrBytePos` under the same spinlock, so T ≥ the end of the commit record. Since 0017 the gate compares against `si_durability_target(T)`, which removes page-header bytes only (§2.4); it still bounds the commit record.
 4. **The flush position means fsynced.** `pg_current_wal_flush_lsn()` (`LogwrtResult.Flush`) advances only in `XLogWrite`, after `WaitXLogInsertionsToFinish` and `issue_xlog_fsync`. So once flush ≥ T, the commit record is complete and fsynced, and crash recovery replays it.
 5. **Verified against behaviour, not only source.** The proof was checked by SIGKILL crash recovery:
    - AUD-12a;
@@ -95,6 +95,47 @@ With the transaction id taken from the id itself, observing the commit needs no 
    - the M3-AUD-03 before/after experiment.
 
    It was not assumed from "write vs. flush" positions.
+
+### 2.4 R-35: the target at WAL page and segment boundaries (migration 0017, M3-R35)
+
+**Defect (0010/0011, both gate copies).** `GetXLogInsertRecPtr()` returns `XLogBytePosToRecPtr(CurrBytePos)`. When the reserved WAL ends exactly on a page boundary, that conversion yields the first *usable* byte of the next page:
+- page start + `SizeOfXLogShortPHD` (24);
+- segment start + `SizeOfXLogLongPHD` (40) for a segment's first page. This also happens after every `XLOG_SWITCH`.
+
+The flush pointer of that WAL is the boundary itself: record end pointers come from `XLogBytePosToEndRecPtr`, and `XLogWrite` writes whole pages. Nothing can be flushed into a page that holds no record, so `flush < T` holds until another backend writes and flushes WAL. On a quiet server the 1 s wait expired and a fully durable intent was refused `INTENT_NOT_DURABLE`. The refusal failed closed (nothing released, the intent stays OPEN), but it was spurious.
+
+Measured on PostgreSQL 16.15 (8 KiB pages, 16 MiB segments, MAXALIGN 8, from `pg_control_init()`), in R35-M:
+- Old target, last record ending on a page boundary: insert = boundary + 24, flush = boundary. Refused after 1.002–1.008 s, in both copies.
+- Old target, after `pg_switch_wal()`: insert = segment start + 40, flush = segment start. Same refusal.
+
+**Correction.** `si_durability_target(T)` (owner-only, STABLE):
+- returns the page start when `T mod 8192 = 24` and T is not in a segment's first page;
+- returns the segment start when `T mod 16 MiB = 40`;
+- returns T unchanged otherwise.
+
+The two gates compare `flush >= si_durability_target(T)`. That is the only line changed in each.
+
+**Why it is safe.**
+1. **Only header bytes are excluded.** At those two positions `CurrBytePos` is exactly at a page's first usable byte. Header bytes never contain record data, so every record reserved before T was read (the intent's commit record included, §2.2 (3)) ends at or before the page start. `flush >= page start` therefore still implies that the commit record is complete and fsynced.
+2. **No other position is touched.** Any other offset can be a record end: a record continuing after a short header ends at +32 or later, and a non-first page at +40 is a record end. Those keep the original comparison (R35-1 enumerates them).
+3. **Segment starts are handled.** Offset +24 within a segment's first page lies inside its 40-byte long header, so it is never normalized. Only +40 is.
+4. **Header sizes are tied to alignment.** They are `MAXALIGN` of the header structs (24 and 40 with MAXALIGN 8). On a server reporting any other `max_data_alignment`, the function returns T unchanged: the original, stricter gate.
+5. **Nothing else changes.** Commit observation before the target, intent binding, expiry, single use, the bounded 1 s wait, lock order, authorization and audit are unchanged (M1q: the function texts differ by exactly that line).
+
+**Tests (permanent).**
+
+| Test file | What it covers |
+|---|---|
+| `tests/db/wal-boundary.mjs` | Builds and verifies exact WAL layouts with logical messages |
+| `tests/db/m3-r35-wal-boundary.test.mjs` | R35-1 target arithmetic; R35-2/3 both gate copies at page and segment boundaries, 8 bytes before a boundary and across one; R35-4 rolled-back, uncommitted, replayed and concurrent intents at a boundary; R35-M the old-target mutant |
+| `tests/crash/m3-r35-durability.test.mjs` | WAL writer delayed to 10 s by the verified fixture. R35-U1..U3 unflushed WAL mid-page, ending on a boundary, and after a flushed boundary; R35-N negative controls; R35-C1..C3 crash recovery |
+
+The negative controls are three mutants that weaken durability: wait skipped, target floored to its page, small page offsets normalized. Each releases unflushed WAL in exactly its scenario.
+
+The crash cases:
+- **C1:** a release at a flushed boundary survives recovery.
+- **C2:** an unwritten asynchronous intent is refused and lost; the wait-skipped mutant releases it and loses it.
+- **C3:** an intent on a written-but-unflushed page is refused.
 
 ### 2.3 Durability conditions (part of the guarantee)
 

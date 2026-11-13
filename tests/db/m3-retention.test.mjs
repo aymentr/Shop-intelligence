@@ -575,14 +575,14 @@ test('RT-14: down 0006 with purged data restores the exact 0005 catalog; up re-a
   const ref = await freshDatabase(t, 'm3ret5', { migrate: false });
   const refc = await connect({ database: ref }); t.after(() => refc.end());
   await migrateUp(refc, { to: 5 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 5, allowDestructive: true }), [16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 5, allowDestructive: true }), [17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6]);
   // A table ACL equal to the owner's default (acldefault: all privileges to the owner, none to others)
   // is equivalent to NULL; pg_dump/restore turns the explicit form into NULL, so on a restored cluster
   // (DR-1) the two lineages differ only in that spelling. Nothing else is normalized.
   const norm = f => f.replaceAll('"relacl":"{si_owner=arwdDxt/si_owner}"', '"relacl":null');
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(await schemaFingerprint(refc)), 'exact 0005 catalog with purged data present');
   assert.equal((await runState(x, run.run_id)).retention_state, 'PURGED', 'a PURGED run is a valid 0005 row');
-  assert.deepEqual(await migrateUp(x.admin), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  assert.deepEqual(await migrateUp(x.admin), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(at6));
 });
 

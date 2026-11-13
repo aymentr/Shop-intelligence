@@ -272,7 +272,7 @@ test('VR-10: evidence purged before verification is UNVERIFIABLE (NO_EVIDENCE); 
   // Historical: evidence committed under 0006, verified after 0007 is applied.
   const h = await fresh(t, 'm3verh', { upTo: 6 });
   const hrun = await collect(h, await source(h), [ROW('v10-h')]);
-  assert.deepEqual(await migrateUp(h.admin), [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  assert.deepEqual(await migrateUp(h.admin), [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   assert.deepEqual(counts(await verify(h)), ['VERIFIED', 1, 1, 0, 0]);
   assert.equal((await row(h, hrun.run_id)).verdict, 'VALID');
 });
@@ -397,11 +397,11 @@ test('VR-16: down 0007 with verification data present restores the exact 0006 ca
   const ref = await freshDatabase(t, 'm3ver6', { migrate: false });
   const refc = await connect({ database: ref }); t.after(() => refc.end());
   await migrateUp(refc, { to: 6 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 6, allowDestructive: true }), [16, 15, 14, 13, 12, 11, 10, 9, 8, 7]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 6, allowDestructive: true }), [17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7]);
   const norm = f => f.replaceAll('"relacl":"{si_owner=arwdDxt/si_owner}"', '"relacl":null');    // equivalent ACL spelling after restore (DR-1)
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(await schemaFingerprint(refc)), 'exact 0006 catalog');
   assert.equal((await x.admin.query('SELECT count(*)::int AS n FROM si.publication_receipts WHERE run_id = $1', [run.run_id])).rows[0].n, 1);
-  assert.deepEqual(await migrateUp(x.admin), [7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  assert.deepEqual(await migrateUp(x.admin), [7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(at7));
   assert.deepEqual(counts(await verify(x)), ['VERIFIED', 1, 1, 0, 0], 're-verified after the round trip (records were dropped by down)');
 });

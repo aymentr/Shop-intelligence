@@ -102,7 +102,9 @@ const EXPECTED_VOLATILITY = {
   si_normalize_advertiser: 'i', si_intelligence_scope: 'i', si_availability_state: 'v', si_intelligence_iso: 'i',
   si_intelligence_check_args: 'i', si_search_advertisers: 'v', si_advertiser_history: 'v',
   // 0015 intelligence remediation (index key, owner-only)
-  si_advertiser_key: 'i'
+  si_advertiser_key: 'i',
+  // 0017 durability-gate target (owner-only)
+  si_durability_target: 's',
 };
 // 0015 (D3): resource bounds pinned on the two server-side reader functions; 0016 (N1b): plan_cache_mode pinned too.
 const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB|plan_cache_mode=force_custom_plan'.split('|')];

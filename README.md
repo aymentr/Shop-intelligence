@@ -56,6 +56,7 @@ serving), no live collection, no production deployment.
 | 0014 | server-side audited advertiser search and history: bounded, keyset-paged, one audited request per page binding the complete request; replaces the client-side 5,000-record scan | M4-P2, conditionally accepted (M4-P2-ACCEPT-01); FD22 conditionally authorized |
 | 0015 | intelligence remediation: response bound = audit bound (262,144 bytes, typed refusal); resource bounds pinned on the reader functions (work_mem, temp_file_limit; requires the bootstrap parameter grant); names up to 1,000 characters (index on a digest of the normalized name) | M4-P2.1, accepted by M4-P2.1-ACCEPT-01 (synthetic development) |
 | 0016 | cold-database query reliability: readable runs selected once per page before the page statement (no join whose plan depends on statistics), `plan_cache_mode` pinned to custom plans; same predicate, gate and bounds | M4-P2.2, pending independent acceptance |
+| 0017 | durability gate at WAL page boundaries (R-35): the gate's target excludes WAL page-header bytes only (page start + 24, segment start + 40), so a fully flushed intent is no longer refused when WAL ends on a page boundary; one line in each gate copy, unflushed WAL is still refused | M3-R35, pending independent acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1

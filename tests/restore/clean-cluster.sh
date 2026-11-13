@@ -232,4 +232,11 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^(COLD-1|COLD-3|IDG-1) ' tests/db/m4-cold-identity.test.mjs
 echo 'DR-1 restored cold-database reliability and identity conflict (0016): PASS'
+# Migration 0017 on the restored cluster: the durability-gate target (WAL geometry read from the restored cluster's
+# control data) and durable intents at page and segment boundaries through si_read_evidence.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^R35-(1|2):' tests/db/m3-r35-wal-boundary.test.mjs
+echo 'DR-1 restored durability gate at WAL page and segment boundaries PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'
