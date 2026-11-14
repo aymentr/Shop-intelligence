@@ -105,6 +105,8 @@ const EXPECTED_VOLATILITY = {
   si_advertiser_key: 'i',
   // 0017 durability-gate target (owner-only)
   si_durability_target: 's',
+  // 0018 set-based readability (owner-only)
+  si_readable_runs_at: 's', si_readable_runs: 'v',
 };
 // 0015 (D3): resource bounds pinned on the two server-side reader functions; 0016 (N1b): plan_cache_mode pinned too.
 const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB|plan_cache_mode=force_custom_plan'.split('|')];
@@ -222,6 +224,7 @@ test('SD1: SECURITY DEFINER contract — owner, fixed search_path, no PUBLIC EXE
     // 0008: the read function also pins a bounded lock wait (it must never queue behind emergency controls).
     assert.deepEqual(f.proconfig, ['si_search_advertisers', 'si_advertiser_history'].includes(f.proname) ? PINNED_INTELLIGENCE
                                 : ['si_read_evidence', 'si_read_source_status', 'si_read_source_availability'].includes(f.proname) ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
+                                : f.proname === 'si_readable_runs_at' ? ['search_path=pg_catalog, pg_temp', 'plan_cache_mode=force_custom_plan']   // 0018: constant arrays
                                                                    : ['search_path=pg_catalog, pg_temp'], `${f.proname} search_path`);
     assert.equal(f.default_acl, false, `${f.proname}: a NULL ACL would mean PUBLIC EXECUTE`);
     assert.equal(f.public_grant, false, `${f.proname}: PUBLIC must not have EXECUTE`);

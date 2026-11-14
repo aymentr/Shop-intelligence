@@ -722,7 +722,7 @@ COLLISION fixture: an instrumented copy of the history function that selects by 
 
 | Test | What it shows |
 |---|---|
-| COLD-1 (`tests/db/m4-cold-identity.test.mjs`) | Cold 5,000-observation history within a 2 s statement timeout. Exactly 10 readability evaluations per page and 500 for 50 pages. Cold search. 5,001 refused after one page (`SCAN_LIMIT`, not a timeout). Results equal the warm ones after `ANALYZE` |
+| COLD-1 (`tests/db/m4-cold-identity.test.mjs`) | Cold 5,000-observation history within a 2 s statement timeout. Exactly 10 readability evaluations per page and 500 for 50 pages (since 0018, §14: no per-run evaluation and one set-based evaluation per page). Cold search. 5,001 refused after one page (`SCAN_LIMIT`, not a timeout). Results equal the warm ones after `ANALYZE` |
 | COLD-2 | Cold results equal the client-side oracle over INVALID, UNVERIFIABLE, pending and expired evidence |
 | COLD-3 | `plan_cache_mode` pinned; a reader's `force_generic_plan` is not in effect inside |
 | IDG-1 | §13.4 and §13.5 |
@@ -752,3 +752,139 @@ Tests built from the production function text (SRV, REM) now use 0016's text. An
 2. The warm 200,000-candidate history page is about 20% slower (§13.6).
 3. The per-page readable-run array grows with the number of runs of a source in the period (400 at the measured cap).
 4. R-26, R-28, R-29 and R-32 remain open. All Milestone 3 real-evidence, pilot and production NO-GOs remain.
+
+## 14. M4-P3.0: set-based evidence readability (migration 0018)
+
+**Status:** IMPLEMENTED on branch `claude/b002-m4-p3-0` from the accepted `023fc36` (M3-R35.1), pending independent acceptance. It must be accepted on its own before M4-P3.1. Synthetic data only. No advertiser summary, identity dictionary, new publication-time metadata or cached readability; no table, column or index. FD21/FD22 boundaries, the M3 durability gate (0017), durability and audit are unchanged.
+
+### 14.1 The oracle and its callers (unchanged)
+
+`si_evidence_readable(run)` (0007, STABLE, SECURITY INVOKER) is the authoritative predicate. It reads `clock_timestamp()` once per call (instant t, margin m = `si_publish_margin()` = 60 s) and is TRUE exactly when every condition below holds. A missing row or a NULL anywhere makes it FALSE (`coalesce(..., false)`).
+
+| # | Condition | Varies by |
+|---|---|---|
+| 1 | a verdict row exists (`receipt_verifications`, primary key `run_id`: at most one) and it is `VALID` | run |
+| 2 | run `COMPLETED`, `RETAINED`, `published_count > 0` | run |
+| 3 | source `evidence_kind = 'SYNTHETIC'` | source |
+| 4 | source not retired, nor retiring within the margin: `retired_at IS NULL OR t + m < retired_at` | source |
+| 5 | source not suspended: the latest control (by `control_seq`) is not `SUSPEND` / `TERMINATE_RETENTION` (`si_source_suspended`) | source |
+| 6 | retention not terminated for the run's rights version (`si_retention_terminated(source, version)`) | version |
+| 7 | active retention: `t + m < least(retain_until, si_retention_end(source, version))` (`least` ignores a NULL; both NULL: FALSE). `si_retention_end` is the earliest of a covering termination, a retain revocation by a later version and the expiry of an allow-version, each only if it took effect | run × version |
+| 8 | current rights: the version in effect at t (the highest `version` with `effective_from <= t`) allows evaluation and retention, and `t + m < si_window_end(it)` (its expiry, the next version's `effective_from` including a scheduled one, a covering termination) | source |
+| 9 | every observation of the run is in a network of `supported_networks` (`NOT EXISTS ... NOT (o.network = ANY (supported_networks))`) | run |
+
+Not part of the predicate, enforced by the readers before it: the reader's grant and scope (checked under the source lock), the availability state (FD21 token), the committed and durable read intent (0009/0010/0017 gate), and the response and scan bounds.
+
+Callers: `si_read_evidence` and `si_read_source_status` (unchanged: still the oracle, per run), and `si_search_advertisers` / `si_advertiser_history` (0016: the oracle once per run of the source on every page; changed by 0018).
+
+Transactions and locks (unchanged by 0018): a page takes the source row `FOR SHARE` after its intent claim. Controls, rights versions, grants, run completion and purge lock the source row (`FOR UPDATE` / `FOR NO KEY UPDATE`) and cannot commit during a page. Receipt verification takes no source lock; a verdict only ever makes a run readable, and a page that misses it is conservative. The 60 s margin exceeds the 10 s statement bound, so a run selected at t cannot be released after its retention or rights end (§13.3).
+
+### 14.2 Design
+
+`si_readable_runs_at(source, from, to, t)` (PL/pgSQL, STABLE, SECURITY INVOKER, owner-only, `plan_cache_mode = force_custom_plan`) returns the runs of the 0016 readable-run statement at instant t: COMPLETED, RETAINED, `published_count > 0`, in the period, and the oracle's conditions. Four statements, each with no join whose plan depends on statistics:
+
+1. **Source, once** (conditions 3, 4, 5, 8): if any fails, no run is readable (early return). It also yields the unsupported networks: the five networks of the `ads.network` CHECK minus `supported_networks`, with the oracle's NULL semantics.
+2. **Rights versions of the source, once each** (6 and the version half of 7): ids of the non-terminated versions whose retention end is set and later than t + m, and of those without a retention end. Condition 7 is exactly "(retain_until or end set) and each one that is set > t + m".
+3. **Networks** (9): only if a network is unsupported, the runs with an observation of an ad of this source in an unsupported network (`ads (source_id, network, ...)` and `observations_by_ad`, proportional to evidence in unsupported networks only). This is exact because an observation's network is its ad's (composite foreign key `observations_ad`, all columns NOT NULL) and `ads.network` is CHECKed to the five networks. EQ-0 asserts both.
+4. **Runs, one scan of the source's runs** (1, 2, the run half of 7, 9, period): the verdict by primary key (a correlated scalar lookup, not a join), and hashed membership in the constant arrays of 2 and 3.
+
+`si_readable_runs(source, from, to)` calls it with `t = clock_timestamp()` once. In both reader functions the 0016 readable-run statement is replaced by `readable_runs := si.si_readable_runs(p_source_id, p_from, p_to);`. Nothing else in them changes (M1r: definitions equal the 0017 text with that one replacement; ACL, settings, SECURITY DEFINER, volatility and owner unchanged).
+
+**Time semantics (the one intended difference).** The oracle reads the clock separately for each run; 0018 decides a page at one instant. Within one page statement the oracle could see a boundary between two runs; 0018 cannot. Equivalence is therefore stated and tested as "0018 at t = the oracle at the same t" (EQ-2 to EQ-4), plus the real oracle at real time wherever no boundary falls inside the statement (EQ-1, EQ-2).
+
+A first set-based draft (one SQL statement joining runs, verdicts, versions and CTEs) was equivalent but **plan-dependent**: on a cold database at 400 runs the planner chose a nested loop with a sequential scan of `receipt_verifications` per run (80,000 comparisons, 12 ms); at 2,000 runs it chose hash joins (8 ms). A plan that is quadratic when statistics are missing is the 0015 hazard (§13), so it was replaced before measurement by the form above.
+
+### 14.3 Equivalence (tests/db/m4-readability-equivalence.test.mjs)
+
+Reference = the 0016 readable-run statement, verbatim, with `si_test_evidence_readable_at(run, t)`. That function is the installed oracle with exactly one substitution, `clock_timestamp()` → `p_t`; EQ-0 compares `prosrc` against the installed oracle. Comparisons are exact arrays (multisets: no duplicates).
+
+| Test | States | Result |
+|---|---|---|
+| EQ-0 | Design dependencies; instruments are the installed functions | `ads.network` CHECK domain = the literal of 0018; `observations_ad` FK on NOT NULL columns; `receipt_verifications` PK = `run_id`; margin 60 s; oracle copy = installed oracle with exactly one substitution; candidate = active 0018 text; both readers call it once and never the oracle |
+| EQ-1 | Product path at real time, after every step: VALID, pending, INVALID, UNVERIFIABLE, EMPTY, RUNNING, reaped (FAILED), retain_until within/beyond the margin, retention ended, purged, grant revoked, network reduced (unsupported and mixed runs) and restored, SUSPEND/LIFT, retain revocation by a later version, expiry within the margin, TERMINATE_RETENTION, retirement in a day and within the margin, a period | real `si_readable_runs` = real oracle, and both equal at the same instant, at every step; grant revocation does not change the set |
+| EQ-2 | Six runs whose retention ends and a scheduled v2 (retain DENIED) cross in real time over 6.5 s | about 980 samples: exact equality at the injected instant on every sample; real-time differences only on samples straddling a known boundary (2) |
+| EQ-3 | 8 s of concurrent publication (about 480), verification, purge (about 73), reaping (about 73), SUSPEND/LIFT (15) | about 300 REPEATABLE READ snapshots: candidate = reference on every one, no duplicate |
+| EQ-4 | ZOO, seed 20261114, 120 trials x 3 sources x 5 instants (t, t ± 1 µs, t - margin) x 2 periods. Each trial randomizes, within PK/FK/NOT NULL only: run status (all 4), retention state (all 5), published_count, retain_until and finished_at on boundary values, verdicts (all 3, pending, inserted), controls (SUSPEND/LIFT/TERMINATE with any through_version and time), rights versions (evaluation/retain ALLOWED/DENIED/UNKNOWN, effective_from and expiry on boundaries, a scheduled v3), supported_networks (subsets, empty, NULL element, unknown value), retirement, evidence kind | 3,600 comparisons, all identical; about 2,400 readable and 45,600 unreadable run evaluations; every status, retention state and verdict covered (asserted). Reproduce with `SI_EQ_SEED`, `SI_EQ_TRIALS` |
+
+No mismatch was observed. The ZOO fixture drops CHECKs and disables user triggers on five state tables in a disposable clone so that impossible states are also compared; the evidence tables and every key the design relies on are untouched.
+
+### 14.4 Mutation testing
+
+The 34 mutants of `si_readable_runs_at` run on the EQ-4 states. A mutant is killed when it disagrees with the reference. Every disagreeing run is then checked against facts computed independently from the tables at the same t, which must show the mutant's intended reason: for example, a run gained by "verdict condition removed" must have a non-VALID or missing verdict.
+
+| Mutant | Kills (of 3,600) | Unexplained |
+|---|---|---|
+| verdict condition removed | 386 | 0 |
+| unknown (pending) verdict treated as readable | 268 | 0 |
+| run status / retention state / published_count condition removed | 282 / 408 / 62 | 0 |
+| evidence kind condition removed | 44 | 0 |
+| retirement condition removed (missing source-status check) / margin removed / `<` → `<=` | 165 / 71 / 9 | 0 |
+| suspension condition removed (missing source-status check) | 294 | 0 |
+| current rights condition removed | 269 | 0 |
+| wrong rights version: latest ignoring effective_from / first instead of current | 59 / 613 | 0 |
+| effective_from `<=` → `<` | 6 | 0 |
+| current evaluation / retain removed | 92 / 64 | 0 |
+| rights window removed / margin removed / `<` → `<=` | 48 / 42 / 4 | 0 |
+| retention termination removed | 13 | 0 |
+| retention condition removed (missing retention) / retain_until ignored / rights retention end ignored | 506 / 487 / 25 | 0 |
+| retention `<` → `<=` / margin removed | 16 / 169 | 0 |
+| network condition removed | 287 | 0 |
+| incorrect network predicate: first unsupported network only / first observation only / supported read as unsupported | 124 / 158 / 869 | 0 |
+| period end inclusive / start exclusive | 42 / 55 | 0 |
+| source filter removed (runs of another source) | 1,036 | 0 |
+| unsafe join duplicating runs: per observation / verdicts joined by source | 665 / 750 | 0 (only extra copies of readable runs) |
+
+All 34 mutants are killed, and every disagreement is explained by the mutant's intended reason.
+
+The M4 reader mutants of earlier phases now target the active text: the period-end mutants edit `si_readable_runs_at`, "history readable-evidence predicate omitted" replaces the call, and the source-lock pause sits before it.
+
+### 14.5 Performance
+
+One synthetic source, 10 observations per run, built through the product path. The states are mixed: 5% INVALID, 3% pending, 5% retention ended but not purged, about 5% GOOGLE runs made unsupported, and 14% mixed META/TIKTOK runs. Environment: local PostgreSQL 16.15 container (fsync off, tmpfs). Each figure is p50 / p95 over 20 requests, the 0016 path also over 20.
+- *Selection* is the readable-run selection alone, with the readers' pinned settings and the 10 s timeout.
+- *History* is a one-page library history request, the complete reader path: lock, intent, gate, audit.
+- *Search* is a library search request, reported only: its page statement scans every candidate observation of the source (§12.4), which this phase does not change.
+- `tests/slow/m4-readability-bench.test.mjs`.
+
+| Runs (readable) | State | Selection 0018 | Selection 0016 | History 0018 | History 0016 | Search 0018 | Search 0016 |
+|---|---|---|---|---|---|---|---|
+| 10 (8) | cold / warm | 1.6 / 2.2, 1.5 / 1.8 ms | 3.4 / 3.8, 3.5 / 3.8 ms | 4.4 / 5.0 ms | 6.8 / 7.3 ms | 4.8 / 5.3 ms | 7.2 / 8.6 ms |
+| 100 (84) | cold / warm | 2.1 / 2.6, 1.8 / 2.1 ms | 28.7 / 38.6, 28.7 / 29.5 ms | 4.8 / 5.8 ms | 33.6 / 42.7 ms | 9.0 / 10.4 ms | 38.2 / 66.3 ms |
+| 400 (333) | cold / warm | 2.2 / 3.7, 2.5 / 2.8 ms | 110 / 135, 113 / 120 ms | 5.2 / 6.2 ms | 115 / 131 ms | 20.7 / 22.7 ms | 132 / 308 ms |
+| 2,000 (1,658) | cold / warm | 6.7 / 7.9, 6.4 / 7.2 ms | 549 / 641, 563 / 619 ms | 8.4 / 12.3 ms | 583 / 651 ms | 86 / 107 ms | 650 / 703 ms |
+| **10,000 (8,243)** | cold | **29 / 36 ms** | 2,784 / 2,884 ms | **23.5 / 24.3 ms** | 2,910 / 3,058 ms | 428 / 443 ms | 3,342 / 3,455 ms |
+| | warm | **31 / 35 ms** | 2,867 / 2,948 ms | **26.3 / 34.3 ms** | 3,036 / 3,121 ms | 421 / 488 ms | 3,426 / 3,557 ms |
+| **30,000 (25,001)** | cold | **155 / 192 ms** | 8,508 / 8,667 ms | **113 / 124 ms** | 8,842 / 9,053 ms | 1,372 / 1,481 ms | 8 of 20 `RESOURCE_LIMIT` (10 s) |
+| | warm | **102 / 109 ms** | 8,719 / 8,908 ms | **83 / 111 ms** | 8,985 / 9,227 ms | 1,334 / 1,425 ms | 18 of 20 `RESOURCE_LIMIT` |
+| | restored | **137 / 153 ms** | 9,007 / 9,228 ms | **105 / 117 ms** | 9,167 / 9,368 ms | 1,363 / 1,441 ms | 20 of 20 `RESOURCE_LIMIT` |
+
+The table shows p50 / p95; where two pairs are given, the second is the warm figure.
+
+**Targets.** Selection and history at 10,000 runs: p95 ≤ 100 ms, met. At 30,000 runs: p95 ≤ 400 ms, met cold, warm and restored. No timeout, no temporary file (0 bytes over 20 selections at every layout), no limit raised.
+
+**Other measurements.**
+- *Search.* At 10,000 runs search is about 440 ms, of which about 30 ms is readability. Its page statement, O(observations), is the next step (M4-P3.1); M4-P3.0 brings it from timeouts to 1.4 s at 30,000 runs.
+- *Peak backend memory.* VmHWM, which includes the shared buffers touched, was 99–171 MB at 10,000–30,000 runs. The memory used by the function itself is the arrays: 16 bytes per run.
+- *Plans.* The nested plans are linear and statistics-independent, cold and warm (auto_explain). At 10,000 runs, cold:
+  - the source statement: hash of 1 source row and 1 version (0.4 ms);
+  - the network statement: bitmap scan of the unsupported networks' ads, then `observations_by_ad`, 5,000 rows, 8.8 ms, 15,600 buffer hits;
+  - the run scan: index scan of the source's runs with a primary-key verdict lookup per run, 18.6 ms, 29,000 buffer hits;
+  - 35 ms in total.
+- *Restored.* pg_dump -Fc / pg_restore into a fresh database, no statistics; the server is not restarted (its data is in tmpfs).
+- *R-26.* Requests refused once by the durability gate and retried by the library (about 1–4 s, pre-existing) are counted apart, on both paths: at most one per 20.
+
+### 14.6 Security and privileges
+
+- **New functions:** `si_readable_runs_at` and `si_readable_runs`, both SECURITY INVOKER, owned by `si_owner`, `EXECUTE` revoked from PUBLIC; no role is granted them (privileges test).
+- **Who runs them:** only the two SECURITY DEFINER reader functions call them, so the code runs as `si_owner` with the readers' pinned settings (work_mem, temp_file_limit, statement timeout, jit, parallelism; `plan_cache_mode` also pinned on the new function).
+- **Reader privileges:** no new table privilege.
+- **Unchanged:** the grant check, availability token (FD21), intent claim and logging, durability gate, identity guard and response bounds (M4 suites, DR-1).
+- **Reversibility:** migration down restores the exact 0017 catalog, and up re-applies identically (M1r).
+
+### 14.7 Limitations and risks
+
+1. Single-instant semantics (§14.2). This is intended and conservative: no run is released that the oracle would refuse at the page's instant.
+2. Statement 2 is O(versions²) per page (`si_retention_end` per version) and statement 3 is O(unsupported evidence). Both are small for synthetic sources; a source with many versions or much evidence in a de-supported network is unmeasured beyond §14.5.
+3. The page statement itself remains O(observations of the source) for search (§12.4). M4-P3.0 removes only the per-run readability cost.
+4. Write path (observed while building the benchmark, pre-existing, not changed): one collector session that ingests about 10,000 runs into a database without statistics slows down steeply in `si_complete_run`, consistent with plans cached when the tables were small (98% CPU in one backend after about 7,000 runs). The benchmark reconnects its collector every 500 runs. Recorded as R-37.
+5. R-26 (gate refusals on stray WAL) affects request latency independently (§14.5 counts the retries). R-26, R-28, R-29, R-32 and R-36 remain open. All real-evidence pilot and production NO-GOs remain.

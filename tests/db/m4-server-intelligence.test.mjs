@@ -7,6 +7,7 @@
 // replica), and instrumented or mutated COPIES of the 0014 functions in disposable databases (lowered bounds; mutants).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { latestDefinition } from './durability-fixtures.mjs';
 import { readFileSync, mkdtempSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,7 +23,11 @@ const MIG14 = readFileSync(new URL('../../db/migrations/0014_server_side_intelli
 // The production text of the two reader functions is 0015's (M4-P2.1); si_availability_state is still 0014's.
 // M4-P2.2: the production text of the two reader functions is now 0016's (0015's with the readable runs selected first and a
 // pinned plan_cache_mode); copies and mutants are built from it.
-const MIG_FN = readFileSync(new URL('../../db/migrations/0016_cold_query_reliability.up.sql', import.meta.url), 'utf8');
+// The production text of the two reader functions: the latest migration that defines them (0018 since M4-P3.0).
+const MIG_FN = readFileSync(new URL('../../db/migrations/' + latestDefinition('si_search_advertisers', 'END $search$;').file, import.meta.url), 'utf8');
+
+// 0018 (M4-P3.0): the readable-run selection (period included) is si_readable_runs_at; its latest text, for mutants.
+const READABLE_FN = latestDefinition('si_readable_runs_at', '$readable_runs_at$;').text;
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 let n = 0;
 test.before(async () => {
@@ -439,7 +444,8 @@ const DB_MUTANTS = [
   { name: 'history availability check omitted', scenario: scnHistorySuspended, baseline: 'INTEL:SOURCE_UNAVAILABLE:SUSPENDED', mutant: 'ok:0',
     sql: mutate(HISTORY_FN, '    IF st.available IS NOT TRUE THEN', '    IF false THEN') },
   { name: 'history readable-evidence predicate omitted', scenario: scnReadable, baseline: 'ok:1', mutant: 'ok:2',
-    sql: mutate(HISTORY_FN, '       AND si.si_evidence_readable(r.run_id);', '       AND true;') },             // 0016: the readable-run statement
+    sql: mutate(HISTORY_FN, '    readable_runs := si.si_readable_runs(p_source_id, p_from, p_to);',            // 0018: the readable-run call
+      "    readable_runs := ARRAY(SELECT r.run_id FROM si.collection_runs r WHERE r.source_id = p_source_id AND r.status = 'COMPLETED' AND r.retention_state = 'RETAINED' AND r.published_count > 0);") },
   { name: 'search scope does not bind the query', scenario: scnSearchScopeQuery, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok',
     sql: mutate(SEARCH_FN, "cur := si.si_intelligence_scope('search', p_source_id, ARRAY[p_query,", "cur := si.si_intelligence_scope('search', p_source_id, ARRAY['contoso',") },
   { name: 'history scope does not bind the period', scenario: scnHistoryScopePeriod, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok',
@@ -447,7 +453,7 @@ const DB_MUTANTS = [
   { name: 'history intent claim omitted', scenario: scnHistoryClaim, baseline: 'SI_READ_INTENT_INVALID', mutant: 'ok',
     sql: mutate(HISTORY_FN, '  PERFORM si.si_claim_read_intent(who, p_source_id, p_intent_id, cur, p_limit);', '') },
   { name: 'history period end inclusive', scenario: scnPeriodEnd, baseline: 'ok:0', mutant: 'ok:1',
-    sql: mutate(HISTORY_FN, 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at < p_to))', 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at <= p_to))') },
+    sql: mutate(READABLE_FN, 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at < p_to))', 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at <= p_to))') },   // 0018: the period lives in si_readable_runs_at
   { name: 'history identity by substring', scenario: scnIdentity, baseline: 'ok:1', mutant: 'ok:2',
     sql: mutate(mutate(HISTORY_FN, 'si.si_advertiser_key(o.advertiser_name) = nk', 'strpos(si.si_normalize_advertiser(o.advertiser_name), nn) > 0'),
                 'IF same_identity IS NOT TRUE THEN', 'IF false THEN') },          // 0015: selector and identity guard both removed

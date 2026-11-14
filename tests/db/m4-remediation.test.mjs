@@ -15,6 +15,7 @@
 //   REM-M      negative-control mutants: each baseline gives exactly its outcome, each mutant exactly the defect.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { latestDefinition } from './durability-fixtures.mjs';
 import { readFileSync, mkdtempSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,7 +29,10 @@ import * as INTEL from '../../dist/persistence/intelligence.js';
 const DIST = fileURLToPath(new URL('../../dist/persistence/', import.meta.url));
 // M4-P2.2: the production text of the two reader functions is now 0016's (0015's with the readable runs selected first and a
 // pinned plan_cache_mode); copies and mutants are built from it.
-const MIG_FN = readFileSync(new URL('../../db/migrations/0016_cold_query_reliability.up.sql', import.meta.url), 'utf8');
+const MIG_FN = readFileSync(new URL('../../db/migrations/' + latestDefinition('si_search_advertisers', 'END $search$;').file, import.meta.url), 'utf8');   // latest reader-function text (0018)
+
+// 0018 (M4-P3.0): the readable-run selection (period included) is si_readable_runs_at; its latest text, for mutants.
+const READABLE_FN = latestDefinition('si_readable_runs_at', '$readable_runs_at$;').text;
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
 const AUDIT_LIMIT = 262144;
 let n = 0;
@@ -421,9 +425,9 @@ async function scnIdentityGuard(x, sql = COLLIDING) {
 /** The source lock: a SUSPEND issued while a search page is being computed must wait for it (instrumented pause). Without the
  *  lock the SUSPEND commits mid-page and the page, checked AVAILABLE, silently releases nothing (ok:0): the FD21 defect. */
 async function scnSearchLock(x, mutantSql) {
-  // 0016: the pause is before the readable-run statement (after the lock and the availability check).
-  const pause = "  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float);\n    SELECT coalesce(array_agg(r.run_id), ";
-  await asOwner(x.admin, a => a.query(mutate(mutantSql ?? SEARCH_FN, '    SELECT coalesce(array_agg(r.run_id), ', pause)));
+  // 0016/0018: the pause is before the readable-run statement (after the lock and the availability check).
+  const pause = "  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float);\n    readable_runs := si.si_readable_runs(";
+  await asOwner(x.admin, a => a.query(mutate(mutantSql ?? SEARCH_FN, '    readable_runs := si.si_readable_runs(', pause)));
   const s = await source(x); await collect(x, s, [AD('Northwind Synthetic', 'lk')]);
   const alice = await reader(x); await alice.query(`SET si.test_pause = '1.5'`);
   // Barrier: the reader's backend is inside the instrumented pause, i.e. past the lock and the availability check.
@@ -438,7 +442,7 @@ async function scnSearchLock(x, mutantSql) {
 }
 const DB_MUTANTS = [
   { name: 'search period end inclusive', scenario: scnSearchPeriodEnd, baseline: 'ok:0', mutant: 'ok:1',
-    sql: mutate(SEARCH_FN, 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at < p_to))', 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at <= p_to))') },
+    sql: mutate(READABLE_FN, 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at < p_to))', 'AND (p_from IS NULL OR (r.finished_at >= p_from AND r.finished_at <= p_to))') },   // 0018: the period lives in si_readable_runs_at
   { name: 'history network filter omitted', scenario: scnHistoryNetwork, baseline: 'ok:1', mutant: 'ok:2',
     sql: mutate(HISTORY_FN, 'AND (cardinality(p_networks) = 0 OR o.network = ANY (p_networks))', 'AND true') },
   { name: 'search synchronous_commit protection omitted', scenario: scnSearchSyncCommit, baseline: 'SI_READ_UNSAFE_SESSION', mutant: 'ok',

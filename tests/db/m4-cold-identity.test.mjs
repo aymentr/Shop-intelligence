@@ -21,6 +21,7 @@
 //   COLD-M / IDG-M  negative-control mutants, each killed for its intended reason.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { latestDefinition } from './durability-fixtures.mjs';
 import { readFileSync, mkdtempSync, writeFileSync, copyFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -32,7 +33,7 @@ import { grantReader, beginRead } from '../../dist/persistence/reader.js';
 import * as INTEL from '../../dist/persistence/intelligence.js';
 
 const DIST = fileURLToPath(new URL('../../dist/persistence/', import.meta.url));
-const MIG16 = readFileSync(new URL('../../db/migrations/0016_cold_query_reliability.up.sql', import.meta.url), 'utf8');
+const MIG16 = readFileSync(new URL('../../db/migrations/' + latestDefinition('si_search_advertisers', 'END $search$;').file, import.meta.url), 'utf8');   // the ACTIVE reader functions (0018 since M4-P3.0)
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_monitor'];
 const CONFLICT = 'SI_READ_IDENTITY_CONFLICT: the advertiser key selects another normalized name';
 let n = 0;
@@ -110,6 +111,12 @@ async function rawHistory(alice, src, name, limit, { networks = [], after = null
   });
   return { ...r, id };
 }
+/** si_readable_runs_at evaluations recorded so far (track_functions = 'all'; stats flushed by readableCalls first). */
+async function setCalls(x) {
+  await new Promise(r => setTimeout(r, 600));
+  await x.admin.query('SELECT pg_stat_clear_snapshot()');
+  return Number((await x.admin.query(`SELECT coalesce(sum(calls), 0) AS c FROM pg_stat_user_functions WHERE funcname = 'si_readable_runs_at'`)).rows[0].c);
+}
 /** si_evidence_readable calls recorded for the database so far (track_functions = 'all'; flushed explicitly). */
 async function readableCalls(x, ...sessions) {
   for (const s of [x.admin, ...sessions]) await s.query('SELECT pg_stat_force_next_flush()');
@@ -135,7 +142,7 @@ async function concentrated(x, src, runs = 10) {
 }
 
 // ------------------------------------------------------------------------------------------------
-test('COLD-1 (N1): without statistics, history and search pages evaluate readability once per run and succeed; results equal the warm ones', async t => {
+test('COLD-1 (N1): without statistics, history and search pages evaluate readability once per page (set-based, M4-P3.0) and succeed; results equal the warm ones', async t => {
   const x = await fresh(t, 'm4cold1', { cold: true });
   const src = await source(x);
   await concentrated(x, src);
@@ -143,25 +150,28 @@ test('COLD-1 (N1): without statistics, history and search pages evaluate readabi
   await alice.query(`SET statement_timeout = '2s'`);                         // the fix may not rely on the 10 s ceiling
   assert.ok(await noStatistics(x), 'cold: no planner statistics for the evidence tables');
   const runs = 10;
-  let c0 = await readableCalls(x, alice);
+  let c0 = await readableCalls(x, alice), s0 = await setCalls(x);
   const page = await rawHistory(alice, src, 'Many Synthetic', 100);
   let c1 = await readableCalls(x, alice);
   assert.equal(page.status, 'ok', `cold history page: ${page.message}`);
   assert.equal(page.value.rows[0].doc.summary.observations, 5000);
-  console.log(`# COLD-1 cold history page: si_evidence_readable calls ${c1 - c0} (0015: 13,438 and a statement timeout)`);
-  assert.equal(c1 - c0, runs, 'one readability evaluation per run of the source');
+  console.log(`# COLD-1 cold history page: per-run si_evidence_readable calls ${c1 - c0}, set-based evaluations ${(await setCalls(x)) - s0} (0015: 13,438 and a statement timeout)`);
+  assert.equal(c1 - c0, 0, 'M4-P3.0: no per-run evaluation on the reader path (the oracle is not called)');
+  assert.equal((await setCalls(x)) - s0, 1, 'one set-based readability evaluation for the page');
   const cc = counting(alice);
-  c0 = await readableCalls(x, alice);
+  c0 = await readableCalls(x, alice); s0 = await setCalls(x);
   const coldHistory = await INTEL.advertiserHistory(cc, src, 'Many Synthetic', { maxRecords: 5000 });
   c1 = await readableCalls(x, alice);
   console.log(`# COLD-1 cold library history: ${coldHistory.observations.length} observations, ${cc.requests} page requests, si_evidence_readable calls ${c1 - c0}`);
   assert.equal(coldHistory.observations.length, 5000);
   assert.ok(cc.requests >= 50 && cc.requests <= 50 + 2, 'fifty pages (plus at most two NOT_DURABLE retries, R-26; refused before evaluation)');
-  assert.equal(c1 - c0, 50 * runs, 'every page: one evaluation per run');
-  c0 = await readableCalls(x, alice);
+  assert.equal(c1 - c0, 0, 'no per-run evaluation on any page');
+  assert.equal((await setCalls(x)) - s0, 50, 'one set-based evaluation per delivered page (a NOT_DURABLE refusal precedes it)');
+  c0 = await readableCalls(x, alice); s0 = await setCalls(x);
   const coldSearch = await INTEL.searchAdvertisers(alice, { sources: [src], query: 'many', limit: 50 });
   c1 = await readableCalls(x, alice);
-  assert.deepEqual([coldSearch.hits.length, coldSearch.hits[0].observations, c1 - c0], [1, 5000, runs]);
+  assert.deepEqual([coldSearch.hits.length, coldSearch.hits[0].observations, c1 - c0, (await setCalls(x)) - s0], [1, 5000, 0, 1],
+    'search: no per-run evaluation, one set-based evaluation');
   // The bound is still refused after one page (not by a timeout): a second cold source with 5,001 observations.
   const big = await source(x);
   await concentrated(x, big); await collect(x, big, [AD('Many Synthetic', 'one-more')]);
@@ -296,7 +306,7 @@ async function mutatedLibrary(t, edits) {
   return import(pathToFileURL(join(dir, 'intelligence.js')).href);
 }
 const DB_MUTANTS = [
-  { name: 'readable runs joined inside the page statement (the 0015 shape)', baseline: 'ok:readable-calls=10', mutant: 'SQLSTATE:57014', cold: true,
+  { name: 'readable runs joined inside the page statement (the 0015 shape)', baseline: 'ok:readable-calls=0', mutant: 'SQLSTATE:57014', cold: true,
     scenario: x => scnColdPage(x), copy: x => scnColdPage(x, HISTORY_0015) },
   { name: 'plan_cache_mode not pinned', baseline: 'value:force_custom_plan', mutant: 'value:force_generic_plan',
     scenario: x => scnPlanMode(x), copy: x => scnPlanMode(x, { search: mutate(SEARCH_FN, PIN, ''), history: mutate(HISTORY_FN, PIN, '') }) },

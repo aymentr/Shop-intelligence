@@ -132,6 +132,8 @@ jobs:
         run: node tests/db/run.mjs tests/slow/m4-remediation-scale.test.mjs
       - name: Concentrated history on a database without planner statistics (M4-P2.2 N1; 200,000 observations, plus the 0015 mutant)
         run: node tests/db/run.mjs tests/slow/m4-cold-scale.test.mjs
+      - name: Set-based readability at 10,000 runs, cold and warm (M4-P3.0; p95 targets, plus the 0016 per-run path measured)
+        run: SI_BENCH_RUNS=10000 SI_BENCH_ORIG_N=3 node tests/db/run.mjs tests/slow/m4-readability-bench.test.mjs
       - name: Disabled commit timestamps (VR-12)
         run: bash tests/slow/commit-ts-off.sh
       - name: Database logs on failure
