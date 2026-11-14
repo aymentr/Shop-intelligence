@@ -29,8 +29,9 @@ jobs:
 
   integration:
     # PostgreSQL 16 integration tests against the same compose.yaml developers use.
+    # 40 min: M4-P3.0 adds the readability equivalence suite (about 3 min per pass, three passes).
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
