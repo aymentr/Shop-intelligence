@@ -6,7 +6,7 @@
 //   published_count > 0, in the period, and si_evidence_readable(r) — evaluated at ONE instant t through
 //   si_test_evidence_readable_at(run, t): a copy of the installed oracle whose only change is clock_timestamp() -> p_t
 //   (asserted: exactly one occurrence; the copy's source equals the installed oracle's with that one substitution).
-// Candidate: si_readable_runs_at(source, from, to, t) (0018), as installed.
+// Candidate: si_readable_runs_at(source, from, to, t) (0018; network statement replaced by 0019), as installed.
 //
 // Fixtures a product path cannot perform, labelled where used:
 //   - ZOO: a disposable clone whose user triggers on sources, rights_versions, source_controls, collection_runs and
@@ -18,7 +18,7 @@
 //   - replica-mode UPDATEs of retain_until / lease_expires_at in the product-path tests (a run's retention ending,
 //     a lease expiring), as in m4-cold-identity.
 //
-//   EQ-0  the design's dependencies: ads.network CHECK domain = the five-network literal of 0018; observations_ad
+//   EQ-0  the design's dependencies: no network literal in the candidate (0019); observations_ad
 //         composite foreign key; NOT NULL network / ad_id; receipt_verifications primary key (run_id); 60 s margin;
 //         the oracle copy is the installed oracle with exactly one substitution; the candidate is the active 0018 text.
 //   EQ-1  product-path lifecycle at real time (every verdict, pending, EMPTY, FAILED/reaped, RUNNING, purged,
@@ -124,12 +124,14 @@ async function compareNow(c, src, label, from = null, to = null) {
 test('EQ-0: the dependencies of the set-based design hold, and the instruments are the installed functions', async t => {
   const x = await fresh(t, 'm4eq0');
   const q = async (sql, p) => (await x.admin.query(sql, p)).rows;
-  // ads.network domain == the literal of 0018 (an observation's network is its ad's: composite FK).
+  // The candidate enumerates no network: it derives the values stored for the source's evidence (0019, condition A of
+  // M4-P3.0-ACCEPT-01); an observation's network is its ad's (composite FK, below). The current domain, for the record:
   const [chk] = await q(`SELECT pg_get_constraintdef(c.oid) AS d FROM pg_constraint c WHERE c.conrelid = 'si.ads'::regclass AND c.contype = 'c'
                           AND pg_get_constraintdef(c.oid) LIKE '%network%'`);
   const domain = [...chk.d.matchAll(/'([A-Z]+)'::text/g)].map(m => m[1]);
   assert.deepEqual(domain, NETWORKS, 'ads.network CHECK domain');
-  assert.match(READABLE_FN, new RegExp(`ARRAY\\[${NETWORKS.map(s => `'${s}'`).join(',')}\\]::text\\[\\]`), '0018 enumerates exactly that domain');
+  for (const nw of NETWORKS) assert.ok(!READABLE_FN.includes(`'${nw}'`), `the candidate does not name the network ${nw}`);
+  assert.match(READABLE_FN, /NOT \(n\.net = ANY \(supported\)\)/, 'unsupported = the oracle\'s test on stored network values');
   const [fk] = await q(`SELECT pg_get_constraintdef(oid) AS d, confmatchtype, confdeltype FROM pg_constraint WHERE conname = 'observations_ad' AND conrelid = 'si.observations'::regclass`);
   assert.equal(fk.d, 'FOREIGN KEY (ad_id, source_id, network, native_ad_id) REFERENCES si.ads(ad_id, source_id, network, native_ad_id) ON DELETE RESTRICT');
   const nn = await q(`SELECT attname, attnotnull FROM pg_attribute WHERE attrelid = 'si.observations'::regclass AND attname IN ('ad_id','network','source_id','run_id') ORDER BY attname`);
@@ -142,8 +144,8 @@ test('EQ-0: the dependencies of the set-based design hold, and the instruments a
   const live = await src('si.si_evidence_readable(uuid)');
   assert.equal(live, body(ORACLE.text, '$evidence_readable$'), 'the oracle text used is the installed oracle');
   assert.equal(await src('si.si_test_evidence_readable_at(uuid,timestamptz)'), live.replace('clock_timestamp()', 'p_t'), 'the copy differs by exactly one substitution');
-  assert.equal(await src('si.si_readable_runs_at(text,timestamptz,timestamptz,timestamptz)'), body(READABLE_FN, '$readable_runs_at$'), 'the candidate is the active 0018 text');
-  assert.equal(READABLE.file, '0018_set_based_readability.up.sql');
+  assert.equal(await src('si.si_readable_runs_at(text,timestamptz,timestamptz,timestamptz)'), body(READABLE_FN, '$readable_runs_at$'), 'the candidate is the active text');
+  assert.equal(READABLE.file, '0019_readability_hardening.up.sql');
   assert.doesNotMatch(READABLE_FN, /si_evidence_readable\s*\(/, 'the candidate never calls the oracle');
   // Both M4 readers call the candidate exactly once and never the oracle.
   for (const f of ['si.si_search_advertisers(text,uuid,text,text[],timestamptz,timestamptz,text,boolean,integer)',
@@ -377,7 +379,9 @@ const MUTANTS = [
   ['network condition removed', M('\n     AND NOT (r.run_id = ANY (unsupported_runs))', ''), f => f.unsupported],
   ['incorrect network predicate: only the first unsupported network', M('a.network = ANY (unsupported_networks)', 'a.network = unsupported_networks[1]'), f => f.unsupported],
   ['incorrect network predicate: only the first observation of a run', M('JOIN si.observations o ON o.ad_id = a.ad_id', 'JOIN si.observations o ON o.ad_id = a.ad_id AND o.ordinal = 0'), f => f.unsupported],
-  ['incorrect network predicate: supported read as unsupported', M('WHERE NOT (d.n = ANY (s.supported_networks))', 'WHERE d.n = ANY (s.supported_networks)'), f => f.unsupported || f.has_supported],
+  ['incorrect network predicate: supported read as unsupported', M('AND NOT (n.net = ANY (supported))', 'AND n.net = ANY (supported)'), f => f.unsupported || f.has_supported],
+  ['network enumeration stops after the first stored value', M('FROM nets WHERE nets.net IS NOT NULL)', 'FROM nets WHERE false)'), f => f.unsupported],
+  ['unknown network comparison (NULL in supported_networks) treated as unsupported', M('AND NOT (n.net = ANY (supported))', 'AND NOT coalesce(n.net = ANY (supported), false)'), f => f.unknown_network],
   ['period end inclusive', M('r.finished_at < p_to', 'r.finished_at <= p_to'), (f, c) => c.from !== null && f.finished_eq_to],
   ['period start exclusive', M('r.finished_at >= p_from', 'r.finished_at > p_from'), (f, c) => c.from !== null && f.finished_eq_from],
   ['source filter removed (runs of another source)', s => mutate(mutate(s, '   WHERE r.source_id = p_source_id AND r.status', '   WHERE r.status'),
@@ -413,6 +417,7 @@ const FACTS = `
          EXISTS (SELECT 1 FROM si.rights_versions w WHERE w.source_id = r.source_id AND w.effective_from = p.t) AS version_at_t,
          EXISTS (SELECT 1 FROM si.observations o WHERE o.run_id = r.run_id AND NOT (o.network = ANY (s.supported_networks))) AS unsupported,
          EXISTS (SELECT 1 FROM si.observations o WHERE o.run_id = r.run_id AND o.network = ANY (s.supported_networks)) AS has_supported,
+         EXISTS (SELECT 1 FROM si.observations o WHERE o.run_id = r.run_id AND (o.network = ANY (s.supported_networks)) IS NULL) AS unknown_network,
          coalesce(r.finished_at = $3, false) AS finished_eq_from, coalesce(r.finished_at = $4, false) AS finished_eq_to
     FROM si.collection_runs r CROSS JOIN p
     JOIN si.sources s ON s.source_id = r.source_id
@@ -566,4 +571,96 @@ test('EQ-4 / EQ-M: seeded randomized states at boundary instants — candidate =
     assert.ok(killed[k].kills > 0, `mutant "${name}" is killed`);
     assert.deepEqual(killed[k].unexplained.slice(0, 3), [], `mutant "${name}": every disagreement is explained by its intended reason`);
   }
+});
+
+// ------------------------------------------------------------------------------------------------
+// M4-P3.0.1 (condition A of M4-P3.0-ACCEPT-01): the network domain is not assumed.
+const M18 = readFileSync(new URL('../../db/migrations/0018_set_based_readability.up.sql', import.meta.url), 'utf8');
+const F0018 = (() => { const a = M18.indexOf('CREATE FUNCTION si.si_readable_runs_at'); const e = '$readable_runs_at$;';
+  return M18.slice(a, M18.indexOf(e, a) + e.length).replace('FUNCTION si.si_readable_runs_at(', 'FUNCTION si.si_test_f0018_runs_at('); })();
+/** Observations whose composite references do not hold (what the FKs observations_ad / observations_run guarantee). */
+const FK_AUDIT = `SELECT o.run_id, o.ordinal FROM si.observations o
+    LEFT JOIN si.ads a ON a.ad_id = o.ad_id AND a.source_id = o.source_id AND a.network = o.network AND a.native_ad_id = o.native_ad_id
+    LEFT JOIN si.collection_runs r ON r.run_id = o.run_id AND r.source_id = o.source_id AND r.rights_version_id = o.rights_version_id
+   WHERE a.ad_id IS NULL OR r.run_id IS NULL ORDER BY 1, 2`;
+async function atNow(c, src) {
+  const r = (await c.query(`SELECT clock_timestamp() AS t`)).rows[0];
+  const v = (await c.query(`SELECT si.si_readable_runs_at($1, NULL, NULL, $2) AS cand, si.si_test_reference_runs_at($1, NULL, NULL, $2) AS ref,
+      si.si_test_f0018_runs_at($1, NULL, NULL, $2) AS f0018`, [src, r.t])).rows[0];
+  return { cand: sorted(v.cand), ref: sorted(v.ref), f0018: sorted(v.f0018) };
+}
+
+test('EQ-5: a network added to the domain later (simulated) is excluded unless supported — exactly as the oracle; the 0018 literal form is killed', async t => {
+  const x = await fresh(t, 'm4eq5');
+  const c = x.admin;
+  await asOwner(c, a => a.query(F0018));
+  const src = 'eq-snap';
+  await createSources(c, [src], ['META']);
+  await recordRights(x.si_rights_admin, src, {});
+  const R1 = await collect(x, src, [AD('s1')]);
+  const R2 = await collect(x, src, [AD('s2')]);
+  const R3 = await collect(x, src, [AD('s3'), AD('s4')]);
+  assert.deepEqual((await c.query(FK_AUDIT)).rows, [], 'fixture: all references hold');
+  // Fixture: a later migration extends the domain (CHECKs of ads.network and of supported_networks), and evidence in
+  // the new network exists — rows built consistent with every composite FK (asserted by FK_AUDIT); replica mode only
+  // bypasses the append-only and completion triggers.
+  for (const [tb, col] of [['ads', 'network'], ['sources', 'supported_networks']]) {
+    const k = (await c.query(`SELECT conname FROM pg_constraint WHERE conrelid = $1::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE $2`, [`si.${tb}`, `%${col}%`])).rows;
+    assert.equal(k.length, 1, `fixture: one ${tb}.${col} CHECK`);
+    await c.query(`ALTER TABLE si.${tb} DROP CONSTRAINT ${k[0].conname}`);
+  }
+  await c.query(`ALTER TABLE si.ads ADD CONSTRAINT ads_network_check CHECK (network IN ('META','TIKTOK','GOOGLE','PINTEREST','OTHER','SNAP'))`);
+  await c.query('BEGIN'); await c.query('SET LOCAL session_replication_role = replica');
+  for (const [run, ord] of [[R2, 1], [R3, 2]]) {
+    const ad = (await c.query(`INSERT INTO si.ads (source_id, network, native_ad_id, first_run_id) VALUES ($1, 'SNAP', $2, $3) RETURNING ad_id`, [src, `snap-${ord}-${run.slice(0, 8)}`, run])).rows[0].ad_id;
+    await c.query(`INSERT INTO si.observations (run_id, source_id, rights_version_id, ordinal, ad_id, network, native_ad_id, advertiser_name, countries, seen_at, source_url, content_sha256)
+        SELECT o.run_id, o.source_id, o.rights_version_id, $2, $3, 'SNAP', a.native_ad_id, o.advertiser_name, o.countries, o.seen_at, o.source_url, o.content_sha256
+          FROM si.observations o JOIN si.ads a ON a.ad_id = $3 WHERE o.run_id = $1 AND o.ordinal = 0`, [run, ord, ad]);
+  }
+  await c.query('COMMIT');
+  assert.deepEqual((await c.query(FK_AUDIT)).rows, [], 'fixture: the SNAP evidence satisfies every composite reference');
+  let r = await atNow(c, src);
+  console.log(`# EQ-5 source supports META: reference ${r.ref.length}, candidate ${r.cand.length}, 0018 form ${r.f0018.length}`);
+  assert.deepEqual(r.ref, [R1], 'oracle: the runs with SNAP evidence are not readable (SNAP unsupported)');
+  assert.deepEqual(r.cand, r.ref, 'candidate == oracle');
+  assert.deepEqual(r.f0018, sorted([R1, R2, R3]), 'killed: the 0018 literal never lists SNAP and releases R2 and R3');
+  await asOwner(c, a => a.query(`UPDATE si.sources SET supported_networks = '{META,SNAP}' WHERE source_id = $1`, [src]));
+  r = await atNow(c, src);
+  assert.deepEqual(r.ref, sorted([R1, R2, R3]), 'oracle: SNAP supported');
+  assert.deepEqual(r.cand, r.ref, 'candidate == oracle');
+  await asOwner(c, a => a.query(`UPDATE si.sources SET supported_networks = '{SNAP}' WHERE source_id = $1`, [src]));
+  r = await atNow(c, src);
+  assert.deepEqual(r.ref, [], 'oracle: META unsupported (every run has META evidence)');
+  assert.deepEqual(r.cand, r.ref, 'candidate == oracle');
+});
+
+test('EQ-6: references bypassed (disposable adversarial fixture) — exact outcomes characterized; FK_AUDIT detects every such state', async t => {
+  const x = await fresh(t, 'm4eq6');
+  const c = x.admin;
+  await asOwner(c, a => a.query(F0018));
+  await createSources(c, ['fk-a'], ['META', 'TIKTOK']); await createSources(c, ['fk-b'], ['TIKTOK']);
+  await recordRights(x.si_rights_admin, 'fk-a', {}); await recordRights(x.si_rights_admin, 'fk-b', {});
+  const OK = await collect(x, 'fk-a', [AD('ok1')]);
+  const [R1, R2, R3, R4] = [await collect(x, 'fk-a', [AD('r1')]), await collect(x, 'fk-a', [AD('r2')]), await collect(x, 'fk-a', [AD('r3')]), await collect(x, 'fk-a', [AD('r4')])];
+  const B = await collect(x, 'fk-b', [AD('b1', 'TIKTOK')]);
+  const T = await collect(x, 'fk-a', [AD('t1', 'TIKTOK')]);                      // a TIKTOK ad of fk-a (for case iv)
+  assert.deepEqual((await c.query(FK_AUDIT)).rows, [], 'fixture: all references hold before the bypass');
+  await asOwner(c, a => a.query(`UPDATE si.sources SET supported_networks = '{META}' WHERE source_id = 'fk-a'`));
+  // Bypass (replica mode skips FK triggers): each case corrupts exactly one observation.
+  await c.query('BEGIN'); await c.query('SET LOCAL session_replication_role = replica');
+  await c.query(`UPDATE si.observations SET network = 'TIKTOK' WHERE run_id = $1`, [R1]);                        // (i) network differs from its ad's
+  await c.query(`UPDATE si.observations o SET ad_id = b.ad_id, network = b.network, native_ad_id = b.native_ad_id
+                   FROM si.observations b WHERE o.run_id = $1 AND b.run_id = $2`, [R2, B]);                         // (ii) another source's ad
+  await c.query(`UPDATE si.observations SET ad_id = 999999999, network = 'TIKTOK' WHERE run_id = $1`, [R3]);     // (iii) dangling reference
+  await c.query(`UPDATE si.observations o SET ad_id = t.ad_id, native_ad_id = t.native_ad_id
+                   FROM si.observations t WHERE o.run_id = $1 AND t.run_id = $2`, [R4, T]);                         // (iv) META row on a TIKTOK ad of the source
+  await c.query('COMMIT');
+  const audit = (await c.query(FK_AUDIT)).rows.map(r => r.run_id);
+  assert.deepEqual(sorted(audit), sorted([R1, R2, R3, R4]), 'FK_AUDIT finds exactly the four corrupted observations');
+  const r = await atNow(c, 'fk-a');
+  console.log(`# EQ-6 bypassed references: reference ${JSON.stringify(r.ref.map(v => [OK, R1, R2, R3, R4, T].indexOf(v)))}, candidate ${JSON.stringify(r.cand.map(v => [OK, R1, R2, R3, R4, T].indexOf(v)))}`);
+  assert.deepEqual(r.ref, sorted([OK, R4]), 'oracle: R1-R3 carry TIKTOK observations (unsupported); R4 carries a META observation');
+  assert.deepEqual(r.cand, sorted([OK, R1, R2, R3]),
+    'candidate (characterized): the evidence path follows ad networks, so (i)-(iii) are released and (iv) is refused; exact only while the composite FKs hold');
+  assert.deepEqual(r.f0018, r.cand, '0018 behaved identically: not a regression of 0019');
 });

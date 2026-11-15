@@ -888,3 +888,51 @@ The table shows p50 / p95; where two pairs are given, the second is the warm fig
 3. The page statement itself remains O(observations of the source) for search (§12.4). M4-P3.0 removes only the per-run readability cost.
 4. Write path (observed while building the benchmark, pre-existing, not changed): one collector session that ingests about 10,000 runs into a database without statistics slows down steeply in `si_complete_run`, consistent with plans cached when the tables were small (98% CPU in one backend after about 7,000 runs). The benchmark reconnects its collector every 500 runs. Recorded as R-37.
 5. R-26 (gate refusals on stray WAL) affects request latency independently (§14.5 counts the retries). R-26, R-28, R-29, R-32 and R-36 remain open. All real-evidence pilot and production NO-GOs remain.
+
+### 14.8 M4-P3.0.1: readability hardening (migration 0019; conditions A–C of M4-P3.0-ACCEPT-01)
+
+M4-P3.0-ACCEPT-01 gave M4-P3.0 a CONDITIONAL ACCEPT with three conditions. Under the current schema the independent review found no mismatch (159,360 own comparisons plus 36,000 with new seeds). Migration 0019 replaces only `si_readable_runs_at`, keeping its owner, privileges, STABLE volatility and settings. The oracle, `si_readable_runs` and both readers are unchanged, and 0018 is not edited.
+
+**A — network domain.** In 0018, the unsupported networks were the five-name literal minus `supported_networks`. If the domain were ever extended, the new network would never be treated as unsupported, and its runs would be released.
+
+0019 derives the unsupported networks from stored data instead. The candidates are the network values actually present for the source's evidence: `ads (source_id, network, ...)`, one index probe per distinct value (a loose index scan). Each candidate is kept when `NOT (network = ANY (supported_networks))` holds, which is the oracle's own test with the oracle's NULL semantics.
+
+Each observation's network equals its ad's through the composite FK `observations_ad`, so the excluded runs are exactly the oracle's. The alternatives were measured on the same 30,000-run dataset (p95, cold, no statistics):
+
+| Network predicate | 10,000 runs | 30,000 runs | Exact if the composite FKs are bypassed? |
+|---|---|---|---|
+| 0018: five-name literal | 67.7 ms | 253 ms | no |
+| **0019: stored network values (adopted)** | **62.1 ms** | **193 ms** | no (characterized, below) |
+| per-run probe of each run's own observations (the oracle's form) | 118 ms | 338 ms | yes |
+
+The per-run probe is the only form independent of the composite FKs, and it misses the 10,000-run target, so it was not adopted. The dependency on the FKs is unchanged from 0018. It is characterized by EQ-6, a disposable fixture that bypasses FK triggers with `session_replication_role = replica`:
+
+| Case | Oracle | 0019 (and 0018) |
+|---|---|---|
+| (i) observation network differs from its ad's | refused | released |
+| (ii) observation references another source's ad | refused | released |
+| (iii) dangling ad reference | refused | released |
+| (iv) META observation on a TIKTOK ad of the source | readable | refused (conservative) |
+
+None of these states can be reached without disabling constraints, and that takes superuser rights. The query `FK_AUDIT` (in the test file) detects every such row. It belongs after any bulk load that bypasses triggers, and before readers are re-enabled.
+
+EQ-5 simulates a later migration that adds a network, SNAP, with FK-consistent evidence:
+- source supports META: the oracle and 0019 both refuse the runs with SNAP evidence, while the 0018 form releases them (killed);
+- source supports META and SNAP: both release them;
+- source supports only SNAP: both refuse everything.
+
+New mutants killed on the EQ-4 states: "network enumeration stops after the first stored value" and "unknown network comparison treated as unsupported". The 36 mutants in total each have 0 unexplained disagreements.
+
+**B — single snapshot.** `si_readable_runs_at` must stay STABLE. Under READ COMMITTED, a STABLE PL/pgSQL function runs all four of its statements on its caller's snapshot; a VOLATILE one takes a new snapshot for each statement. This is now documented in the function itself.
+
+`tests/db/m4-readability-snapshot.test.mjs` uses an instrumented copy that differs from the active text only by one `pg_sleep` between statements 1 and 2 (asserted). While the reader is paused, a single writer transaction removes TIKTOK from the source's networks and records a VALID verdict for a pending META run B. Run A is a VALID TIKTOK run and C a VALID META run.
+
+| Test | Result |
+|---|---|
+| SNAP-1 (direct) and SNAP-1v (through the VOLATILE wrapper the readers call) | exactly the before-set {A, C}; a new call afterwards returns exactly the after-set {B, C} |
+| SNAP-M (VOLATILE mutant) | exactly {A, B, C}: a set that never existed, which releases A (unauthorized) — killed |
+
+A reader failure inside the fixture is reported as a fixture error, never as a kill. The catalog volatility pin (privileges) and SNAP-0 remain.
+
+**C — R-37** is recorded with the independent findings and remains a separately tracked write-path risk (risk register). `si_complete_run` is unchanged.
+

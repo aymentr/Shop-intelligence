@@ -244,6 +244,6 @@ echo 'DR-1 restored durability gate at WAL page and segment boundaries PASS'
 SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
   SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
   SI_TEST_TEMPLATE=si_template_test \
-  node --test --test-name-pattern='^EQ-(0|1):' tests/db/m4-readability-equivalence.test.mjs
-echo 'DR-1 restored set-based readability (0018) equals the oracle PASS'
+  node --test --test-name-pattern='^(EQ-(0|1|5):|SNAP-(0|1):)' tests/db/m4-readability-equivalence.test.mjs tests/db/m4-readability-snapshot.test.mjs
+echo 'DR-1 restored set-based readability (0018/0019) equals the oracle, network domain and single snapshot PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

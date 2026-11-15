@@ -58,6 +58,7 @@ serving), no live collection, no production deployment.
 | 0016 | cold-database query reliability: readable runs selected once per page before the page statement (no join whose plan depends on statistics), `plan_cache_mode` pinned to custom plans; same predicate, gate and bounds | M4-P2.2, pending independent acceptance |
 | 0017 | durability gate at WAL page boundaries (R-35): the gate's target excludes WAL page-header bytes only (page start + 24, segment start + 40), so a fully flushed intent is no longer refused when WAL ends on a page boundary; one line in each gate copy, unflushed WAL is still refused | M3-R35, pending independent acceptance |
 | 0018 | set-based evidence readability for advertiser search and history: `si_readable_runs_at` evaluates the unchanged `si_evidence_readable` predicate for all runs of a source at one instant (source-wide conditions once, run conditions relationally); the oracle and its other callers are unchanged; no table, index, summary or cached decision | M4-P3.0, pending independent acceptance |
+| 0019 | readability hardening: `si_readable_runs_at` derives unsupported networks from the network values stored for the source's evidence (no fixed network list); the single-snapshot (STABLE) invariant documented and tested under READ COMMITTED | M4-P3.0.1, pending independent acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1
