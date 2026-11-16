@@ -31,15 +31,15 @@ const relExists = async (c, rel) => (await c.query('SELECT pg_catalog.to_regclas
 test('M1: up -> down -> up yields an identical schema (catalog fingerprint incl. owners and ACLs)', async t => {
   const db = await freshDatabase(t, 'm1', { migrate: false });
   const { admin } = await roles(t, db, ['admin']);
-  assert.deepEqual(await migrateUp(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  assert.deepEqual(await migrateUp(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
   const afterUp = await schemaFingerprint(admin);
-  assert.deepEqual(await migrateDown(admin, { to: 0, allowDestructive: true }), [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
+  assert.deepEqual(await migrateDown(admin, { to: 0, allowDestructive: true }), [20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]);
   const afterDown = await schemaFingerprint(admin);
   assert.notEqual(afterDown, afterUp);
   const left = (await admin.query(`SELECT relname FROM pg_class WHERE relnamespace = 'si'::regnamespace AND relkind = 'r'`)).rows;
   assert.deepEqual(left.map(r => r.relname), ['schema_migrations'], 'down 0012 to 0001 leaves only the runner table');
   assert.equal((await admin.query(`SELECT count(*)::int AS n FROM pg_proc WHERE pronamespace = 'si'::regnamespace`)).rows[0].n, 0);
-  assert.deepEqual(await migrateUp(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  assert.deepEqual(await migrateUp(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
   assert.equal(await schemaFingerprint(admin), afterUp);
   assert.equal((await admin.query('SELECT count(*)::int AS n FROM si.rights_versions')).rows[0].n, 1, 'seed re-applied');
 });
@@ -420,6 +420,38 @@ test('M1s: up 0019 changes exactly si_readable_runs_at (network values from stor
   assert.equal(await schemaFingerprint(admin), with0019, '0019 re-applies identically');
 });
 
+test('M1t: up 0020 adds the owner-only summary storage and changes exactly si_complete_run (one statement); down 0020 restores the exact 0019 catalog', async t => {
+  const db = await freshDatabase(t, 'm1t', { migrate: false });
+  const { admin } = await roles(t, db, ['admin']);
+  await migrateUp(admin, { to: 19 });
+  const only0019 = await schemaFingerprint(admin);
+  const defs = async () => new Map((await admin.query(`SELECT p.oid::regprocedure::text AS f, pg_get_functiondef(p.oid) AS d, p.proconfig, p.proacl::text AS acl,
+                                                                p.prosecdef, p.provolatile, pg_get_userbyid(p.proowner) AS owner
+                                                         FROM pg_proc p WHERE p.pronamespace = 'si'::regnamespace`)).rows.map(r => [r.f, r]));
+  const before = await defs();
+  assert.deepEqual(await migrateUp(admin, { to: 20 }), [20]);
+  const with0020 = await schemaFingerprint(admin);
+  const after = await defs();
+  const F = 'si.si_complete_run(uuid,uuid,jsonb)';
+  assert.deepEqual([...before].filter(([f, r]) => after.get(f).d !== r.d).map(([f]) => f), [F], 'only si_complete_run changes among existing functions');
+  const [b, a] = [before.get(F), after.get(F)];
+  assert.deepEqual([a.acl, a.proconfig, a.prosecdef, a.provolatile, a.owner], [b.acl, b.proconfig, b.prosecdef, b.provolatile, b.owner], 'attributes unchanged');
+  const ADD = "  -- 0020 (M4-P3.1): the run's advertiser summaries, in this transaction (fails closed with the publication).\n  PERFORM si.si_summarize_run(p_run_id, 'PUBLICATION');\n";
+  assert.equal(a.d.replace(ADD, ''), b.d, 'exactly one statement added');
+  for (const [f, h] of after) if (!before.has(f)) assert.deepEqual([h.owner, h.acl], ['si_owner', '{si_owner=X/si_owner}'], `${f}: owner-only`);
+  const tables = (await admin.query(`SELECT c.relname, c.relacl::text AS acl FROM pg_class c WHERE c.relnamespace = 'si'::regnamespace
+      AND c.relname IN ('advertiser_identities', 'run_advertiser_summaries', 'run_summary_status', 'summary_events') ORDER BY 1`)).rows;
+  assert.deepEqual(tables.map(r => [r.relname, r.acl]), [['advertiser_identities', '{si_owner=arwdDxt/si_owner}'], ['run_advertiser_summaries', '{si_owner=arwdDxt/si_owner}'],
+    ['run_summary_status', '{si_owner=arwdDxt/si_owner}'], ['summary_events', '{si_owner=arwdDxt/si_owner}']], 'owner-only tables');
+  for (const f of ['si.si_search_advertisers(text,uuid,text,text[],timestamp with time zone,timestamp with time zone,text,boolean,integer)',
+                   'si.si_advertiser_history(text,uuid,text,text[],timestamp with time zone,timestamp with time zone,text,integer)'])
+    assert.equal(after.get(f).d, before.get(f).d, `${f}: unchanged (readers are not switched)`);
+  assert.deepEqual(await migrateDown(admin, { to: 19, allowDestructive: true }), [20]);
+  assert.equal(await schemaFingerprint(admin), only0019, 'down 0020 restores the exact 0019 catalog');
+  assert.deepEqual(await migrateUp(admin, { to: 20 }), [20]);
+  assert.equal(await schemaFingerprint(admin), with0020, '0020 re-applies identically');
+});
+
 test('0001 is frozen: its files match the checksums merged in PR #2 (main 4418b69)', () => {
   // Applied migrations are immutable. A change to 0001 must be a new migration instead.
   const sha = f => createHash('sha256').update(readFileSync(join(DEFAULT_MIGRATIONS_DIR, f))).digest('hex');
@@ -441,7 +473,7 @@ test('M2: an edited applied migration (up or down file) is refused by checksum',
   cpSync(DEFAULT_MIGRATIONS_DIR, dir, { recursive: true });       // restore up, now edit down
   appendFileSync(join(dir, '0001_sources_rights.down.sql'), '\n-- edited\n');
   await rejects(assert, migrateUp(admin, { dir }), { message: /^CHECKSUM_MISMATCH/ });
-  assert.deepEqual(await appliedVersions(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], 'nothing changed');
+  assert.deepEqual(await appliedVersions(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], 'nothing changed');
 });
 
 test('M3: concurrent runners serialize on the advisory lock; exactly one applies', async t => {
@@ -478,7 +510,7 @@ test('M4: down is refused without the destructive flag, and with non-synthetic d
   await rejects(assert, migrateDown(admin, { to: 0, allowDestructive: false }), { message: /^DESTRUCTIVE_NOT_ALLOWED/ });
   await rejects(assert, migrateDown(admin, { to: 0 }), { message: /^DESTRUCTIVE_NOT_ALLOWED/ });
   await rejects(assert, migrateDown(admin, { to: 1 }), { message: /^DESTRUCTIVE_NOT_ALLOWED/ });
-  assert.deepEqual(await appliedVersions(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  assert.deepEqual(await appliedVersions(admin), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
 
   // Non-synthetic guard: a throwaway schema without the 0001 CHECK lets us plant a non-synthetic row.
   const dir = tempMigrations(t, {
@@ -575,9 +607,9 @@ test('runner: history records exact checksums, applying login, and objects owned
   const { admin } = await roles(t, db, ['admin']);
   const rows = (await admin.query('SELECT * FROM si.schema_migrations ORDER BY version')).rows;
   const sha = f => createHash('sha256').update(readFileSync(join(DEFAULT_MIGRATIONS_DIR, f))).digest('hex');
-  assert.deepEqual(rows.map(r => [r.version, r.name]), [[1, 'sources_rights'], [2, 'runs'], [3, 'request_scope'], [4, 'completion_hardening'], [5, 'evidence'], [6, 'retention'], [7, 'receipt_verification'], [8, 'internal_reader'], [9, 'read_audit'], [10, 'read_durability'], [11, 'reader_status'], [12, 'reader_availability'], [13, 'opaque_availability_state'], [14, 'server_side_intelligence'], [15, 'intelligence_remediation'], [16, 'cold_query_reliability'], [17, 'wal_boundary_gate'], [18, 'set_based_readability'], [19, 'readability_hardening']]);
+  assert.deepEqual(rows.map(r => [r.version, r.name]), [[1, 'sources_rights'], [2, 'runs'], [3, 'request_scope'], [4, 'completion_hardening'], [5, 'evidence'], [6, 'retention'], [7, 'receipt_verification'], [8, 'internal_reader'], [9, 'read_audit'], [10, 'read_durability'], [11, 'reader_status'], [12, 'reader_availability'], [13, 'opaque_availability_state'], [14, 'server_side_intelligence'], [15, 'intelligence_remediation'], [16, 'cold_query_reliability'], [17, 'wal_boundary_gate'], [18, 'set_based_readability'], [19, 'readability_hardening'], [20, 'advertiser_summaries']]);
   for (const [row, base] of [[rows[0], '0001_sources_rights'], [rows[1], '0002_runs'], [rows[2], '0003_request_scope'],
-                             [rows[3], '0004_completion_hardening'], [rows[4], '0005_evidence'], [rows[5], '0006_retention'], [rows[6], '0007_receipt_verification'], [rows[7], '0008_internal_reader'], [rows[8], '0009_read_audit'], [rows[9], '0010_read_durability'], [rows[10], '0011_reader_status'], [rows[11], '0012_reader_availability'], [rows[12], '0013_opaque_availability_state'], [rows[13], '0014_server_side_intelligence'], [rows[14], '0015_intelligence_remediation'], [rows[15], '0016_cold_query_reliability'], [rows[16], '0017_wal_boundary_gate'], [rows[17], '0018_set_based_readability'], [rows[18], '0019_readability_hardening']]) {
+                             [rows[3], '0004_completion_hardening'], [rows[4], '0005_evidence'], [rows[5], '0006_retention'], [rows[6], '0007_receipt_verification'], [rows[7], '0008_internal_reader'], [rows[8], '0009_read_audit'], [rows[9], '0010_read_durability'], [rows[10], '0011_reader_status'], [rows[11], '0012_reader_availability'], [rows[12], '0013_opaque_availability_state'], [rows[13], '0014_server_side_intelligence'], [rows[14], '0015_intelligence_remediation'], [rows[15], '0016_cold_query_reliability'], [rows[16], '0017_wal_boundary_gate'], [rows[17], '0018_set_based_readability'], [rows[18], '0019_readability_hardening'], [rows[19], '0020_advertiser_summaries']]) {
     assert.equal(row.up_sha256, sha(`${base}.up.sql`));
     assert.equal(row.down_sha256, sha(`${base}.down.sql`));
     assert.equal(row.applied_by, cfg.adminUser);
@@ -591,11 +623,11 @@ test('runner: history records exact checksums, applying login, and objects owned
 test('assertSchemaVersion: the application refuses a database at the wrong version', async t => {
   const db = await freshDatabase(t, 'version');
   const { si_collector } = await roles(t, db, ['si_collector']);
-  assert.equal(codeSchemaVersion(), 19);
+  assert.equal(codeSchemaVersion(), 20);
   await assertSchemaVersion(si_collector);                            // as an application role
-  await rejects(assert, assertSchemaVersion(si_collector, 10), { message: /^SCHEMA_VERSION_MISMATCH: database is at version 19/ });
+  await rejects(assert, assertSchemaVersion(si_collector, 10), { message: /^SCHEMA_VERSION_MISMATCH: database is at version 20/ });
   const empty = await freshDatabase(t, 'version0', { migrate: false });
   const c = await connect({ database: empty });
   t.after(() => c.end());
-  await rejects(assert, assertSchemaVersion(c), { message: /database is at version 0, code expects 19/ });
+  await rejects(assert, assertSchemaVersion(c), { message: /database is at version 0, code expects 20/ });
 });

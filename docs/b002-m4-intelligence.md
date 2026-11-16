@@ -973,3 +973,123 @@ This is an operational control. It does not make inconsistent states unreachable
 
 **Mutation coverage.** M4-P3.0.1-ACCEPT-01 found that the "retention termination condition removed" mutant was killed on some seeds of the randomized EQ-4 and not on others; seed 424242 is reproduced with 0 kills. In product-reachable states the condition is redundant: a termination is recorded at its own time and also ends retention through `si_retention_end`. EQ-7 now kills it deterministically. Its fixture records a covering TERMINATE_RETENTION at t + 1 day followed by a LIFT, with its facts asserted before the comparison, so a setup failure is never a kill. A control case (termination of version 0 only) shows the mutant agrees wherever the condition is not decisive. EQ-4 remains randomized: it requires every other mutant to be killed on every seed and names the one covered by EQ-7.
 
+
+## 15. M4-P3.1: immutable advertiser summaries and identity dictionary (migration 0020)
+
+**Status:** IMPLEMENTED on branch `claude/b002-m4-p3-1` from `1d6fb8f` (M4-P3.0.1-CLOSE-01), pending independent acceptance. Storage foundation only: **no reader reads these tables**. `si_search_advertisers` and `si_advertiser_history` are unchanged (M1t asserts their definitions); switching them is M4-P3.2. Synthetic data only. Owner-only tables and functions; no reader or application role gains any privilege. No authorization or readability decision is stored. Readability stays live (§14), and so do verdicts, rights, controls, grants and expiry.
+
+### 15.1 Design decisions
+
+| # | Question | Decision |
+|---|---|---|
+| D1 | Distinct ads across runs without summing per-run counts | Within a run an ad occurs once (`observations UNIQUE (run_id, ad_id)`), and `ad_id` ↔ `(source, network, native_ad_id)` is one-to-one (`ads` UNIQUE). Each summary row stores the run's sorted `ad_ids`. Distinct ads over any set of runs = the number of distinct elements of the union. Per-run counts (`observations`) are summed only for observation counts. SUM-1: 4 distinct ads, 7 observations. |
+| D2 | Digest and normalized-name collisions | The identity **is** the normalized name (`si_normalize_advertiser`, the existing rule) under a normalizer fingerprint. The 32-byte digest is only the index key; a CHECK enforces `advertiser_key = sha256(normalized_name)`. Publication inserts missing identities, then compares the stored normalized name for every digest it uses. A digest recorded for another name fails the publication closed (`SI_SUMMARY_IDENTITY_COLLISION`, SUM-2). Different raw spellings with one normalized name are one identity by design; each run keeps its distinct raw spellings (`names`). |
+| D3 | Long normalized names | Up to 18,000 characters (1,000 × an NFKC expansion of up to 18). They are stored but never indexed; the unique index is `(source_id, normalizer, advertiser_key)`. SUM-1 publishes an 18,000-character name. |
+| D4 | Normalizer changes | The fingerprint `v1|icu=<actual und-x-icu version>|pg=<major>` is recorded on identities and on each run's status. A status with another fingerprint is STALE: the run is not eligible, the guard admits deleting its rows, and backfill re-derives it under the new fingerprint (SUM-5). Bump `v1` in code whenever `si_normalize_advertiser` itself changes. |
+| D5 | Partial backfill fails closed | A run's summary rows and its status record commit in **one** transaction, both at publication and at backfill. A source is eligible for summary-backed reads (`si_summary_coverage`, for M4-P3.2) only if every COMPLETED RETAINED/EMPTY run has a current status and no drift is open. Backfill is bounded (`p_limit` ≤ 1,000) and resumable in deterministic `(source, finished_at, run_id)` order; an interrupted batch rolls back entirely (SUM-4). |
+| D6 | Completed-run immutability | Summary rows, status and the drift log are append-only (UPDATE and TRUNCATE are refused for every role, the owner included). DELETE is admitted only for a PURGED run, a STALE status or a source with open drift; an identity only when no summary references it. New: observations can be inserted only while their run is RUNNING (`trg_observation_open_run`). Adding evidence to a completed run (the M4-P3.0.1-ACCEPT-01 owner path) now requires disabling a trigger, which the integrity gate reports. |
+
+### 15.2 Schema (0020; reversible: down restores the exact 0019 catalog, M1t)
+
+- `si.advertiser_identities` `(identity_id, source_id, normalizer, advertiser_key, normalized_name, first_run_id, created_at)`. UNIQUE `(source_id, normalizer, advertiser_key)`, digest CHECK.
+- `si.run_advertiser_summaries` `(run_id, source_id, identity_id, network, observations, ad_ids bigint[], names text[])`. PK `(run_id, identity_id, network)`, index `(identity_id)`. Composite FKs to the run and the identity, both on `source_id`, so a summary cannot cross sources. CHECKs: `cardinality(ad_ids) = observations`, no NULL elements.
+- `si.run_summary_status` `(run_id PK, source_id, normalizer, observation_count, summary_rows, identities, content_digest, method PUBLICATION|BACKFILL|REBUILD, recorded_at, recorded_by)`.
+- `si.summary_events` (append-only): `DRIFT_DETECTED` (with a finding), `DRIFT_CLEARED`, `REBUILT`.
+- Functions, all owner-only:
+  - `si_summary_content` is the one derivation, used both to write and to verify;
+  - `si_summarize_run`, `si_backfill_summaries`, `si_verify_summaries`, `si_rebuild_run_summaries`, `si_summary_coverage`, `si_normalizer_fingerprint`;
+  - the guards and triggers.
+- `si_complete_run` is the 0005 text with **one** statement added (M1t): `PERFORM si.si_summarize_run(p_run_id, 'PUBLICATION')` before the receipt.
+
+### 15.3 Publication, backfill, verification, purge
+
+- **Publication.** It derives the run's content once, from the observations just inserted: one normalizer call per observation. It then:
+  1. inserts the missing identities in digest order, so concurrent publications of one source wait instead of deadlocking;
+  2. checks for collisions;
+  3. inserts the summaries and the status.
+
+  Any error aborts the whole publication; SUM-2 shows the run stays RUNNING with no evidence. The deferred `trg_runs_summary_check` refuses at commit a run that becomes COMPLETED without a current status covering exactly its observations. Duplicate completions are refused as before (`SI_T2_NOT_OWNER`), with no change to the summaries (SUM-3). Identity lookups are correlated index probes (`LATERAL ... LIMIT 1`, scalar `IS NULL`), so no plan can hash the dictionary: with 100,000 identities, a hash join spilled 541 MB of temporary files during backfill until this was fixed.
+- **Backfill** `si_backfill_summaries(p_limit)` takes the sources `FOR SHARE` and the runs `FOR SHARE`, and re-checks each run under the locks. A purge committed before the lock is not resurrected (SUM-7). A purge waits for, or skips (`BUSY`), a source under maintenance.
+- **Verification** `si_verify_summaries(source)` recomputes every summarized run from its observations. Comparing them as multisets in both directions, it reports `MISSING`, `CONTENT_MISMATCH`, `STATUS_MISMATCH` (counts or digest), `ORPHAN_IDENTITY` and `IDENTITY_MISMATCH`. Any finding records `DRIFT_DETECTED`, which blocks coverage; a clean verification of a drifted source records `DRIFT_CLEARED`. `si_rebuild_run_summaries` works only while drift is open (SUM-6).
+- **Purge** is unchanged. A trigger, running in the purge transaction under its exclusive source lock, deletes the purged run's summaries and status, and the source's identities that no remaining summary references.
+
+  **Dictionary retention policy:** a normalized name is derived evidence content, so an identity lives exactly as long as some retained run's summary references it. It is deleted in the purge transaction of its last run (SUM-7) or with its last stale summary (SUM-5). It is never evidence of readability.
+- **Not affected:** verdicts, rights versions, source controls and grants never write summaries. SUM-7 checks that summaries, identities and status are byte-identical across all of them; expiry and readability are evaluated live by readers.
+- **Integrity controls (§14.9) still apply.** The gate now also checks the 0020 guard and lifecycle triggers (IG-2: insert guard, summary append-only, purge trigger). FK_AUDIT is unchanged. Summary drift is found by `si_verify_summaries`, not by FK_AUDIT: SUM-6's corruption is FK-consistent.
+
+### 15.4 Tests (`tests/db/m4-summaries.test.mjs`, `tests/db/m4-integrity-gate.test.mjs`)
+
+The reference for every summary is an independent recomputation in JavaScript from the raw observations; only the normalizer is evaluated by the database.
+
+- **SUM-1:** repeated ads, several sources, networks, spellings, an 18,000-character name, an emoji and full-width forms.
+- **SUM-2:** digest collision.
+- **SUM-3:** rollback, duplicate completion, and 6 × 5 concurrent publications sharing identities.
+- **SUM-4:** pre-0020 data. Backfill steps `[3,4] → [3,1] → [1,0]`, an interrupted batch leaves nothing, and search output is identical before and after.
+- **SUM-5:** normalizer change.
+- **SUM-6:** owner corruption, drift, rebuild and clear, and append-only refusals.
+- **SUM-7:** lifecycle invariance, purge, and both lock orders.
+
+Targeted mutants, each killed for its stated reason with the baseline asserted exactly (a fixture failure throws and is never a kill):
+
+| Mutant | Baseline | Mutant |
+|---|---|---|
+| summary rows missing for one network (self-check intact) | published, equal | publication refused `SI_SUMMARY_INCONSISTENT` |
+| same, with self-check and commit check removed | published, equal | published, differs from recomputation; verification `CONTENT_MISMATCH` |
+| names stored normalized (shared derivation) | equal | differs from the independent recomputation (verification cannot see it: the reason for the independent reference) |
+| observation count + 1 | published | refused by the `cardinality(ad_ids) = observations` CHECK |
+| collision check removed | `SI_SUMMARY_IDENTITY_COLLISION` | published under the impostor identity |
+| coverage ignores missing runs (incomplete backfill reported complete) | not eligible | eligible |
+| backfill records status without rows | `MISSING` | `CONTENT_MISMATCH` |
+| purge keeps summaries | 0 summaries, 0 identities | 1, 1 |
+| purge keeps the run's identities | 0 identities | 1 |
+
+### 15.5 Performance and storage (`tests/slow/m4-summaries-bench.test.mjs`; local PostgreSQL 16.15 container, fsync off)
+
+**Method.**
+- Publications alternate on the same growing source between the 0020 `si_complete_run` (with summaries) and the 0005 text (bench fixture). The runs published without summaries are then backfilled.
+- One source per layout; synthetic rows; 2 networks.
+- `ids` is the size of the advertiser pool. With 500 observations per run spread over the pool, almost every observation is its own `(run, identity, network)` summary row: the **worst case for storage**. `conc50` concentrates about 5 observations per summary row.
+
+| Layout | Publication p50 with / without summaries | Overhead (p50) | WAL per publication | Summaries + dictionary + status vs observations (incl. indexes, TOAST) | Backfill | Verify (whole source) | Rebuild per run | Purge per run with / without |
+|---|---|---|---|---|---|---|---|---|
+| 5,000 obs (10 × 500) | 243 / 250 ms | −3% (noise) | 829 / 608 kB | 1.5 / 2.4 MB = **63%** | 5 runs 0.1 s | 0.3 s | 80 ms | 35 ms |
+| 50,000 obs | 263 / 252 ms | **5%** | 830 / 612 kB | 11.7 / 23.2 MB = **50.5%** | 50 runs 1.3 s | 2.1 s | 78 ms | 61 / 24 ms |
+| 200,000 obs | 274 / 236 ms | **16%** | 832 / 615 kB | 45.1 / 93.0 MB = **48.6%** | 200 runs 4.8 s | 10.8 s | 80 ms | 50 / 39 ms |
+| 1,000,000 obs | 301 / 277 ms | **9%** | 841 / 619 kB | 225 / 465 MB = **48.4%** | 1,000 runs 23.4 s | 46.7 s | 76 ms | 54 / 50 ms |
+| 10,000 runs × 10 | 24.1 / 22.0 ms | **10%** | 16.8 / 12.6 kB | 24.5 / 44.4 MB = **54.9%** | 5,000 runs 6.6 s | 7.2 s | 3.6 ms | 114 / 107 ms |
+| 30,000 runs × 10 | 31.6 / 30.0 ms | **5%** | 16.9 / 12.6 kB | 72.1 / 133.2 MB = **54.1%** | 15,000 runs 25 s | 24.6 s | 4.3 ms | 359 / 311 ms |
+| 500 identities (200,000 obs) | 255 / 230 ms | **11%** | 831 / 615 kB | 48.7% | 200 runs 4.0 s | 8.4 s | 69 ms | 32 / 28 ms |
+| 100,000 identities (200,000 obs) | 266 / 230 ms | **16%** | 976 / 628 kB | 79.7 / 100.7 MB = **79.2%** (dictionary 30.1 MB) | 200 runs 5.3 s | 9.1 s | 67 ms | 33 / 32 ms |
+| concentrated (50 identities) | 210 / 201 ms | **5%** | 662 / 615 kB | 11.1 / 92.9 MB = **12%** | 200 runs 1.6 s | 5.2 s | 19 ms | 28 / 24 ms |
+
+Every layout: 0 bytes of temporary files in build, backfill and verification; collector peak RSS 46–168 MB (it includes shared buffers touched).
+
+**Publication overhead: target ≤ 25% met** (median 5–16%, including 100,000 identities and 1M observations). Write amplification is +35% WAL bytes per publication at one observation per summary row, and +8% when concentrated.
+
+**Storage: target ≤ 35% met only when advertisers concentrate.**
+- At one observation per `(run, identity, network)` row the ratio is 48–55%. A 1-element row costs about 230 bytes: tuple header, run id, two arrays with their headers, and two index entries. An observation costs about 470 bytes.
+- With 100,000 distinct identities the dictionary adds 30 MB (79%).
+- The ratio is therefore a property of the data's concentration, not a defect of the encoding. ≤ 35% needs about 1.6 observations per summary row on average.
+
+Options for M4-P3.2 to decide, measured or estimated from the per-row breakdown; not implemented:
+- (a) single-element rows stored without array headers, a scalar `ad_id` with the array only when there are more (about −30% per such row);
+- (b) per-source spelling dictionary, with summaries referencing spelling ids instead of raw names;
+- (c) the normalizer fingerprint as a small id in the dictionary's unique key (about −20 bytes per identity);
+- (d) accept the cost and track it.
+
+**R-37 (reported, not hidden).** The runs layouts published their first 3,000 runs through **one persistent collector session**. Per-500 medians:
+
+| Layout | Per-500 medians (ms per publication) |
+|---|---|
+| 10,000 runs | 20.5 → 40.4 → 61.7 → 76.5 → 95.1 → 104.2 |
+| 30,000 runs | 18.6 → 38.2 → 55.8 → 74.2 → 90.4 → 104.7 |
+
+Afterwards the bench reconnects every 500 runs (14 and 54 reconnections), and the per-run figures above come from that regime. The slowdown pre-dates 0020 (M4-P3.0-ACCEPT-01: generic plans in the write path); summaries do not remove it.
+
+### 15.6 Limitations and risks
+
+1. Storage at low advertiser concentration exceeds the 35% target (§15.5); R-38.
+2. Publication of runs with many new identities costs more: +16% at 100,000 identities, plus dictionary growth. The dictionary is per source and is purged with its last run.
+3. Summaries are as trustworthy as their evidence. The insert guard and the integrity gate keep completed-run evidence fixed, and `si_verify_summaries` detects divergence, but only when it is run. M4-P3.2 must call `si_summary_coverage`, and verification must be scheduled operationally.
+4. An ICU or major-version change makes every summary STALE until backfill re-derives it. Readers must then fall back to the observation path (M4-P3.2).
+5. R-37 (write path), R-26, R-28, R-29, R-32 and R-36 remain open. All real-evidence pilot and production NO-GOs remain.

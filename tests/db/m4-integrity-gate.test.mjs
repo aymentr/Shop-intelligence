@@ -88,6 +88,12 @@ const TAMPER = [
     expect: ['IMMUTABILITY_TRIGGER:trg_observations_append_only'] },
   { name: 'the run-completed constraint trigger disabled', owner: true, sql: async c => c.query('ALTER TABLE si.observations DISABLE TRIGGER trg_observation_run_completed'),
     expect: ['IMMUTABILITY_TRIGGER:trg_observation_run_completed'] },
+  { name: 'the 0020 evidence insert guard disabled', owner: true, sql: async c => c.query('ALTER TABLE si.observations DISABLE TRIGGER trg_observation_open_run'),
+    expect: ['IMMUTABILITY_TRIGGER:trg_observation_open_run'] },
+  { name: 'the 0020 summary append-only trigger disabled', owner: true, sql: async c => c.query('ALTER TABLE si.run_advertiser_summaries DISABLE TRIGGER trg_summaries_append_only'),
+    expect: ['IMMUTABILITY_TRIGGER:trg_summaries_append_only'] },
+  { name: 'the 0020 purge-summaries trigger disabled', owner: true, sql: async c => c.query('ALTER TABLE si.collection_runs DISABLE TRIGGER trg_runs_purge_summaries'),
+    expect: ['IMMUTABILITY_TRIGGER:trg_runs_purge_summaries'] },
   { name: 'a stored session_replication_role default (superuser)', owner: false,
     sql: async c => c.query(`ALTER ROLE si_collector IN DATABASE ${c.database} SET session_replication_role = replica`),
     expect: (db) => [`REPLICA_DEFAULT:${db}/si_collector`] },
@@ -128,11 +134,13 @@ test('IG-3: si_owner can create inconsistent evidence; gate, VALIDATE and audit 
   // As si_owner only: drop the key, add an observation recorded as TIKTOK against R's META ad, re-add NOT VALID.
   await c.query('BEGIN'); await c.query('SET LOCAL ROLE si_owner');
   await c.query('ALTER TABLE si.observations DROP CONSTRAINT observations_ad');
+  await c.query('ALTER TABLE si.observations DISABLE TRIGGER trg_observation_open_run');   // 0020: the owner must disable the insert guard
   await c.query(`INSERT INTO si.observations (run_id, source_id, rights_version_id, ordinal, ad_id, network, native_ad_id, advertiser_name, countries, seen_at, source_url, content_sha256)
       SELECT o.run_id, o.source_id, o.rights_version_id, 1, a.ad_id, 'TIKTOK', a.native_ad_id, o.advertiser_name, o.countries, o.seen_at, o.source_url, o.content_sha256
         FROM si.observations o JOIN si.ads a ON a.native_ad_id = 'ok1' WHERE o.run_id = $1 AND o.ordinal = 0`, [R]);
   await c.query('SET CONSTRAINTS ALL IMMEDIATE');                              // the deferred run-completed check runs (and passes)
   await c.query(`ALTER TABLE si.observations ADD CONSTRAINT observations_ad ${FK_AD} NOT VALID`);
+  await c.query('ALTER TABLE si.observations ENABLE TRIGGER trg_observation_open_run');
   await c.query('COMMIT');
   assert.equal((await c.query(`SELECT status FROM si.collection_runs WHERE run_id = $1`, [R])).rows[0].status, 'COMPLETED', 'written into a COMPLETED run');
   assert.deepEqual(await gate(c), ['FK_NOT_VALIDATED:observations_ad'], 'gate: the key is not validated');

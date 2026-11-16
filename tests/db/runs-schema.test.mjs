@@ -229,5 +229,5 @@ test('step-4 scope: T2, the publication check and the receipt guards exist', asy
   assert.deepEqual(trg?.slice().sort(), ['trg_receipts_guard', 'trg_receipts_no_truncate', 'trg_receipts_run_completed',
     'trg_run_errors_append_only', 'trg_run_errors_count', 'trg_run_errors_no_truncate', 'trg_runs_error_count', 'trg_runs_insert',
     'trg_runs_no_delete', 'trg_runs_no_truncate', 'trg_runs_publish_check', 'trg_runs_purge_check', 'trg_runs_retention',
-    'trg_runs_transition'].sort());
+    'trg_runs_transition', 'trg_runs_summary_check', 'trg_runs_purge_summaries'].sort());   // 0020: summaries at publication and purge
 });

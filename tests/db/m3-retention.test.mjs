@@ -7,6 +7,7 @@
 // can do this; it only stands in for the passage of time.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { latestDefinition } from './durability-fixtures.mjs';
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -20,7 +21,6 @@ import { purgeDue, purgeFailures, retentionStatus, overdueRetention, RetentionFa
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
 const MIG1 = readFileSync(new URL('../../db/migrations/0001_sources_rights.up.sql', import.meta.url), 'utf8');
-const MIG5 = readFileSync(new URL('../../db/migrations/0005_evidence.up.sql', import.meta.url), 'utf8');
 const MIG6 = readFileSync(new URL('../../db/migrations/0006_retention.up.sql', import.meta.url), 'utf8');
 const CHECK = '23514';
 const ROLES = ['admin', 'si_rights_admin', 'si_collector', 'si_retention', 'si_monitor'];
@@ -147,7 +147,7 @@ const PURGE_CHECK_FN = fnText(MIG6, 'CREATE FUNCTION si.trg_runs_purge_check', '
 const RETENTION_END_FN = fnText(MIG1, 'CREATE FUNCTION si.si_retention_end(', '\n$$;');
 // Instrumented T2 (test only): identical to 0005 except a pause between the identity phase and the
 // observation insert, which forces the interleaving a purge without the source lock would race.
-const T2_PAUSED = mutate(fnText(MIG5, 'CREATE OR REPLACE FUNCTION si.si_complete_run', 'END $run_complete$;'),
+const T2_PAUSED = mutate(latestDefinition('si_complete_run', 'END $run_complete$;').text,   // the ACTIVE publication text (0020 since M4-P3.1)
   '      ON CONFLICT DO NOTHING;\n  END LOOP;\n',
   `      ON CONFLICT DO NOTHING;\n  END LOOP;\n  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float8);\n`);
 
@@ -575,14 +575,14 @@ test('RT-14: down 0006 with purged data restores the exact 0005 catalog; up re-a
   const ref = await freshDatabase(t, 'm3ret5', { migrate: false });
   const refc = await connect({ database: ref }); t.after(() => refc.end());
   await migrateUp(refc, { to: 5 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 5, allowDestructive: true }), [19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 5, allowDestructive: true }), [20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6]);
   // A table ACL equal to the owner's default (acldefault: all privileges to the owner, none to others)
   // is equivalent to NULL; pg_dump/restore turns the explicit form into NULL, so on a restored cluster
   // (DR-1) the two lineages differ only in that spelling. Nothing else is normalized.
   const norm = f => f.replaceAll('"relacl":"{si_owner=arwdDxt/si_owner}"', '"relacl":null');
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(await schemaFingerprint(refc)), 'exact 0005 catalog with purged data present');
   assert.equal((await runState(x, run.run_id)).retention_state, 'PURGED', 'a PURGED run is a valid 0005 row');
-  assert.deepEqual(await migrateUp(x.admin), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  assert.deepEqual(await migrateUp(x.admin), [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
   assert.equal(norm(await schemaFingerprint(x.admin)), norm(at6));
 });
 

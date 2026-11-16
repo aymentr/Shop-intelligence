@@ -3,6 +3,7 @@
 // `docker compose logs db`; they FAIL (never skip) when the log cannot be read.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { latestDefinition } from './durability-fixtures.mjs';
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -15,7 +16,6 @@ import { completeRunWithEvidence, T2Refused } from '../../dist/persistence/runs.
 import { checkCollectorLogging } from '../../dist/persistence/preconditions.js';
 
 const REPO = fileURLToPath(new URL('../../', import.meta.url));
-const MIGRATION = readFileSync(new URL('../../db/migrations/0005_evidence.up.sql', import.meta.url), 'utf8');
 const CHECK = '23514';
 const cleanups = [];
 const scope = { after: fn => cleanups.push(fn) };
@@ -382,8 +382,7 @@ test('EV-13 (O3): concurrent completions with overlapping identities in opposite
 });
 
 test('EV-14 (O4, targeted mutant): payload-order identity inserts deadlock under a forced interleaving; the sorted order does not', async () => {
-  const start = MIGRATION.indexOf('CREATE OR REPLACE FUNCTION si.si_complete_run');
-  const fn = MIGRATION.slice(start, MIGRATION.indexOf('END $run_complete$;', start) + 'END $run_complete$;'.length);
+  const fn = latestDefinition('si_complete_run', 'END $run_complete$;').text;   // the ACTIVE publication text (0020 since M4-P3.1)
   const anchor = 'FOR a IN SELECT DISTINCT t.net COLLATE "C" AS net, t.nid COLLATE "C" AS nid FROM unnest(rws) t ORDER BY 1, 2 LOOP';
   assert.equal(fn.split(anchor).length, 2, 'exactly one anchor');
   const pause = `PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float8);`;

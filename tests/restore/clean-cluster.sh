@@ -252,4 +252,10 @@ gate_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ER
 audit_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_restore_admin -d si_template_test < db/ops/fk-audit.sql)
 [[ -z "$audit_out" ]] || { echo "DR-1 FK_AUDIT FAILED on the restored cluster:"; echo "$audit_out"; exit 1; }
 echo 'DR-1 restored evidence-reference integrity gate and FK_AUDIT PASS'
+# Migration 0020 on the restored cluster: summaries equal the independent recomputation; lifecycle invariance and purge.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^SUM-(1|7):' tests/db/m4-summaries.test.mjs
+echo 'DR-1 restored advertiser summaries (0020): publication, lifecycle and purge PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

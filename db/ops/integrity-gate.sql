@@ -20,7 +20,13 @@ fk AS (
 immutability(tgname, relname) AS (VALUES
   ('trg_observations_append_only', 'observations'), ('trg_observations_no_truncate', 'observations'),
   ('trg_observation_run_completed', 'observations'), ('trg_observation_purge_check', 'observations'),
-  ('trg_ads_append_only', 'ads'), ('trg_ads_no_truncate', 'ads'), ('trg_ad_has_observation', 'ads'))
+  ('trg_ads_append_only', 'ads'), ('trg_ads_no_truncate', 'ads'), ('trg_ad_has_observation', 'ads'),
+  ('trg_observation_open_run', 'observations'),                                                   -- 0020
+  ('trg_summaries_append_only', 'run_advertiser_summaries'), ('trg_summaries_no_truncate', 'run_advertiser_summaries'),
+  ('trg_summary_status_append_only', 'run_summary_status'), ('trg_summary_status_no_truncate', 'run_summary_status'),
+  ('trg_identities_append_only', 'advertiser_identities'), ('trg_identities_no_truncate', 'advertiser_identities'),
+  ('trg_summary_events_append_only', 'summary_events'), ('trg_summary_events_no_truncate', 'summary_events'),
+  ('trg_runs_summary_check', 'collection_runs'), ('trg_runs_purge_summaries', 'collection_runs'))
 SELECT 'FK_MISSING' AS check, conname AS detail FROM fk WHERE oid IS NULL
 UNION ALL
 SELECT 'FK_NOT_FOREIGN_KEY', conname FROM fk WHERE oid IS NOT NULL AND contype <> 'f'

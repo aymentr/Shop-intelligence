@@ -10,7 +10,8 @@ const APP_ROLES = ['si_collector', 'si_rights_admin', 'si_retention', 'si_monito
 const TABLES = ['si.sources', 'si.rights_versions', 'si.rights_evidence', 'si.source_controls', 'si.schema_migrations',
                 'si.collection_runs', 'si.publication_receipts', 'si.run_errors', 'si.run_request_scope', 'si.ads', 'si.observations',
                 'si.purge_log', 'si.purge_failures', 'si.receipt_verifications', 'si.verification_failures',
-                'si.reader_grants', 'si.reader_access_log', 'si.read_intents'];
+                'si.reader_grants', 'si.reader_access_log', 'si.read_intents',
+                'si.advertiser_identities', 'si.run_advertiser_summaries', 'si.run_summary_status', 'si.summary_events'];   // 0020: owner-only
 const PRIVS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER'];
 const RECORD_SIG = 'si.si_record_rights_version(text,text,text,text,text,text,integer,interval,text,text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[])';
 const CONTROL_SIG = 'si.si_record_source_control(text,text,text,text,integer,integer,integer,integer)';
@@ -55,9 +56,9 @@ const EXPECTED_EXECUTE = {
 const EXPECTED_DEFINER = ['si_advertiser_history', 'si_begin_read', 'si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_purge_due',
                           'si_purge_failures', 'si_read_evidence', 'si_read_source_availability', 'si_read_source_status', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
                           'si_record_source_control', 'si_record_verification_failure', 'si_retention_status', 'si_revoke_reader', 'si_search_advertisers',
-                          'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_purge_check',
+                          'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_open_run', 'trg_observation_purge_check',
                           'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
-                          'trg_runs_publish_check', 'trg_runs_purge_check'];
+                          'trg_runs_publish_check', 'trg_runs_purge_check', 'trg_runs_purge_summaries', 'trg_runs_summary_check'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
   trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
@@ -107,6 +108,10 @@ const EXPECTED_VOLATILITY = {
   si_durability_target: 's',
   // 0018 set-based readability (owner-only)
   si_readable_runs_at: 's', si_readable_runs: 'v',
+  // 0020 advertiser summaries (owner-only)
+  si_normalizer_fingerprint: 's', si_summary_drift_open: 's', trg_summary_guard: 'v', trg_observation_open_run: 'v',
+  si_summary_content: 's', si_summary_digest: 'i', si_summary_stored: 's', si_summarize_run: 'v', trg_runs_summary_check: 'v',
+  trg_runs_purge_summaries: 'v', si_backfill_summaries: 'v', si_verify_summaries: 'v', si_rebuild_run_summaries: 'v', si_summary_coverage: 's',
 };
 // 0015 (D3): resource bounds pinned on the two server-side reader functions; 0016 (N1b): plan_cache_mode pinned too.
 const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB|plan_cache_mode=force_custom_plan'.split('|')];
