@@ -914,7 +914,7 @@ The per-run probe is the only form independent of the composite FKs, and it miss
 | (iii) dangling ad reference | refused | released |
 | (iv) META observation on a TIKTOK ad of the source | readable | refused (conservative) |
 
-None of these states can be reached without disabling constraints, and that takes superuser rights. The query `FK_AUDIT` (in the test file) detects every such row. It belongs after any bulk load that bypasses triggers, and before readers are re-enabled.
+None of these states can be reached through the product's write path. **They do not require superuser rights** (corrected by M4-P3.0.1-ACCEPT-01, reproduced by IG-3): `si_owner` owns the tables, and so does any role able to `SET ROLE si_owner`, such as `si_migrator`. Such a role can drop or replace the keys, insert an observation that violates them (also into a COMPLETED run: the append-only triggers block only UPDATE and DELETE), and re-add the key `NOT VALID`. A superuser can additionally bypass FK triggers with `session_replication_role = replica` while the keys stay VALID. The controls that keep readers away from such states are in §14.9.
 
 EQ-5 simulates a later migration that adds a network, SNAP, with FK-consistent evidence:
 - source supports META: the oracle and 0019 both refuse the runs with SNAP evidence, while the 0018 form releases them (killed);
@@ -935,4 +935,41 @@ New mutants killed on the EQ-4 states: "network enumeration stops after the firs
 A reader failure inside the fixture is reported as a fixture error, never as a kill. The catalog volatility pin (privileges) and SNAP-0 remain.
 
 **C — R-37** is recorded with the independent findings and remains a separately tracked write-path risk (risk register). `si_complete_run` is unchanged.
+
+### 14.9 Trust boundary and integrity controls (M4-P3.0.1-CLOSE-01)
+
+**What the readers' correctness rests on.** These are separate invariants. Production SQL enforces each of them; none is re-checked per read.
+
+1. **Validated composite foreign keys**, `observations_ad (ad_id, source_id, network, native_ad_id)` and `observations_run (run_id, source_id, rights_version_id)`, on NOT NULL columns. The 0019 network optimization relies on them: an observation's network is its ad's (§14.8, EQ-6).
+2. **Immutable completed-run evidence.** The append-only triggers on `observations` and `ads`, the run-completed and ad-has-observation constraint triggers, and the purge path are the only writers. This is a separate invariant, not implied by (1).
+3. **One snapshot inside the readability helper.** `si_readable_runs_at` is STABLE, so its four statements read one snapshot (SNAP-*).
+
+   The reader functions are a different matter. They run the readability statement (`readable_runs := si.si_readable_runs(...)`) and the evidence page statement separately under READ COMMITTED, so they do **not** read one transaction-wide snapshot. Writers that can change readability are excluded during a page by the source lock (`FOR SHARE`, §13.3). What the lock does not cover is evidence appended between the two statements: M4-P3.0.1-ACCEPT-01 showed such an observation (written with a superuser fixture) is returned. This is safe only while invariant (2) holds; the product never appends to a completed run.
+4. **The catalog is not the data.** A catalog check shows the constraints are in force **now**. It does not prove that rows written while they were not in force are consistent: rows written while a key was dropped, `NOT VALID`, or bypassed by disabled triggers or replica mode (IG-4). Only a data audit shows that.
+
+**Controls (no production SQL change, no per-read scan).**
+
+| Control | File | What it checks | Cost | When |
+|---|---|---|---|---|
+| Catalog integrity gate | `db/ops/integrity-gate.sql` | both FKs: exist on `si.observations` with the expected name, are foreign keys, have the exact expected definition, are validated, have all 4 enforcement triggers enabled (2 on `observations`, 2 on the referenced table), have NOT NULL referencing columns and a valid unique referenced key; the 7 immutability/integrity triggers on `observations` and `ads` are enabled; no stored `session_replication_role` default for any database or role | catalog only: about 2.5 ms (IG-5; 0.05 ms server time measured by M4-P3.0.1-ACCEPT-01) | deployment verification (CI integration job), DR-1 on the restored cluster, step 2 below |
+| Data audit `FK_AUDIT` | `db/ops/fk-audit.sql` | every observation whose composite references do not hold, whatever the state of the constraints | full scan of `si.observations` (130–200 ms at 300,000 observations) | step 3 below; never per read |
+
+Both are read-only (IG-1 runs them as `si_owner` in a READ ONLY transaction). PASS means zero rows, and each row of the gate names one failed check. Run them with:
+
+    psql -X -v ON_ERROR_STOP=1 -At -f db/ops/integrity-gate.sql
+    psql -X -v ON_ERROR_STOP=1 -At -f db/ops/fk-audit.sql
+
+IG-2 checks that each tampering is reported by exactly its own check: a key dropped, replaced by a narrower key or re-added `NOT VALID`, an enforcement trigger disabled on either table, a referencing column made nullable, an immutability trigger disabled, a stored replica default. Each runs as `si_owner` where the owner can perform it (asserted), otherwise as superuser.
+
+**Procedure after any operation that can bypass integrity.** This covers a privileged or data-only load, any `DISABLE TRIGGER`, `session_replication_role = replica`, dropping, replacing or re-adding a constraint, or a restore that is not a full `pg_restore` (a full restore re-validates the keys):
+
+1. **Readers stay disabled for the affected sources.** Record a `SUSPEND` control (`si_record_source_control`) for each affected source before the operation, or for every source when the scope is unknown. Readers then refuse those sources (availability `SUSPENDED`), and the source lock orders the control against pages in flight.
+2. **Restore and validate the constraints.** Re-create any dropped key, run `ALTER TABLE ... VALIDATE CONSTRAINT` (it fails on an inconsistent row), re-enable triggers and reset `session_replication_role`. Then run the gate; it must return zero rows.
+3. **Run `FK_AUDIT`**; it must return zero rows. It also finds rows written while the keys looked valid (IG-4).
+4. **Any row returned by either query blocks re-enabling readers.** The affected evidence is investigated and corrected through a reviewed procedure; readers are not re-enabled to work around it.
+5. **Record the verification.** Re-enable readers with the `LIFT` control (`lift`). Its `reason` names the verification ("integrity gate PASS, FK_AUDIT 0 rows, <time>") and its `reference` names the change ticket. Source controls are append-only, so the record is durable and attributed (`recorded_by`).
+
+This is an operational control. It does not make inconsistent states unreachable to the owner role, and it does not replace restricting who can assume `si_owner` (docs/b002-d5b-production-hardening.md).
+
+**Mutation coverage.** M4-P3.0.1-ACCEPT-01 found that the "retention termination condition removed" mutant was killed on some seeds of the randomized EQ-4 and not on others; seed 424242 is reproduced with 0 kills. In product-reachable states the condition is redundant: a termination is recorded at its own time and also ends retention through `si_retention_end`. EQ-7 now kills it deterministically. Its fixture records a covering TERMINATE_RETENTION at t + 1 day followed by a LIFT, with its facts asserted before the comparison, so a setup failure is never a kill. A control case (termination of version 0 only) shows the mutant agrees wherever the condition is not decisive. EQ-4 remains randomized: it requires every other mutant to be killed on every seed and names the one covered by EQ-7.
 

@@ -246,4 +246,10 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^(EQ-(0|1|5):|SNAP-(0|1):)' tests/db/m4-readability-equivalence.test.mjs tests/db/m4-readability-snapshot.test.mjs
 echo 'DR-1 restored set-based readability (0018/0019) equals the oracle, network domain and single snapshot PASS'
+# M4-P3.0.1-CLOSE-01: the evidence-reference integrity gate and the data audit on the restored cluster (zero rows each).
+gate_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_restore_admin -d si_template_test < db/ops/integrity-gate.sql)
+[[ -z "$gate_out" ]] || { echo "DR-1 integrity gate FAILED on the restored cluster:"; echo "$gate_out"; exit 1; }
+audit_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_restore_admin -d si_template_test < db/ops/fk-audit.sql)
+[[ -z "$audit_out" ]] || { echo "DR-1 FK_AUDIT FAILED on the restored cluster:"; echo "$audit_out"; exit 1; }
+echo 'DR-1 restored evidence-reference integrity gate and FK_AUDIT PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

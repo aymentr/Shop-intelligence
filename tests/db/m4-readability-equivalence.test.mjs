@@ -567,7 +567,11 @@ test('EQ-4 / EQ-M: seeded randomized states at boundary instants — candidate =
   for (const [k, [name]] of MUTANTS.entries()) {
     console.log(`# EQ-M ${name}: killed in ${killed[k].kills} comparisons, unexplained disagreements ${killed[k].unexplained.length}`);
   }
+  // Mutants whose condition is decisive only in states the random trials may or may not draw are killed
+  // deterministically elsewhere (named here); every other mutant must be killed on every seed.
+  const DETERMINISTIC = { 'retention termination condition removed': 'EQ-7' };
   for (const [k, [name]] of MUTANTS.entries()) {
+    if (killed[k].kills === 0 && DETERMINISTIC[name]) { console.log(`# EQ-M ${name}: not drawn by seed ${seed}; killed deterministically by ${DETERMINISTIC[name]}`); continue; }
     assert.ok(killed[k].kills > 0, `mutant "${name}" is killed`);
     assert.deepEqual(killed[k].unexplained.slice(0, 3), [], `mutant "${name}": every disagreement is explained by its intended reason`);
   }
@@ -579,10 +583,7 @@ const M18 = readFileSync(new URL('../../db/migrations/0018_set_based_readability
 const F0018 = (() => { const a = M18.indexOf('CREATE FUNCTION si.si_readable_runs_at'); const e = '$readable_runs_at$;';
   return M18.slice(a, M18.indexOf(e, a) + e.length).replace('FUNCTION si.si_readable_runs_at(', 'FUNCTION si.si_test_f0018_runs_at('); })();
 /** Observations whose composite references do not hold (what the FKs observations_ad / observations_run guarantee). */
-const FK_AUDIT = `SELECT o.run_id, o.ordinal FROM si.observations o
-    LEFT JOIN si.ads a ON a.ad_id = o.ad_id AND a.source_id = o.source_id AND a.network = o.network AND a.native_ad_id = o.native_ad_id
-    LEFT JOIN si.collection_runs r ON r.run_id = o.run_id AND r.source_id = o.source_id AND r.rights_version_id = o.rights_version_id
-   WHERE a.ad_id IS NULL OR r.run_id IS NULL ORDER BY 1, 2`;
+const FK_AUDIT = readFileSync(new URL('../../db/ops/fk-audit.sql', import.meta.url), 'utf8');   // the file operations run (docs §14.9)
 async function atNow(c, src) {
   const r = (await c.query(`SELECT clock_timestamp() AS t`)).rows[0];
   const v = (await c.query(`SELECT si.si_readable_runs_at($1, NULL, NULL, $2) AS cand, si.si_test_reference_runs_at($1, NULL, NULL, $2) AS ref,
@@ -663,4 +664,50 @@ test('EQ-6: references bypassed (disposable adversarial fixture) — exact outco
   assert.deepEqual(r.cand, sorted([OK, R1, R2, R3]),
     'candidate (characterized): the evidence path follows ad networks, so (i)-(iii) are released and (iv) is refused; exact only while the composite FKs hold');
   assert.deepEqual(r.f0018, r.cand, '0018 behaved identically: not a regression of 0019');
+});
+
+// ------------------------------------------------------------------------------------------------
+// M4-P3.0.1-CLOSE-01: the termination condition, deterministically (M4-P3.0.1-ACCEPT-01 found its mutant killed or not
+// depending on the EQ-4 seed). In product-reachable states the condition is redundant: a TERMINATE_RETENTION is recorded
+// at its own clock time, which also ends the covered versions' retention (si_retention_end) — so the run is already
+// refused by the retention condition. It is decisive only when the recorded termination time lies beyond t + margin.
+// Fixture (labelled): a TERMINATE_RETENTION covering version 1 recorded at t + 1 day, followed by a LIFT, inserted with
+// the control trigger disabled. The facts are asserted BEFORE the comparison, so a setup failure is never a kill.
+test('EQ-7: the retention-termination mutant is killed deterministically, for its reason; the control case is not', async t => {
+  const k = MUTANTS.findIndex(m => m[0] === 'retention termination condition removed');
+  assert.ok(k >= 0, 'the mutant exists');
+  for (const [label, through, killed] of [['covering termination', 1, true], ['control: termination of version 0 only', 0, false]]) {
+    const x = await fresh(t, 'm4eq7');
+    const c = x.admin;
+    await asOwner(c, a => a.query(mutantSql(k, MUTANTS[k][1])));
+    const src = 'eq-term';
+    await createSources(c, [src], ['META']);
+    await recordRights(x.si_rights_admin, src, {});
+    const R = await collect(x, src, [AD('t1')]);
+    const T = (await c.query(`SELECT clock_timestamp() AS t`)).rows[0].t;
+    await c.query('BEGIN');
+    await c.query('ALTER TABLE si.source_controls DISABLE TRIGGER USER');
+    await c.query(`INSERT INTO si.source_controls (source_id, control_seq, kind, through_version, reason, occurred_at, wall_clock_at,
+                                                   expected_max_version, expected_control_seq)
+                   VALUES ($1, 1, 'TERMINATE_RETENTION', $2, 'fixture', $3::timestamptz + interval '1 day', $3::timestamptz, NULL, NULL),
+                          ($1, 2, 'LIFT', NULL, 'fixture', $3::timestamptz, $3::timestamptz, 1, 1)`, [src, through, T]);
+    await c.query('ALTER TABLE si.source_controls ENABLE TRIGGER USER');
+    await c.query('COMMIT');
+    const f = (await c.query(`SELECT si.si_retention_terminated($1, 1) AS terminated, si.si_source_suspended($1) AS suspended,
+        coalesce(si.si_retention_end($1, 1) > $2::timestamptz + si.si_publish_margin(), true) AS retention_open,   -- NULL: no end
+        si.si_window_end((SELECT rights_version_id FROM si.rights_versions WHERE source_id = $1 AND version = 1)) > $2::timestamptz + si.si_publish_margin() AS window_open`,
+      [src, T])).rows[0];
+    assert.deepEqual(f, { terminated: through >= 1, suspended: false, retention_open: true, window_open: true }, `${label}: fixture facts (not a kill if wrong)`);
+    const r = (await c.query(`SELECT si.si_test_reference_runs_at($1, NULL, NULL, $2) AS ref, si.si_readable_runs_at($1, NULL, NULL, $2) AS cand,
+        si.si_test_mutant_${k}($1, NULL, NULL, $2) AS mut`, [src, T])).rows[0];
+    console.log(`# EQ-7 ${label}: reference ${r.ref.length}, candidate ${r.cand.length}, mutant ${r.mut.length}`);
+    assert.deepEqual(sorted(r.cand), sorted(r.ref), `${label}: candidate == reference`);
+    if (killed) {
+      assert.deepEqual(r.ref, [], 'reference: the terminated version\'s run is refused');
+      assert.deepEqual(r.mut, [R], 'killed for its reason: without the termination condition the run is released');
+    } else {
+      assert.deepEqual(r.ref, [R], 'control: version 1 is not terminated, the run is readable');
+      assert.deepEqual(r.mut, r.ref, 'control: the mutant agrees where the condition is not decisive');
+    }
+  }
 });
