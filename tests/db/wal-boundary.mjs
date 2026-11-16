@@ -15,6 +15,26 @@ const cut = (t, a, b) => { const s = t.indexOf(a); return t.slice(s, t.indexOf(b
 export const OLD_READ = cut(mig('0010_read_durability.up.sql'), 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
 export const OLD_CLAIM = cut(mig('0011_reader_status.up.sql'), 'CREATE FUNCTION si.si_claim_read_intent', 'END $claim_read_intent$;')
   .replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION');
+// M4-P3.1-CLOSE-02: instrumented copies of the pre-0017 gate for R35-M. The ONLY change is one NOTICE after the wait loop
+// reporting the gate's own decision inputs (target, flush) at the moment it releases; the comparison, the wait and the
+// refusal are byte-identical (asserted by R35-0). The oracle classifies a release by this evidence, not by elapsed time.
+const LOOP_TAIL = '    PERFORM pg_sleep(0.005);\n  END LOOP;\n';
+export const DECISION_NOTICE = "  RAISE NOTICE 'si-r35-decision %|%', target, pg_current_wal_flush_lsn();\n";
+const observed = text => { if (text.split(LOOP_TAIL).length !== 2) throw new Error('fixture: the gate wait loop must occur exactly once');
+  return text.replace(LOOP_TAIL, () => LOOP_TAIL + DECISION_NOTICE); };
+export const OLD_READ_OBS = observed(OLD_READ);
+export const OLD_CLAIM_OBS = observed(OLD_CLAIM);
+/** The gate's decision inputs from its NOTICE ({ target, flush } as numbers), or null if it did not release. */
+export const decisionOf = notices => { const m = notices.map(n => /^si-r35-decision ([0-9A-F]+\/[0-9A-F]+)\|([0-9A-F]+\/[0-9A-F]+)$/.exec(n)).filter(Boolean).pop();
+  return m ? { target: lsn(m[1]), flush: lsn(m[2]) } : null; };
+/** WAL records inserted from `from` (a record start, e.g. the verified insert position) to now (pg_walinspect). */
+export async function walSince(admin, from) {
+  await admin.query('CREATE EXTENSION IF NOT EXISTS pg_walinspect');
+  const now = (await admin.query('SELECT pg_current_wal_insert_lsn()::text AS i')).rows[0].i;
+  if (lsn(now) <= from) return [];
+  return (await admin.query(`SELECT start_lsn::text AS at, resource_manager AS rm, record_type AS rt, xid::text AS xid
+      FROM pg_get_wal_records_info($1::pg_lsn, $2::pg_lsn) ORDER BY start_lsn`, [str(from), now])).rows;
+}
 export const NEW_READ = cut(mig('0017_wal_boundary_gate.up.sql'), 'CREATE OR REPLACE FUNCTION si.si_read_evidence', 'END $read_evidence$;');
 export const NEW_CLAIM = cut(mig('0017_wal_boundary_gate.up.sql'), 'CREATE OR REPLACE FUNCTION si.si_claim_read_intent', 'END $claim_read_intent$;');
 

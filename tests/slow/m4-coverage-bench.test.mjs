@@ -5,7 +5,7 @@
 // first call, p50 and p95 over SI_CB_N (default 20) calls; plans (EXPLAIN ANALYZE, BUFFERS) logged.
 //   node tests/db/run.mjs tests/slow/m4-coverage-bench.test.mjs        (SI_CB_RUNS, default 30000)
 // Asserted: identical results; 0021 at least 10x faster than 0020 at p95 cold (no statistics: 0020 evaluates the
-// fingerprint per run) and not slower warm; 0021 p95 <= 50 ms cold and warm. The
+// fingerprint per run) and not slower warm; 0021 p95 <= 40 ms cold and <= 15 ms warm (revised C1 contract, CLOSE-02). The
 // acceptance target (p95 <= 10 ms) is REPORTED, not asserted: an exact check is O(runs of the source) (docs §15.7).
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,6 +14,9 @@ import { asOwner, connect, createSources, dropDatabase, freshDatabase, recordRig
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 
 const RUNS = Number(process.env.SI_CB_RUNS ?? 30000), N = Number(process.env.SI_CB_N ?? 20), TARGET = 10;
+// M4-P3.1-CLOSE-02: the revised C1 acceptance contract (approved): p95 <= 15 ms warm, <= 40 ms cold, at 30,000 runs.
+// The original 10 ms target is still reported, as MET or NOT MET.
+const LIMIT = { WARM: 15, COLD: 40 };
 const M20 = readFileSync(new URL('../../db/migrations/0020_advertiser_summaries.up.sql', import.meta.url), 'utf8');
 const COVERAGE_0020 = (() => { const a = M20.indexOf('CREATE FUNCTION si.si_summary_coverage('); const e = '$summary_coverage$;';
   return M20.slice(a, M20.indexOf(e, a) + e.length).replace('FUNCTION si.si_summary_coverage(', 'FUNCTION si.si_test_coverage_0020('); })();
@@ -62,7 +65,9 @@ test('CB: summary eligibility at 30,000 runs — 0021 vs 0020, cold and warm', {
     assert.deepEqual(out['0021'].res, out['0020'].res, `${label}: identical eligibility`);
     if (/COLD/.test(label)) assert.ok(out['0021'].p95 * 10 <= out['0020'].p95, `${label}: at least 10x faster than 0020 at p95`);
     else assert.ok(out['0021'].p95 <= out['0020'].p95, `${label}: not slower than 0020 at p95`);
-    assert.ok(out['0021'].p95 <= 50, `${label}: 0021 p95 <= 50 ms`);
+    const limit = /COLD/.test(label) ? LIMIT.COLD : LIMIT.WARM;
+    console.log(`# CB ${label}: revised contract p95 <= ${limit} ms ${out['0021'].p95 <= limit ? 'MET' : 'NOT MET'} (${out['0021'].p95.toFixed(2)} ms)`);
+    assert.ok(out['0021'].p95 <= limit, `${label}: 0021 p95 ${out['0021'].p95.toFixed(2)} ms <= ${limit} ms (revised C1 contract)`);
   };
   await measure('COLD (no statistics)');
   for (const c of Object.values(x)) await c.end().catch(() => {});

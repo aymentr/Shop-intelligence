@@ -1194,3 +1194,77 @@ IG-0 recomputes the 16 function pins from the migration files. IG-2 adds 23 deli
 A clean gate says the definitions are in force now. It is not proof that data written before, or by the trusted owner, is correct: that is `fk-audit.sql` for evidence and `verify-summaries.sql` for summaries.
 
 **Finding recorded, not changed (outside the summary contract):** when a run's status row alone is missing and its summary rows remain, backfill fails the whole batch on the summary primary key (fail closed; CV-1 counts it). The run stays INCOMPLETE until verification records the drift and `si_rebuild_run_summaries` re-derives it (R-40).
+
+## 15B. M4-P3.1-CLOSE-02: CI reliability diagnosis (CI #140) and the revised C1 contract
+
+**Status:** branch `claude/b002-m4-p3-1-close-02` from `12b7eb3` (CLOSE-01, unchanged), pending independent acceptance. No production SQL changes: tests, documentation, risk register.
+
+### 15.10 CI #140 reconstruction
+
+| Attempt | Integration pass 1 | Integration pass 2 | Other jobs |
+|---|---|---|---|
+| 1 | 472/472 | R35-M failed | all green |
+| 2 | RT-13 failed (SUSPEND max-batch purge 5,908 ms > 5,000) | — | all green |
+| 3 | 472/472 | R35-M failed | all green |
+
+- Pass 1's WAL positions are byte-identical between CI and local runs (R35-M old page layout 0/1351C018), so the suite is deterministic up to background activity.
+- Both R35-M failures were the same observation: the old-target mutant's first boundary case (0/AD522018) was released after 31 ms and 75 ms; the other six cases were refused after the 1 s wait.
+- The CI server log shows no timed or WAL checkpoint near either failure.
+
+### 15.11 R35-M — test-oracle defect (classification: test oracle; not a product defect)
+
+**Mutation contract.** The pre-0017 gate captures `target = pg_current_wal_insert_lsn()`. At a verified page boundary that is boundary + 24, past the flush pointer (the boundary), and it is reachable only if more WAL is inserted after the boundary and flushed during the wait. Without such WAL the old gate must refuse after its 1 s wait.
+
+**Defect.** Any WAL inserted after the boundary and flushed during the wait releases the old gate legitimately, and says nothing about the gate. Measured sources (local evidence with `pg_walinspect`):
+- autovacuum (`Heap2/PRUNE`, `Btree/VACUUM`, xid 0);
+- heap pruning;
+- another backend's commit;
+- the background writer's `Standby/RUNNING_XACTS` (reproduced with `pg_log_standby_snapshot()`).
+
+The test told such releases apart from escapes by elapsed time (void only after ≥ 100 ms). A foreign record flushed quickly releases in under 100 ms. That is CI's 31 / 75 ms, and R35-V1 reproduces it deterministically: a foreign synchronous commit 15 ms into the wait releases at a verified boundary after 27 ms.
+
+**Correction (test only).**
+- R35-M runs observed copies of the old gate that differ by exactly one NOTICE after the wait loop, reporting the gate's own `target` and flush at release (R35-0 asserts byte-identity otherwise).
+- A release is classified by that evidence:
+  - flush ≥ target → **VOID**: rebuilt, at most 5 times, each void logged with the WAL records found after the boundary;
+  - flush < target → **ESCAPE**: counted, and the test fails.
+- The fixture removes dead intents before each layout (`VACUUM si.read_intents`) and calls the replaced gate once before any layout, so the reader's own pruning is not a void source.
+- Every boundary case must end REFUSED; if voids are exhausted the test **fails** — it is never turned into a pass.
+
+**Controls.**
+- R35-V1 (positive): foreign commit → VOID, where the old elapsed-time rule would have counted an escape.
+- R35-V2 (negative): a gate whose wait is removed releases with flush < target → ESCAPE.
+
+**Adversarial repetition.**
+- Quiet: 10/10 pass (0–1 voids per run; sources autovacuum, pruning, other transactions).
+- Continuous foreign commits every 40 ms: 10/10 **fail** (voids exhausted). The mutant cannot be observed under continuous foreign WAL, and the oracle refuses to call it killed.
+
+The durability invariant and the 0017 gate are unchanged.
+
+### 15.12 RT-13 — root cause found; the timing requirement is NOT relaxed (classification: product performance, pre-existing; R-28)
+
+The bound is the M3 design gate M3-T14: source-lock hold median ≤ 2 s and p95 ≤ 5 s, SUSPEND wait p95 ≤ 5 s, against a maximum purge batch (20 runs, 10,000 observations). It is a resource-budget requirement for emergency controls, not a correctness deadline. RT-13 checks it with one sample per control.
+
+Measurements:
+- **Wait events:** the purge backend is CPU-bound in both modes. No lock waits, no checkpoints, no full-page writes.
+- **Bimodal by statistics:** ≈ 0.5 s when `si.observations` has been analyzed before the purge, and ≈ 2.9–3.3 s when it has never been analyzed. `ANALYZE si.observations` alone moves a cold run from 3.3 s to 0.6 s.
+- **Slow statement:** the purge's `DELETE FROM si.ads` takes 2.5–2.6 s, of which the delete itself is 127 ms. The rest is the per-row `ON DELETE RESTRICT` enforcement of `observations_ad`: 10,000 lookups of `si.observations`, planned without statistics.
+- **Why it is nondeterministic:** whether autoanalyze has run when the purge starts depends on the autovacuum schedule. On slower hosts the cold mode reaches 5.9–10.1 s (CI #140, local CLOSE-01, M4-P2.2: 8.2 s).
+- **Not caused by 0020/0021:** 0020 and 0021 show the same two modes (16 interleaved runs).
+
+This is a real exposure: a purge right after a bulk load, before autoanalyze, holds the source lock several times longer, and emergency controls wait for it. Fixing it changes the retention write path (for example, an index or statement form whose plan does not depend on statistics, or an explicit ANALYZE step after bulk ingestion). That is outside this closure's authorization. RT-13 and its 5 s assertion are unchanged; the decision is requested (R-28).
+
+### 15.13 C1 — revised contract (approved thresholds)
+
+At 30,000 runs, with 27,000 in the measured source, the single-source synthetic workload of §15.7, 20 calls:
+
+| | Warm p95 (≤ 15 ms) | Cold p95 (≤ 40 ms) |
+|---|---|---|
+| Local builds 1 / 2 | 10.2 / 11.4 ms | 29.2 / 33.1 ms |
+| Hosted CI #140 | 6.85 ms | 17.1 ms |
+
+- One fingerprint evaluation per call (CV-2, MX16).
+- The original 10 ms target is still reported: not met locally, met warm on CI.
+- `tests/slow/m4-coverage-bench.test.mjs` asserts the revised limits.
+
+**Reader budget.** The M4-P3.0 reader targets are p95 ≤ 100 ms at 10,000 runs and ≤ 400 ms at 30,000 runs. Eligibility at ≤ 40 ms cold is ≤ 10% of the 30,000-run budget, provided M4-P3.2 calls it once per request. Called per page or per statement it would consume the budget.
