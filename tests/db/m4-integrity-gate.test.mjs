@@ -14,9 +14,17 @@
 //   IG-4  catalog validity is not data integrity: rows written in replica mode while the keys stay VALID pass the gate
 //         and are found only by the audit.
 //   IG-5  cost: the gate is a catalog query (asserted < 50 ms); the audit is a full scan (reported).
+//   M4-P3.1-CLOSE-01 (condition C4):
+//   IG-0  the function pins of the gate equal SHA-256 of the function bodies in the latest migration that defines them
+//         (computed here from the migration files, not from the catalog).
+//   IG-2  (extended) the 0020/0021 summary storage: foreign keys dropped / NOT VALID / an enforcement trigger disabled,
+//         a key or CHECK dropped or replaced, a trigger re-created with another definition, the body of a trigger
+//         function, of the eligibility function or of verification replaced, unexpected table or function grants,
+//         ownership changes, a SECURITY DEFINER search_path changed.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { cfg, connect, createSources, freshDatabase, recordRights, roles } from './helpers.mjs';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 
@@ -43,6 +51,26 @@ async function fresh(t, prefix) {
   Object.defineProperty(x, 'db', { value: db, enumerable: false });
   return x;
 }
+
+test('IG-0: the gate pins each security-critical function to the body in the latest migration that defines it', () => {
+  const pins = [...GATE.matchAll(/\('si\.([a-z_]+)\(([^)]*)\)', '([0-9a-f]{64})'/g)].map(m => ({ name: m[1], sha: m[3] }));
+  assert.equal(pins.length, 16, 'sixteen pinned functions');
+  const dir = new URL('../../db/migrations/', import.meta.url);
+  const files = readdirSync(dir).filter(f => /^\d{4}_.*\.up\.sql$/.test(f)).sort().reverse();
+  for (const p of pins) {
+    let body = null, file = null;
+    for (const f of files) {
+      const t = readFileSync(new URL(f, dir), 'utf8');
+      const m = new RegExp(`CREATE (OR REPLACE )?FUNCTION si\\.${p.name}\\(`).exec(t);
+      if (!m) continue;
+      const open = /\bAS\s+(\$[a-z_]*\$)/.exec(t.slice(m.index));                    // the function's opening dollar quote
+      const start = m.index + open.index + open[0].length;
+      body = t.slice(start, t.indexOf(open[1], start)); file = f; break;
+    }
+    assert.ok(body !== null, `${p.name}: defined by a migration`);
+    assert.equal(createHash('sha256').update(body, 'utf8').digest('hex'), p.sha, `${p.name}: pin == body in ${file}`);
+  }
+});
 
 test('IG-1: a freshly migrated database passes the gate and the audit; both are read-only', async t => {
   const x = await fresh(t, 'm4ig1');
@@ -94,6 +122,76 @@ const TAMPER = [
     expect: ['IMMUTABILITY_TRIGGER:trg_summaries_append_only'] },
   { name: 'the 0020 purge-summaries trigger disabled', owner: true, sql: async c => c.query('ALTER TABLE si.collection_runs DISABLE TRIGGER trg_runs_purge_summaries'),
     expect: ['IMMUTABILITY_TRIGGER:trg_runs_purge_summaries'] },
+  // ---- M4-P3.1-CLOSE-01 (C4): the summary storage
+  { name: '0020 FK run_advertiser_summaries_identity dropped', owner: true,
+    sql: async c => c.query('ALTER TABLE si.run_advertiser_summaries DROP CONSTRAINT run_advertiser_summaries_identity'),
+    expect: ['FK_MISSING:run_advertiser_summaries_identity'] },
+  { name: '0020 FK run_summary_status_run re-added NOT VALID', owner: true,
+    sql: async c => { await c.query('ALTER TABLE si.run_summary_status DROP CONSTRAINT run_summary_status_run');
+                      await c.query('ALTER TABLE si.run_summary_status ADD CONSTRAINT run_summary_status_run FOREIGN KEY (run_id, source_id) REFERENCES si.collection_runs (run_id, source_id) NOT VALID'); },
+    expect: ['FK_NOT_VALIDATED:run_summary_status_run'] },
+  { name: '0020 FK run_advertiser_summaries_run narrowed (same name)', owner: true,
+    sql: async c => { await c.query('ALTER TABLE si.run_advertiser_summaries DROP CONSTRAINT run_advertiser_summaries_run');
+                      await c.query('ALTER TABLE si.run_advertiser_summaries ADD CONSTRAINT run_advertiser_summaries_run FOREIGN KEY (run_id) REFERENCES si.collection_runs (run_id)'); },
+    expect: ['FK_DEFINITION:run_advertiser_summaries_run: FOREIGN KEY (run_id) REFERENCES si.collection_runs(run_id)', 'FK_REFERENCED_KEY:run_advertiser_summaries_run'] },
+  { name: '0020 FK enforcement trigger disabled (superuser)', owner: false,
+    sql: async c => c.query(`ALTER TABLE si.run_advertiser_summaries DISABLE TRIGGER "${await trig(c, 'run_advertiser_summaries_identity', 'si.run_advertiser_summaries')}"`),
+    expect: ['FK_TRIGGERS:run_advertiser_summaries_identity: 3 of 4 enforcement triggers enabled'] },
+  { name: '0020 digest CHECK dropped', owner: true, sql: async c => c.query('ALTER TABLE si.advertiser_identities DROP CONSTRAINT advertiser_identities_digest'),
+    expect: ['KEY_MISSING:advertiser_identities_digest'] },
+  { name: '0020 cardinality CHECK replaced by a weaker one (same name)', owner: true,
+    sql: async c => { await c.query('ALTER TABLE si.run_advertiser_summaries DROP CONSTRAINT run_advertiser_summaries_check');
+                      await c.query('ALTER TABLE si.run_advertiser_summaries ADD CONSTRAINT run_advertiser_summaries_check CHECK (cardinality(ad_ids) >= 1)'); },
+    expect: ['KEY_DEFINITION:run_advertiser_summaries_check'] },
+  { name: '0020 identity key re-added NOT VALID CHECK', owner: true,
+    sql: async c => { await c.query('ALTER TABLE si.advertiser_identities DROP CONSTRAINT advertiser_identities_digest');
+                      await c.query(`ALTER TABLE si.advertiser_identities ADD CONSTRAINT advertiser_identities_digest CHECK (advertiser_key = sha256(convert_to(normalized_name, 'UTF8'::name))) NOT VALID`); },
+    expect: ['KEY_NOT_VALIDATED:advertiser_identities_digest'] },
+  { name: 'the 0020 commit check trigger disabled', owner: true, sql: async c => c.query('ALTER TABLE si.collection_runs DISABLE TRIGGER trg_runs_summary_check'),
+    expect: ['IMMUTABILITY_TRIGGER:trg_runs_summary_check'] },
+  { name: 'the 0020 commit check re-created with another WHEN clause', owner: true,
+    sql: async c => { await c.query('DROP TRIGGER trg_runs_summary_check ON si.collection_runs');
+                      await c.query(`CREATE CONSTRAINT TRIGGER trg_runs_summary_check AFTER UPDATE ON si.collection_runs DEFERRABLE INITIALLY DEFERRED
+                                     FOR EACH ROW WHEN (OLD.status = 'RUNNING' AND NEW.status = 'NEVER') EXECUTE FUNCTION si.trg_runs_summary_check()`); },
+    expect: ['TRIGGER_DEFINITION:trg_runs_summary_check'] },
+  { name: 'the summary guard function body replaced (permissive)', owner: true,
+    sql: async c => c.query(`CREATE OR REPLACE FUNCTION si.trg_summary_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp
+                             AS $summary_guard$ BEGIN RETURN OLD; END $summary_guard$`),
+    expect: ['FUNCTION_DEFINITION:si.trg_summary_guard()'] },
+  { name: 'the insert guard function body replaced (permissive)', owner: true,
+    sql: async c => c.query(`CREATE OR REPLACE FUNCTION si.trg_observation_open_run() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+                             AS $observation_open_run$ BEGIN RETURN NEW; END $observation_open_run$`),
+    expect: ['FUNCTION_DEFINITION:si.trg_observation_open_run()'] },
+  { name: 'the eligibility function body replaced (always eligible)', owner: true,
+    sql: async c => c.query(`CREATE OR REPLACE FUNCTION si.si_summary_coverage(p_source_id text) RETURNS TABLE (eligible boolean, reasons text[])
+                             LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $summary_coverage$ SELECT true, '{}'::text[] $summary_coverage$`),
+    expect: ['FUNCTION_DEFINITION:si.si_summary_coverage(text)'] },
+  { name: 'the verification function body replaced (finds nothing)', owner: true,
+    sql: async c => c.query(`CREATE OR REPLACE FUNCTION si.si_verify_summaries(p_source_id text) RETURNS TABLE (run_id uuid, finding text)
+                             LANGUAGE sql SET search_path = pg_catalog, pg_temp AS $verify_summaries$ SELECT NULL::uuid, NULL::text WHERE false $verify_summaries$`),
+    expect: ['FUNCTION_DEFINITION:si.si_verify_summaries(text)'] },
+  { name: 'the fingerprint loses its ICU version', owner: true,
+    sql: async c => c.query(`CREATE OR REPLACE FUNCTION si.si_normalizer_fingerprint() RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp
+                             AS $normalizer_fingerprint$ SELECT 'v1|icu=fixed|pg=16' $normalizer_fingerprint$`),
+    expect: ['FUNCTION_DEFINITION:si.si_normalizer_fingerprint()'] },
+  { name: 'a SECURITY DEFINER search_path changed', owner: true,
+    sql: async c => c.query('ALTER FUNCTION si.trg_runs_purge_summaries() SET search_path = public, pg_catalog'),
+    expect: ['FUNCTION_DEFINITION:si.trg_runs_purge_summaries()', 'SECDEF_SEARCH_PATH:si.trg_runs_purge_summaries()'] },
+  { name: 'SELECT on the summaries granted to the collector', owner: true, sql: async c => c.query('GRANT SELECT ON si.run_advertiser_summaries TO si_collector'),
+    expect: ['TABLE_PRIVILEGES:run_advertiser_summaries: owner si_owner, acl {si_owner=arwdDxt/si_owner,si_collector=r/si_owner}'] },
+  { name: 'INSERT on the drift log granted to the monitor', owner: true, sql: async c => c.query('GRANT INSERT ON si.summary_events TO si_monitor'),
+    expect: ['TABLE_PRIVILEGES:summary_events: owner si_owner, acl {si_owner=arwdDxt/si_owner,si_monitor=a/si_owner}'] },
+  { name: 'EXECUTE on the eligibility function granted to PUBLIC', owner: true, sql: async c => c.query('GRANT EXECUTE ON FUNCTION si.si_summary_coverage(text) TO PUBLIC'),
+    expect: ['FUNCTION_PRIVILEGES:si.si_summary_coverage(text): owner si_owner, acl {si_owner=X/si_owner,=X/si_owner}', 'PUBLIC_EXECUTE:si.si_summary_coverage(text)'] },
+  { name: 'EXECUTE on rebuild granted to the collector', owner: true, sql: async c => c.query('GRANT EXECUTE ON FUNCTION si.si_rebuild_run_summaries(uuid) TO si_collector'),
+    expect: ['FUNCTION_PRIVILEGES:si.si_rebuild_run_summaries(uuid): owner si_owner, acl {si_owner=X/si_owner,si_collector=X/si_owner}'] },
+  { name: 'an owner-only table with a NULL (default) ACL, as pg_restore leaves it, is NOT reported (superuser)', owner: false,
+    sql: async c => c.query(`UPDATE pg_class SET relacl = NULL WHERE oid = 'si.run_advertiser_summaries'::regclass`), expect: [] },
+  { name: 'a summary table given to another owner (superuser)', owner: false, sql: async c => c.query('ALTER TABLE si.run_summary_status OWNER TO si_bootstrap'),
+    expect: ['TABLE_PRIVILEGES:run_summary_status: owner si_bootstrap, acl {si_bootstrap=arwdDxt/si_bootstrap}'] },
+  { name: 'a SECURITY DEFINER trigger function given to another owner (superuser)', owner: false,
+    sql: async c => c.query('ALTER FUNCTION si.trg_runs_summary_check() OWNER TO si_bootstrap'),
+    expect: ['FUNCTION_PRIVILEGES:si.trg_runs_summary_check(): owner si_bootstrap, acl {si_bootstrap=X/si_bootstrap}', 'SECDEF_OWNER:si.trg_runs_summary_check(): si_bootstrap'] },
   { name: 'a stored session_replication_role default (superuser)', owner: false,
     sql: async c => c.query(`ALTER ROLE si_collector IN DATABASE ${c.database} SET session_replication_role = replica`),
     expect: (db) => [`REPLICA_DEFAULT:${db}/si_collector`] },

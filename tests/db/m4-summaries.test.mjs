@@ -344,7 +344,9 @@ test('SUM-7: verdicts, rights, controls and grants do not touch summaries; purge
   await owner.query(`SELECT 1 FROM si.sources WHERE source_id = $1 FOR SHARE`, [s]);
   assert.equal((await x.si_retention.query('SELECT * FROM si.si_purge_due(20)')).rows[0].outcome, 'BUSY', 'purge does not interleave with maintenance');
   await owner.query('COMMIT');
-  // (2) A purge holding the source lock: backfill waits, then skips the purged run.
+  // (2) A purge holding the source lock while a backfill waits. NOTE (M4-P3.1-ACCEPT-01): Q was published after 0020, so it
+  // already has a status and is never a backfill candidate; this checks only that the wait ends cleanly and that nothing
+  // is written for Q. The genuine race (an UNBACKFILLED run purged while backfill waits) is CC-MX7 in m4-summaries-close.
   const ret = await connect({ user: 'si_retention', database: x.db }); t.after(() => ret.end().catch(() => {}));
   await ret.query('BEGIN');
   assert.equal((await ret.query('SELECT * FROM si.si_purge_due(20)')).rows[0].outcome, 'PURGED');
@@ -352,7 +354,7 @@ test('SUM-7: verdicts, rights, controls and grants do not touch summaries; purge
   await new Promise(r => setTimeout(r, 300));
   await ret.query('COMMIT');
   const bf = (await waiting)[0];
-  assert.deepEqual(bf, { summarized: 0, remaining: 0 }, 'the backfill re-checks under the lock and does not resurrect the purged run');
+  assert.deepEqual(bf, { summarized: 0, remaining: 0 }, 'the backfill waits and writes nothing (Q was not a candidate: see CC-MX7)');
   assert.equal((await c.query('SELECT count(*)::int AS n FROM si.run_advertiser_summaries WHERE run_id = $1', [Q])).rows[0].n, 0);
   assert.deepEqual(await verify(c, s), []);
 });
@@ -420,7 +422,7 @@ const MUT = [
   { name: 'collision check removed', scn: 'collision', baseline: 'refused:SI_SUMMARY_IDENTITY_COLLISION', mutant: 'published',
     sql: [mutate(SUMMARIZE, '  IF EXISTS (SELECT 1 FROM unnest(content) u\n               CROSS JOIN LATERAL', '  IF false AND EXISTS (SELECT 1 FROM unnest(content) u\n               CROSS JOIN LATERAL')] },
   { name: 'incomplete backfill reported complete (coverage ignores missing runs)', scn: scnPartialBackfill, baseline: 'eligible=false:verify=MISSING:', mutant: 'eligible=true:verify=MISSING:',
-    sql: [mutate(COVERAGE, "                 THEN 'INCOMPLETE' END], NULL)", "                 AND false THEN 'INCOMPLETE' END], NULL)")] },
+    sql: [mutate(COVERAGE, "              THEN 'INCOMPLETE' END], NULL);", "              AND false THEN 'INCOMPLETE' END], NULL);")] },
   { name: 'backfill records status without summary rows', scn: scnPartialBackfill, baseline: 'eligible=false:verify=MISSING:', mutant: 'eligible=false:verify=CONTENT_MISMATCH:',
     sql: [mutate(BACKFILL, "      PERFORM si.si_summarize_run(x.run_id, 'BACKFILL');",
       "      INSERT INTO si.run_summary_status (run_id, source_id, normalizer, observation_count, summary_rows, identities, content_digest, method)\n      SELECT x.run_id, x.source_id, fp, 0, 0, 0, sha256(''::bytea), 'BACKFILL';")] },

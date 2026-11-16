@@ -152,3 +152,28 @@ jobs:
       - name: Stop database
         if: always()
         run: docker compose down -v
+
+  summary-close:
+    # M4-P3.1-CLOSE-01: eligibility cost at 30,000 runs (C1) and the 0020/0021 file-level mutation campaign (C2).
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start PostgreSQL 16 (localhost only)
+        run: docker compose up -d --wait db
+      - run: npm ci
+      - run: npm run build
+      - name: Summary eligibility cost at 30,000 runs (C1; cold and warm; reported against the 10 ms target)
+        run: node tests/db/run.mjs tests/slow/m4-coverage-bench.test.mjs
+      - name: Summary mutation campaign MX1-MX17 (C2; every non-equivalent mutant killed by its detector; files restored)
+        run: CI=true node tests/mutations/m4-p31-close.mjs
+      - name: Database logs on failure
+        if: failure()
+        run: docker compose logs db
+      - name: Stop database
+        if: always()
+        run: docker compose down -v

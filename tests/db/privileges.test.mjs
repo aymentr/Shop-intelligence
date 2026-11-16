@@ -230,6 +230,7 @@ test('SD1: SECURITY DEFINER contract — owner, fixed search_path, no PUBLIC EXE
     assert.deepEqual(f.proconfig, ['si_search_advertisers', 'si_advertiser_history'].includes(f.proname) ? PINNED_INTELLIGENCE
                                 : ['si_read_evidence', 'si_read_source_status', 'si_read_source_availability'].includes(f.proname) ? ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s']
                                 : f.proname === 'si_readable_runs_at' ? ['search_path=pg_catalog, pg_temp', 'plan_cache_mode=force_custom_plan']   // 0018: constant arrays
+                                : f.proname === 'si_summary_coverage' ? ['search_path=pg_catalog, pg_temp', 'enable_hashjoin=off', 'enable_nestloop=off', 'enable_sort=off']   // 0021: merge plan pinned
                                                                    : ['search_path=pg_catalog, pg_temp'], `${f.proname} search_path`);
     assert.equal(f.default_acl, false, `${f.proname}: a NULL ACL would mean PUBLIC EXECUTE`);
     assert.equal(f.public_grant, false, `${f.proname}: PUBLIC must not have EXECUTE`);

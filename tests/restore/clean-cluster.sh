@@ -258,4 +258,16 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^SUM-(1|7):' tests/db/m4-summaries.test.mjs
 echo 'DR-1 restored advertiser summaries (0020): publication, lifecycle and purge PASS'
+# M4-P3.1-CLOSE-01 (C3, docs §15.8): mandatory summary verification after a restore (the owner is trusted; eligibility
+# and the catalog gate cannot detect owner tampering with summary rows or drift events). On the restored database...
+verify_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_restore_admin -d si_template_test \
+  -c 'SET ROLE si_owner' -f /dev/stdin < db/ops/verify-summaries.sql | grep -v '^SET$' || true)
+[[ -z "$verify_out" ]] || { echo "DR-1 summary verification FAILED on the restored cluster:"; echo "$verify_out"; exit 1; }
+# ...and on databases of the restored cluster that hold summaries: eligibility equivalence, the trusted-owner boundary
+# (verification finds owner tampering that eligibility and the gate cannot see) and the purge race.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^(CV-1|TB-1|CC-MX7):' tests/db/m4-summaries-close.test.mjs
+echo 'DR-1 restored summary verification (0021, M4-P3.1-CLOSE-01): verify-summaries PASS, owner tampering detected by verification PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

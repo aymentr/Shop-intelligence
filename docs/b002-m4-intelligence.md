@@ -1093,3 +1093,104 @@ Afterwards the bench reconnects every 500 runs (14 and 54 reconnections), and th
 3. Summaries are as trustworthy as their evidence. The insert guard and the integrity gate keep completed-run evidence fixed, and `si_verify_summaries` detects divergence, but only when it is run. M4-P3.2 must call `si_summary_coverage`, and verification must be scheduled operationally.
 4. An ICU or major-version change makes every summary STALE until backfill re-derives it. Readers must then fall back to the observation path (M4-P3.2).
 5. R-37 (write path), R-26, R-28, R-29, R-32 and R-36 remain open. All real-evidence pilot and production NO-GOs remain.
+
+## 15A. M4-P3.1-CLOSE-01: closure of conditions C1–C4 of M4-P3.1-ACCEPT-01 (migration 0021)
+
+**Status:** IMPLEMENTED on branch `claude/b002-m4-p3-1-close-01` from the frozen, accepted candidate `f3f765e` (unchanged: the 0020 files are checksum-pinned by a test), pending independent acceptance. Migration 0021 replaces exactly `si_summary_coverage` and adds two indexes. Summary derivation, identity semantics, publication, backfill, verification, purge, readers, grants and the readability path are unchanged (M1u: only `si_summary_coverage` changes among functions; down 0021 restores the exact 0020 catalog). R-38 compaction and M4-P3.2 readers are not part of this milestone.
+
+### 15.7 C1 — eligibility cost (migration 0021; `tests/slow/m4-coverage-bench.test.mjs`)
+
+**Baseline reproduced.** At 30,000 runs (27,000 in the measured source), the 0020 `si_summary_coverage` took 487–617 ms (first call / p50 / p95: 612 / 501 / 554 ms) on a database without planner statistics. Cause: `si_normalizer_fingerprint()` (a catalog lookup plus the ICU collation version) was evaluated inside the per-run anti-join — CV-2 counts 932 evaluations for one call over 30 runs. With statistics (VACUUM ANALYZE) the planner chose a hash anti-join and 0020 took p95 27.1 ms.
+
+**Change.** The fingerprint is evaluated once per call (plpgsql `DECLARE ... constant`), and the anti-join is a merge of two index-only scans in `run_id` order:
+- `collection_runs_summary_eligible (source_id, run_id) WHERE status = 'COMPLETED' AND retention_state IN ('RETAINED', 'EMPTY')`;
+- `run_summary_status_by_source (source_id, normalizer, run_id)`.
+
+The status side is restricted to the source; a status row's `source_id` equals its run's (composite FK `run_summary_status_run`), so the result is unchanged. The merge plan is pinned by function settings (`enable_hashjoin`, `enable_nestloop`, `enable_sort` off), independent of statistics. Nothing is cached: no table, counter or stored decision; drift, completeness and the fingerprint stay live.
+
+**Equivalence.** CV-1 installs the 0020 text next to 0021 and compares them on 280 states per seed (seeds 20261116, 7, 99), including each reason alone on an otherwise eligible source: missing status, status alone missing (rows kept), stale fingerprint (one run, a whole source), open and cleared drift (forged and real), purged, EMPTY and RUNNING runs, a source without runs. All four outcomes are reached (eligible, DRIFT, INCOMPLETE, both); 0 differences.
+
+**Result at 30,000 runs (two independent builds; p95 over 20 calls; local PostgreSQL 16.15, fsync off, 4 vCPU):**
+
+| State | 0020 first / p50 / p95 | 0021 first / p50 / p95 | Target p95 ≤ 10 ms |
+|---|---|---|---|
+| COLD (never analyzed, new connection) | 612 / 501 / 554 ms; 506 / 506 / 649 ms | 42.3 / 27.2 / 29.2 ms; 39.3 / 26.4 / 33.1 ms | **NOT MET** |
+| WARM (VACUUM ANALYZE) | 46.0 / 21.4 / 27.1 ms; 27.0 / 21.2 / 27.0 ms | 15.1 / 9.1 / 10.2 ms; 16.1 / 8.8 / 11.4 ms | **NOT MET** (marginal) |
+
+Plans: COLD, Merge Anti Join over two Index Only Scans with heap fetches (no visibility map yet), 54,417 buffer hits, 34.7 ms; WARM, 0 heap fetches, 463 buffer hits, 13.0 ms.
+
+**Architectural trade-off (target not met; the gate is not weakened).** An exact completeness check must compare every eligible run of the source with its status: it is O(runs of the source). At 27,000 runs the floor is two ordered scans of 27,000 index tuples (about 9–13 ms warm, 27–35 ms cold). The options for M4-P3.2 to decide, none implemented:
+1. Keep the exact live check (0021) and call it once per request, not per statement; accept ~10 ms warm / ~30 ms cold at 30,000 runs.
+2. A transactionally maintained per-source counter of eligible runs without a current status, written by triggers on runs and status. O(1), but it is a stored, owner-mutable decision whose own correctness would need verification and gate coverage; under contract B (§15.8) it adds no protection against the owner. Not adopted.
+3. Partition the check by time (only runs in the requested period). Changes the eligibility contract; a design decision for M4-P3.2.
+4. Change the target, which is a decision for the acceptance authority, not this milestone.
+
+### 15.8 C3 — owner trust boundary (contract B)
+
+**Reproduced.** As `si_owner` only — no superuser, no trigger disabled — the sequence works:
+1. insert `DRIFT_DETECTED` into `summary_events`, which makes the guard admit DELETE;
+2. delete or insert summary rows;
+3. insert `DRIFT_CLEARED`.
+
+Afterwards eligibility is `eligible` and the catalog gate passes; only `si_verify_summaries` reports the change (TB-1). Summary INSERT is not guarded (append-only means no UPDATE, DELETE or TRUNCATE).
+
+**Contract B: the database owner is trusted.** `si_owner` (the identity `si_migrator` assumes) owns every table, function and trigger and can always rewrite data and any stored digest together. A verification digest kept in the same owner-controlled database would not protect against a malicious owner and is therefore not introduced. The guarantees are:
+- **Ordinary roles** (`si_collector`, `si_monitor`, `si_retention`, `si_rights_admin`, readers): no privilege on the summary tables, the drift log or the summary functions (TB-1, privileges SD1, gate `TABLE_PRIVILEGES` / `FUNCTION_PRIVILEGES` / `PUBLIC_EXECUTE`). They cannot forge drift, write summaries or call eligibility, verification, rebuild or backfill.
+- **The owner** can tamper without disabling a trigger. Eligibility and the gate cannot detect it. **`db/ops/verify-summaries.sql` can**: it recomputes every summarized run of every source from the authoritative observations and lists each finding; a finding records `DRIFT_DETECTED`, which makes the source ineligible.
+
+**Mandatory verification.** `db/ops/verify-summaries.sql` (PASS = zero rows) must run:
+- at deployment verification;
+- in DR-1 after a restore (added to `tests/restore/clean-cluster.sh`);
+- after any privileged operation on evidence or summary tables;
+- on a schedule.
+
+**Time of check / time of use.** A clean verification proves the summaries matched the evidence at that moment only. TB-1 shows that tampering after a clean verification is invisible to eligibility until the next verification. M4-P3.2 must not present eligibility as proof of integrity.
+
+**DR-1 limitation.** DR-1 dumps the template database, which holds no evidence. Its verification step proves the script runs on a restored cluster; detection on data is proved by TB-1, CV-1 and CC-MX7, which DR-1 also runs against databases of the restored cluster.
+
+Real-evidence pilot and production remain NO-GO.
+
+### 15.9 C2 and C4 — mutation coverage and the integrity gate
+
+**C2.** `tests/db/m4-summaries-close.test.mjs` adds a deterministic control per previously surviving mutant. Each control runs its scenario once on the installed functions (exact baseline outcome, with its preconditions asserted) and once with the function mutated (exact defect); a fixture failure throws and is never a kill.
+
+| Control | Scenario | Baseline | Mutant |
+|---|---|---|---|
+| CC-MX5 | owner completes a RUNNING run with a receipt but no summary | refused by the summary check (a control with a summary commits) | commits |
+| CC-MX13 | owner completes a run whose status counts 2 of 3 observations | refused by the summary check | commits |
+| CC-MX4 | fabricated extra summary row, status forged to agree | `CONTENT_MISMATCH` (no `STATUS_MISMATCH` masks it) | clean |
+| CC-MX12 | orphan identity | `ORPHAN_IDENTITY` | clean |
+| CC-MX7 | an unbackfilled (pre-0020) run is purged while backfill waits for the source lock (wait asserted) | purged run has no status | status resurrected |
+| CC-MX8 | fingerprint vs an independent computation | exact | differs |
+
+- **MX4 is not redundant.** Without the stored-minus-content direction, an extra row with a consistent forged status is not detected.
+- **SUM-7 clarification.** Its part (2) never exercised the race, because its run was already summarized. It now says so; CC-MX7 is the race.
+- **MX10 is equivalent.** Removing `ORDER BY u.advertiser_key` from the identity insert changes nothing, because in PostgreSQL 16 `DISTINCT ON (u.advertiser_key)` over a function scan is implemented by Sort + Unique on the digest, so rows are inserted in digest order either way. A future plan that implements DISTINCT ON differently would invalidate this; the campaign then reports `KILLED (equivalence claim WRONG)`.
+
+`tests/mutations/m4-p31-close.mjs` (CI step) applies MX1–MX17 to the migration files:
+- MX1–MX15 are those of M4-P3.1-ACCEPT-01;
+- MX16 re-introduces the per-run fingerprint;
+- MX17 accepts a status under any fingerprint.
+
+For each mutant it rebuilds the template and requires its named detector test to fail with an assertion. It restores the files byte for byte after each mutant and requires a green restored baseline. MX10 must survive.
+
+**C4.** `db/ops/integrity-gate.sql` now also checks:
+- **Foreign keys:** the five 0020 FKs (presence, definition, validation, the 4 enforcement triggers, NOT NULL columns, referenced unique key).
+- **Keys and CHECKs:** the 22 primary, unique and CHECK constraints of the summary tables (name, SHA-256 of the definition, validation, unique index valid).
+- **Triggers:** the 18 immutability and lifecycle triggers — enabled, and SHA-256 of `pg_get_triggerdef` (WHEN clause, timing, deferral, function).
+- **Functions:** 16 security-critical functions — SHA-256 of the body (`prosrc`, as written in the migration), SECURITY DEFINER flag, volatility, settings, owner and exact ACL. These are the 8 immutability and lifecycle trigger functions, the eligibility function and everything eligibility and verification evaluate.
+- **Tables:** owner and exact effective ACL of the evidence and summary tables. A NULL ACL is compared as `acldefault()`: pg_restore leaves owner-only tables with a NULL ACL. DR-1 found this in the first version of the gate: six false TABLE_PRIVILEGES reports on the restored cluster, fixed, and IG-2 now has a case for it.
+- **Every SECURITY DEFINER function in `si`:** owner `si_owner` and the pinned search path.
+- **PUBLIC:** no `si` function executable by PUBLIC.
+
+IG-0 recomputes the 16 function pins from the migration files. IG-2 adds 23 deliberate breaks, each reported exactly, plus one non-break (a restored NULL ACL, not reported). Among the breaks:
+- dropped, NOT VALID or narrowed FKs, and a disabled FK enforcement trigger;
+- a dropped, weakened or NOT VALID CHECK;
+- a disabled or redefined trigger;
+- replaced bodies of the guard, the insert guard, eligibility, verification and the fingerprint;
+- a changed SECURITY DEFINER search path;
+- table and function grants, a PUBLIC grant, ownership changes.
+
+A clean gate says the definitions are in force now. It is not proof that data written before, or by the trusted owner, is correct: that is `fk-audit.sql` for evidence and `verify-summaries.sql` for summaries.
+
+**Finding recorded, not changed (outside the summary contract):** when a run's status row alone is missing and its summary rows remain, backfill fails the whole batch on the summary primary key (fail closed; CV-1 counts it). The run stays INCOMPLETE until verification records the drift and `si_rebuild_run_summaries` re-derives it (R-40).
