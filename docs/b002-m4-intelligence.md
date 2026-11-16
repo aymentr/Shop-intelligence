@@ -1268,3 +1268,98 @@ At 30,000 runs, with 27,000 in the measured source, the single-source synthetic 
 - `tests/slow/m4-coverage-bench.test.mjs` asserts the revised limits.
 
 **Reader budget.** The M4-P3.0 reader targets are p95 ≤ 100 ms at 10,000 runs and ≤ 400 ms at 30,000 runs. Eligibility at ≤ 40 ms cold is ≤ 10% of the 30,000-run budget, provided M4-P3.2 calls it once per request. Called per page or per statement it would consume the budget.
+
+## 15C. M4-P3.1-RT13-01: emergency-purge latency fixed at its root (migration 0022)
+
+**Status:** branch `claude/b002-m4-p3-1-rt13-01` from `90d6c46` (CLOSE-02, unchanged), pending independent acceptance. Production SQL: one index (migration 0022). The RT-13 assertion and its 5 s bound (M3-T14) are unchanged.
+
+### 15.14 Root cause (R-28)
+
+Each identity deleted by `si_purge_due` fires the `ON DELETE RESTRICT` check of `observations_ad`, once per deleted row. The check is this query:
+
+```sql
+SELECT 1 FROM ONLY si.observations x
+ WHERE ad_id = $1 AND source_id = $2 AND network = $3 AND native_ad_id = $4
+   FOR KEY SHARE OF x
+```
+
+No index covered those columns.
+
+| Statistics on `si.observations` | Plan of the check | Index tuples read per lookup | Cost per batch |
+|---|---|---|---|
+| Present (analyzed, or stale from one run) | Index scan of `observations_by_ad` (0006) | 1 to 3 buffers | Linear |
+| Absent (never analyzed: `reltuples` 0 from the vacuumed template, no `pg_stats` rows) | `BitmapAnd` of `observations_by_ad` and `observations_by_source_advertiser_key` (0015, leading `source_id`) | Every index entry of the source (10,000 for a maximum batch) | Quadratic |
+
+Evidence, cold maximum batch (20 runs × 500 identities), purge transaction's own counters (`pg_stat_get_xact_tuples_returned`):
+
+| Schema | Index tuples read | Of which `observations_by_source_advertiser_key` | Purge |
+|---|---|---|---|
+| 0021 | 100,040,000 | 100,000,000 (10,000 × 10,000) | 2.7–3.4 s local, 6.2–6.3 s on 1 CPU |
+| 0021 without the 0015 index | 40,000 | 0 | 0.39–0.41 s |
+| 0022 | 40,000 | 0 | 0.39–0.50 s |
+
+- **Where the time goes:** the FK trigger `observations_ad` took 2,728 ms over 10,000 calls. The statement `DELETE FROM si.ads` took 2,857 ms. Deleting the observations took 142 ms.
+- **Wait events:** the purge backend is CPU-bound. Lock-wait samples during the purge were 0 / 3,344 broken and 0 / 961 fixed.
+- **Why the bimodality:** autovacuum timing decides whether `si.observations` was analyzed before the purge. The cost also grows with the size of the source, not only with the batch: a larger real source would scale it further.
+- **What RT-13 measures:** both. Its `purgeMs` is the physical purge. Its `waitMs` is the SUSPEND / TERMINATE wait, which equals the time the purge still holds the source lock (FOR NO KEY UPDATE). The control's own work is negligible.
+
+### 15.15 Design (migration 0022)
+
+```sql
+CREATE INDEX observations_by_ad_fk ON si.observations (ad_id, source_id, network, native_ad_id);
+```
+
+The index key is exactly the FK key, in the FK's order. Every qual of the check becomes an index condition of one btree. Under any statistics the lookup reads its own entries only, and no cheaper alternative remains.
+
+Unchanged by 0022:
+- functions, triggers, constraints (the FK, its RESTRICT action and its validation);
+- privileges and lock order;
+- audit, publication and summaries;
+- the readers;
+- `observations_by_ad`, which is kept so the readers' plans are not touched.
+
+Down drops the index and restores the exact 0021 catalog (M1v).
+
+Rejected alternatives:
+
+| Alternative | Why rejected |
+|---|---|
+| ANALYZE (in the purge or after ingestion) | Does not hold for a stale, partial or reset set of statistics. Inside the purge it costs O(table) and takes a lock. |
+| Planner GUCs on `si_purge_due` (e.g. `enable_bitmapscan = off`) | RI plans are cached per backend, independently of the function's settings. A plain index scan of the `source_id` index would still be possible. Fragile. |
+| An index on `ad_id` alone | Measured as RTX2: the cold plan still ANDs the `source_id` index, and reads 1e8 tuples. |
+| Dropping or reshaping `observations_by_source_advertiser_key` | Changes the readers' plans (search). Out of scope. |
+| Deferring the FK, or deleting identities later | Changes the FK or the atomicity of the purge. |
+| Re-ordering the deletes | The order is fixed by the FK (observations first). |
+
+**Cost.** One more btree is maintained on every observation insert (native ids of up to 256 bytes). It is about 52 bytes per observation for the synthetic ids: 504 KiB per 10,000 rows, against `observations_by_ad` at 240 KiB and the heap at 11.2 MB. Ingesting 10,000 observations (20 runs × 500, 1 CPU, 3 runs each) took 5.82–6.27 s with the index and 5.69–6.40 s without, which is within noise. `observations_by_ad` becomes a strict prefix of the new index; dropping it later is a separate decision (R-42). The index is created non-concurrently: on a large table, applying 0022 blocks writes to `si.observations` for the duration of the build (R-42).
+
+### 15.16 Tests
+
+`tests/db/m4-rt13-purge-fk.test.mjs` is in the DB suite. Autovacuum is disabled on the `si` tables of each test database, so the statistics mode is deterministic and asserted as a precondition.
+
+| Test | What it checks |
+|---|---|
+| PF-0 | The supporting index exists: valid, ready, btree, non-partial, key = FK key. The FK definition is unchanged. |
+| PF-1 cold / warm / stale | Maximum batch. Index tuples read are ≤ 5 per deleted row (structural, size-independent detector). Purge ≤ 5 s. A bystander source with the same native ids is byte-identical afterwards. Evidence and FK invariants hold (no dangling observation, no orphan identity, no purged run with evidence or without audit, every FK validated). |
+| PF-B (in-suite deliberate break) | Drops the index. Asserts that the defect is reproduced (≥ 5e7 reads of the `source_id` index) and that the PF-1 detector fails on it. |
+| PF-2 (rollback) | A rolled-back maximum purge leaves evidence, identities, run states and audit identical. A retry purges. |
+| PF-3 (partial failure) | Fault injected at the audit insert, after the identities are deleted. The whole purge aborts. Then a clean retry. |
+| PF-4 (contention) | Two concurrent cold maximum purges of different sources, SUSPEND and TERMINATE_RETENTION issued during them, and a collector on a third source. Purges never block each other. A control waits only for the purge of its own source. The collector is not blocked. |
+
+Other checks:
+- **File-level deliberate break:** `tests/mutations/m4-rt13-purge-fk.mjs`. RTX1 (no index) and RTX2 (`ad_id` only) are each killed by PF-1 (cold); the file is restored byte for byte.
+- **Contention benchmark:** `tests/slow/m4-rt13-purge-bench.test.mjs`. p50/p95 of the purge and of the control wait over 10 iterations per statistics mode, with a collector running. Asserts p95 ≤ 5 s. With `SI_RT13_BROKEN=1` it gives report-only "before" numbers.
+- **CI:** job `purge-latency`.
+
+### 15.17 Measurements (local PostgreSQL 16.15 container, fsync off)
+
+On a 1-CPU-limited container, 10 iterations per mode (broken: 6), each with a concurrent collector:
+
+| Mode | Purge p50 / p95 | Control wait p50 / p95 | Index tuples read per purge |
+|---|---|---|---|
+| Cold, 0021 (before) | 6,180 / 6,326 ms | 6,339 / 6,483 ms | 100,040,000 |
+| Cold, 0022 | 830 / 1,013 ms | 997 / 1,248 ms | 40,000 |
+| Warm, 0021 (before) | 771 / 1,000 ms | 991 / 1,171 ms | 30,002 |
+| Warm, 0022 | 859 / 968 ms | 1,033 / 1,136 ms | 30,002 |
+
+Warm is unchanged within noise. The cold defect no longer reproduces.

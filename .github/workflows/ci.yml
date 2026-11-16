@@ -177,3 +177,31 @@ jobs:
       - name: Stop database
         if: always()
         run: docker compose down -v
+
+  purge-latency:
+    # M4-P3.1-RT13-01 (migration 0022): emergency-control latency against a maximum purge batch under contention, cold and
+    # warm statistics (p95 <= 5 s, unchanged RT-13 / M3-T14 bound; structural O(rows) bound), and the deliberate break.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start PostgreSQL 16 (localhost only)
+        run: docker compose up -d --wait db
+      - run: npm ci
+      - run: npm run build
+      - name: Purge latency p50/p95 under contention (cold and warm statistics; 10 iterations each)
+        run: SI_RT13_N=10 node tests/db/run.mjs tests/slow/m4-rt13-purge-bench.test.mjs
+      - name: Purge latency without the 0022 index (report only; the "before" numbers)
+        run: SI_RT13_BROKEN=1 SI_RT13_N=3 SI_RT13_MODES=cold node tests/db/run.mjs tests/slow/m4-rt13-purge-bench.test.mjs
+      - name: Deliberate break of 0022 (RTX1, RTX2 killed by PF-1 cold; file restored)
+        run: CI=true node tests/mutations/m4-rt13-purge-fk.mjs
+      - name: Database logs on failure
+        if: failure()
+        run: docker compose logs db
+      - name: Stop database
+        if: always()
+        run: docker compose down -v

@@ -1,0 +1,18 @@
+-- B-002 migration 0022: M4-P3.1-RT13-01 (emergency purge latency; synthetic only). Contract: docs b002-m4-intelligence.md
+-- §15C. Adds exactly one index; no function, trigger, constraint, privilege or row changes.
+--
+-- Root cause. si_purge_due deletes the identities (si.ads) whose last observation it has just deleted. Each deleted ad
+-- fires the ON DELETE RESTRICT check of observations_ad (0005), whose RI query is
+--   SELECT 1 FROM ONLY si.observations x WHERE ad_id = $1 AND source_id = $2 AND network = $3 AND native_ad_id = $4
+--   FOR KEY SHARE OF x
+-- No index covered those columns. With statistics the planner uses observations_by_ad (0006); without statistics
+-- (never analyzed: reltuples 0) it ANDs observations_by_ad with observations_by_source_advertiser_key (0015, leading
+-- source_id), whose bitmap reads EVERY index entry of the source per lookup: 10,000 ads x 10,000 entries = 1e8 index
+-- tuples for a maximum batch (measured), about 3 s locally and 6-10 s on CI, against the 5 s emergency-control bound
+-- (M3-T14, RT-13). Which plan runs depended on whether autovacuum had analyzed si.observations: the RT-13 bimodality.
+--
+-- Fix. An index whose key is exactly the foreign key's columns, in the FK's order. Every RI qual is then an index
+-- condition of one btree, the lookup is O(log n) under any statistics (analyzed, never analyzed, stale), and the
+-- planner has no cheaper alternative to prefer. The FK, its RESTRICT action, the purge function, its lock order and its
+-- audit are unchanged. observations_by_ad is kept (readers' plans are not touched).
+CREATE INDEX observations_by_ad_fk ON si.observations (ad_id, source_id, network, native_ad_id);

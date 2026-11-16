@@ -61,6 +61,7 @@ serving), no live collection, no production deployment.
 | 0019 | readability hardening: `si_readable_runs_at` derives unsupported networks from the network values stored for the source's evidence (no fixed network list); the single-snapshot (STABLE) invariant documented and tested under READ COMMITTED | M4-P3.0.1, conditionally accepted (M4-P3.0.1-ACCEPT-01); its documentation and operational condition resolved by M4-P3.0.1-CLOSE-01 (`db/ops/` integrity gate and FK_AUDIT, docs §14.9), pending acceptance |
 | 0020 | immutable per-run advertiser summaries and a per-source identity dictionary (storage foundation; written atomically with publication, backfilled, verified, removed with purge; no reader reads them yet); observations insertable only into a RUNNING run | M4-P3.1, pending independent acceptance |
 | 0021 | summary eligibility cost (C1 of M4-P3.1-ACCEPT-01): `si_summary_coverage` evaluates the normalizer fingerprint once per call and anti-joins two new indexes (merge plan pinned); same eligibility semantics, nothing cached | M4-P3.1-CLOSE-01, pending independent acceptance |
+| 0022 | emergency-purge latency (R-28, M4-P3.1-RT13-01): an index on `si.observations` whose key is exactly the `observations_ad` FK key, so each ON DELETE RESTRICT check in the purge is one btree lookup under any statistics (it was a scan of every index entry of the source with no statistics); nothing else changes | M4-P3.1-RT13-01, pending independent acceptance |
 
 ```bash
 docker compose up -d --wait db   # local/test only, bound to 127.0.0.1

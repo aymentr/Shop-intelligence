@@ -75,7 +75,7 @@ try {
     await provisionReaderPrincipal(root, READER, ROLE_PW);
     await root.query(`DROP DATABASE IF EXISTS ${DB}`); await root.query(`CREATE DATABASE ${DB}`);
     A = await conn('si_bootstrap'); await bootstrapDatabase(A);
-    assert.deepEqual(await migrateUp(await conn('si_migrator')), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+    assert.deepEqual(await migrateUp(await conn('si_migrator')), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]);
     report.schema_version = codeSchemaVersion();
     [col, ra, mon, rd] = await Promise.all(['si_collector', 'si_rights_admin', 'si_monitor', READER].map(u => conn(u)));
     await A.query('BEGIN'); await A.query('SET LOCAL ROLE si_owner');
