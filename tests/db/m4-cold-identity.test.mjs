@@ -42,7 +42,7 @@ test.before(async () => { const a = await connect(); try { await provisionReader
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 70)}`); return text.replace(from, to); }
 const fnText = (start, end) => { const s = MIG16.indexOf(start); return MIG16.slice(s, MIG16.indexOf(end, s) + end.length); };
 const SEARCH_FN = fnText('CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;');
-const HISTORY_FN = fnText('CREATE OR REPLACE FUNCTION si.si_advertiser_history', 'END $history$;');
+const HISTORY_FN = latestDefinition('si_advertiser_history', 'END $history$;').text;   // M4-P3.2: history is no longer in the search function's file (0023)
 const MIG15 = readFileSync(new URL('../../db/migrations/0015_intelligence_remediation.up.sql', import.meta.url), 'utf8');
 /** The 0015 history function (readable runs joined inside the page statement), with the 0016 plan_cache_mode pin added,
  *  so that the mutant differs from 0016 only in the N1 change. */

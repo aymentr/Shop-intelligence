@@ -1507,3 +1507,87 @@ SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'si.observations'::re
 4. Record migration 0022 as applied, with its checksums, under the migrator's advisory lock.
 
 This is a future deployment requirement. Migration 0022 is unchanged here and no production migration was run.
+
+## 16. M4-P3.2: summary-backed advertiser search (migration 0023)
+
+**Status:** branch `claude/b002-m4-p3-2-implement-01` from the accepted baseline `0ca6ba8` (unchanged; 0020, 0021 and 0022 are checksum-pinned by tests). Pending independent acceptance. Synthetic data only. Data-carrying deployment, the real-evidence pilot and production remain NO-GO.
+
+### 16.1 What changes
+
+Migration 0023 replaces exactly `si_search_advertisers`. The 0018 text is kept line for line (M1w checks that it is a subsequence of the 0023 text) and one block is **added** after the readable-run selection:
+
+```
+request ─► argument checks ─► intent claim (durability gate) ─► source FOR SHARE ─► grant ─► availability
+        ─► readable runs R (si_readable_runs: live readability at one instant; unchanged)
+        ─► si_summary_coverage(source)            once per request (C1 contract, unchanged)
+              eligible ──► summary statement (one snapshot):
+                             guard = no open drift AND every run in R has a status under the current fingerprint
+                             guard true  ──► page from identities + summary rows of R   (path: summary)
+                             guard false ──┐
+              not eligible ────────────────┴─► the 0018 observation statement, unchanged (path: observations)
+        ─► observation cap, byte bound, intent CONSUMED, request audit   (unchanged)
+```
+
+- **Summary statement.** Identities of the source under the current fingerprint whose normalized name contains the normalized query (`strpos`, as before), their summary rows restricted to `R` and to the requested networks (a correlated index probe per identity, then a hashed membership test on `R`), then:
+  - the observation count of every matching row, for the unchanged cap (`SI_READ_SCAN_LIMIT` above 200,000 matching observations, exactly as before);
+  - the page's identities in `COLLATE "C"` order after the cursor (exclusive or inclusive, as before), `p_limit + 1` of them;
+  - for those only: observations (sum), distinct ads (`|union of ad_ids|`, D1), runs, first/last observed (the runs' `finished_at`), networks and spellings (union of the per-run `names`, sorted, first 10, truncation flag).
+- **Response document, ordering, cursor format, bounds, error codes, grant check, availability check, intent, durability gate, lock order, request audit and pinned settings are the 0018 ones.** No table, column, index, grant, cache or stored decision is added. Privileges, owner, SECURITY DEFINER, volatility and settings are unchanged (M1w). Down restores the exact 0022 catalog.
+- **Path signal.** The function raises `DEBUG 'SI_READ_PATH summary|observations'` (visible only to a session that asks for debug messages; not logged at the default `log_min_messages`). Tests and benchmarks use it; the response is unchanged.
+
+### 16.2 Reader semantics kept, and why history is unchanged
+
+| Contract item | How it is kept on the summary path |
+|---|---|
+| Live authorization | Same grant check, under the same source lock, every request; nothing cached. |
+| Live readability | The page uses only summary rows of `R`, computed by the unchanged `si_readable_runs` in the same request. A verdict invalidated, a retention ended, a suspension or a rights change after publication takes effect on the next request (SS-3). |
+| No cross-source leakage | Identities and summary rows are filtered by `source_id`; the composite FKs of 0020 make a summary row's run and identity belong to its source. SS-1 uses two sources sharing names. |
+| Exact distinct-ad unions | `count(DISTINCT ad_id)` over the union of the rows' `ad_ids` (`ad_id` ↔ `(source, network, native_ad_id)`); SS-1b, SSX3. |
+| Normalization | Identity = the normalized name under the current fingerprint (0020 D2/D4); the query is normalized by the same function. |
+| Ordering, cursors, `has_more`, limits | Same expressions (`COLLATE "C"`, inclusive equality, `p_limit + 1`). |
+| Resource limits | Same observation cap (counted from the summary rows' `observations`), byte bound, statement timeout, `work_mem`, `temp_file_limit`; SS-6, SS-9 (no temporary file with 18,000-character names over 150 runs). |
+| No cross-page snapshot | Unchanged: each page is its own request; the library's state-token checks are unchanged. |
+
+**History is not switched (decision, reported).** `si_advertiser_history` returns per-observation rows (title, URL, content digest, `seen_at`) and `source_reported_first_seen` / `source_reported_last_seen`, none of which the frozen 0020 summaries hold. A summary-backed history would still have to read every observation of the advertiser, so it would add a second path without removing the observation read. History is already selected by the advertiser-key index (0015/0016), O(observations of that advertiser), not O(observations of the source); its cost is dominated by the readable-run selection (§14.5, §16.5). Changing this requires extending the summary foundation (a new migration and verification scope), which is outside "the smallest safe transition" and was not done (R-47).
+
+### 16.3 Fallback and safety
+
+| Situation | Behavior | Test |
+|---|---|---|
+| A run without status (never summarized, or rows removed) | coverage `INCOMPLETE` → observation path; exact | SS-2a |
+| Stale normalizer fingerprint (ICU or major-version change) | every run STALE → observation path until backfill re-derives | SS-2b |
+| Incomplete coverage outside the requested period | observation path (coverage is source-wide: conservative) | SS-2c |
+| Coverage wrong or raced (an always-eligible copy installed) | the in-statement guard falls back on a status gap or open drift | SS-2d, SSX2, SSX9 |
+| Missing identity / corrupt or mismatched summaries (owner or superuser tampering) | **served** until `si_verify_summaries` records drift (contract B); from then on the observation path, exactly; rebuild and a clean verification restore the summary path | SS-8 |
+| Purge during a read | the purge takes the source `FOR NO KEY UPDATE SKIP LOCKED`: it skips a source a reader holds and removes nothing; afterwards it purges; answers exact | SS-4b |
+| Backfill during reads | each answer equals the oracle; observation path until coverage is complete, then summary | SS-4c |
+| Publication during reads | each answer equals the oracle of a readable state the publisher committed | SS-4d |
+| SUSPEND / TERMINATE_RETENTION during a read | the control waits for the reader's lock; the page is the pre-control answer; the next request sees the control | SS-4a, SSX11 |
+
+**Why exactness holds (trusted owner).** A run's summary rows and status are written in the transaction that completes it (0020 D5) and are removed only by a purge (excluded while the reader holds the source), as STALE (another fingerprint; the guard checks the fingerprint) or under open drift (rebuild; the guard checks drift). The guard runs in the same statement, so the same snapshot, as the page. Content is not recomputed on the read path: doing so would be the observation scan this phase removes. Content integrity therefore rests on the 0020 immutability controls, the integrity gate, and the **mandatory** `db/ops/verify-summaries.sql` (§15.8; DR-1 runs it). SS-8 demonstrates the boundary: tampering is visible in answers until verification records the drift.
+
+### 16.4 Tests (`tests/db/m4-summary-search.test.mjs`) and deliberate breaks
+
+The oracle is computed in JavaScript from raw observations: runs readable by the unchanged per-run predicate `si_evidence_readable` (0007), the period, the networks, the normalizer (database), grouping, distinct `(network, native_ad_id)` pairs, UTF-8 byte order, cursors, `has_more` and the cap. Every SS-1 request is checked on the summary path and on the forced observation path (owner drift event), with an extra inclusive request at each page boundary.
+
+- SS-1 (3 seeds): 226–242 pages and 144–168 inclusive positions per seed, two sources, 3 networks, fullwidth, combining marks, ligatures, `ß`/`SS`, dotted İ, emoji, ideographic space, 1,000-character names, 12 spellings (truncation), INVALID/pending/expired runs, period and network filters.
+- SS-2a–d fallback; SS-3 security; SS-4a–d concurrency; SS-5 pagination boundaries (limits 1/2/50, inclusive/exclusive, positions between and beyond names, U+10FFFF); SS-6 caps at the exact boundary (cap = matching observations − 1 and = matching observations) and the byte bound, both paths; SS-7 malformed inputs identical on both paths; SS-8 trusted-owner boundary; SS-9 18,000-character names, no temporary file.
+- Existing suites now exercise the summary path (their sources are eligible): SRV-*, REM-*, COLD-*, IDG-*, INT-*, SUM-4 (search identical before and after backfill). The SRV-M mutant "search distinct ads counted as observations" now breaks the summary union; its observation-path twin is SSX10.
+
+`tests/mutations/m4-p32-search.mjs` (CI job `summary-search`), each mutant killed by its named detector, file restored byte for byte, restored baseline green:
+
+| Mutant | Break | Detector |
+|---|---|---|
+| SSX1 | unsafe fallback: summary path whatever eligibility and the guard say | SS-2a |
+| SSX2 | guard no longer requires a status for every readable run | SS-2d |
+| SSX3 | distinct ads lose the union | SS-1b |
+| SSX4 | stale readability: summary rows of runs not readable now | SS-3 |
+| SSX5 | authorization bypass (grant check omitted) | SS-3 |
+| SSX6 | network filter ignored on the summary path | SS-1 |
+| SSX7 | inclusive cursor ignored on the summary path | SS-5 |
+| SSX8 | observation cap ignored on the summary path | SS-6 |
+| SSX9 | open drift ignored by the guard | SS-2d |
+| SSX10 | observation path: distinct ads counted as observations | SS-1 |
+| SSX11 | source lock omitted | SS-4a |
+
+DR-1 runs SS-0, SS-1 (seed 11), SS-1b, SS-2a, SS-3 and SS-8 on the restored cluster.

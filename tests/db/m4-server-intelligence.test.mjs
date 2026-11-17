@@ -368,7 +368,7 @@ test('SRV-7: bounds — candidate cap, response cap and spelling cap fail closed
   await collect(x, src, Array.from({ length: 12 }, (_, i) => AD(`Northwind Synthetic${' '.repeat(i % 2)}${i > 5 ? '' : ''}`, `b${i}`, { advertiserName: `NorthWind ${String.fromCharCode(65 + i)}`.replace(/ [A-L]$/, m => m) })));
   const alice = await reader(x);
   const fn = (name, end) => { const s = MIG_FN.indexOf(`CREATE OR REPLACE FUNCTION si.${name}`); return MIG_FN.slice(s, MIG_FN.indexOf(end, s) + end.length); };
-  const SEARCH_FN = fn('si_search_advertisers', 'END $search$;'), HISTORY_FN = fn('si_advertiser_history', 'END $history$;');
+  const SEARCH_FN = fn('si_search_advertisers', 'END $search$;'), HISTORY_FN = latestDefinition('si_advertiser_history', 'END $history$;').text;
   await asOwner(x.admin, a => a.query(SEARCH_FN.replace('max_candidates constant int := 200000;', 'max_candidates constant int := 3;')));
   assert.equal(await libOutcome(INTEL.searchAdvertisers(alice, { sources: [src], query: 'northwind' })), 'INTEL:SCAN_LIMIT');
   await asOwner(x.admin, a => a.query(SEARCH_FN.replace('max_bytes constant int := 262144;', 'max_bytes constant int := 300;')));
@@ -391,7 +391,7 @@ test('SRV-7: bounds — candidate cap, response cap and spelling cap fail closed
 function fnText(start, end, mig = MIG_FN) { const s = mig.indexOf(start); return mig.slice(s, mig.indexOf(end, s) + end.length).replace(/^CREATE FUNCTION/, 'CREATE OR REPLACE FUNCTION'); }
 function mutate(text, from, to) { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 70)}`); return text.replace(from, to); }
 const SEARCH_FN = fnText('CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;');
-const HISTORY_FN = fnText('CREATE OR REPLACE FUNCTION si.si_advertiser_history', 'END $history$;');
+const HISTORY_FN = latestDefinition('si_advertiser_history', 'END $history$;').text;   // M4-P3.2: history is no longer in the search function's file (0023)
 const STATE_FN = fnText('CREATE FUNCTION si.si_availability_state', 'END $availability_state$;', MIG14);
 const GRANT = 'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g';
 async function revokedBetween(x, src, kind) {                                 // the intent is taken while granted, the call made after the revocation
@@ -457,8 +457,10 @@ const DB_MUTANTS = [
   { name: 'history identity by substring', scenario: scnIdentity, baseline: 'ok:1', mutant: 'ok:2',
     sql: mutate(mutate(HISTORY_FN, 'si.si_advertiser_key(o.advertiser_name) = nk', 'strpos(si.si_normalize_advertiser(o.advertiser_name), nn) > 0'),
                 'IF same_identity IS NOT TRUE THEN', 'IF false THEN') },          // 0015: selector and identity guard both removed
+  // M4-P3.2 (0023): scnDistinct's source is summary-eligible, so its page comes from the summaries; the mutant breaks the
+  // union of ad_ids there. The observation-path variant runs on a forced fallback in m4-summary-search (SSX-3).
   { name: 'search distinct ads counted as observations', scenario: scnDistinct, baseline: 'value:1', mutant: 'value:2',
-    sql: mutate(SEARCH_FN, 'count(DISTINCT (c.network, c.native_ad_id))::int AS distinct_ads', 'count(*)::int AS distinct_ads') },
+    sql: mutate(SEARCH_FN, 'count(DISTINCT u.ad_id)::int AS distinct_ads', 'count(u.ad_id)::int AS distinct_ads') },
   { name: 'server state token ignores the source row version', scenario: scnStateRowVersion, baseline: 'INTEL:AVAILABILITY_CHANGED', mutant: 'ok:3',
     sql: mutate(STATE_FN, "p_who, p_source_id, cs.row_version,", 'p_who, p_source_id,') }
 ];

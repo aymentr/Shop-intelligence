@@ -207,3 +207,29 @@ jobs:
       - name: Stop database
         if: always()
         run: docker compose down -v
+
+  summary-search:
+    # M4-P3.2 (migration 0023): complete summary-backed search and history requests at 1,000 / 10,000 / 30,000 runs, before
+    # (0018) and after (0023, summary path and forced fallback), cold, warm and under publication and purge; and the SSX campaign.
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start PostgreSQL 16 (localhost only)
+        run: docker compose up -d --wait db
+      - run: npm ci
+      - run: npm run build
+      - name: Summary-backed reader requests at 1,000 / 10,000 / 30,000 runs (identical pages on all three variants; summary p95 <= 100 / 400 ms asserted at 10,000 / 30,000)
+        run: SI_SSB_RUNS=1000,10000,30000 node tests/db/run.mjs tests/slow/m4-summary-search-bench.test.mjs
+      - name: Summary-search mutation campaign SSX1-SSX11 (unsafe fallback, authorization, distinct union, stale readability, ...; file restored)
+        run: CI=true node tests/mutations/m4-p32-search.mjs
+      - name: Database logs on failure
+        if: failure()
+        run: docker compose logs db
+      - name: Stop database
+        if: always()
+        run: docker compose down -v

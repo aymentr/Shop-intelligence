@@ -270,4 +270,11 @@ SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_res
   SI_TEST_TEMPLATE=si_template_test \
   node --test --test-name-pattern='^(CV-1|TB-1|CC-MX7):' tests/db/m4-summaries-close.test.mjs
 echo 'DR-1 restored summary verification (0021, M4-P3.1-CLOSE-01): verify-summaries PASS, owner tampering detected by verification PASS'
+# M4-P3.2 (0023): summary-backed search on the restored cluster equals the observation oracle on both paths, keeps
+# authorization and availability live, and falls back exactly when status is missing or drift is open.
+SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
+  SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \
+  SI_TEST_TEMPLATE=si_template_test \
+  node --test --test-name-pattern='^SS-(0|1 \(seed 11\)|1b|2a|3|8):' tests/db/m4-summary-search.test.mjs
+echo 'DR-1 restored summary-backed search (0023, M4-P3.2): oracle equivalence on both paths, live authorization, exact fallback PASS'
 echo 'DR-1 RESULT: PASS (fresh-cluster logical restore and security checks)'

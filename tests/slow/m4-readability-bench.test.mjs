@@ -45,7 +45,7 @@ const M16 = mig('0016_cold_query_reliability.up.sql');
 const FN16 = [cut(M16, 'CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;'), cut(M16, 'CREATE OR REPLACE FUNCTION si.si_advertiser_history', 'END $history$;')];
 const L = latestDefinition('si_search_advertisers', 'END $search$;');
 const FN18 = [L.text, latestDefinition('si_advertiser_history', 'END $history$;').text];
-assert.equal(L.file, '0018_set_based_readability.up.sql');
+assert.equal(L.file, '0023_summary_backed_search.up.sql');   // M4-P3.2: the active search (0023) keeps the 0018 readable-run selection; its page is summary-backed (tests/slow/m4-summary-search-bench)
 
 test.before(async () => { const a = await connect(); try { await provisionReaderPrincipal(a, 'si_reader_alice', cfg.rolePassword); } finally { await a.end(); } });
 

@@ -232,7 +232,7 @@ test('REM-2 (D2): a history above the library bound is refused after one page', 
 const fnText = (start, end) => { const s = MIG_FN.indexOf(start); return MIG_FN.slice(s, MIG_FN.indexOf(end, s) + end.length); };
 const mutate = (text, from, to) => { assert.equal(text.split(from).length, 2, `exactly one anchor: ${from.slice(0, 70)}`); return text.replace(from, to); };
 const SEARCH_FN = fnText('CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;');
-const HISTORY_FN = fnText('CREATE OR REPLACE FUNCTION si.si_advertiser_history', 'END $history$;');
+const HISTORY_FN = latestDefinition('si_advertiser_history', 'END $history$;').text;   // M4-P3.2: history is no longer in the search function's file (0023)
 const SETTINGS = "concat_ws(' / ', current_setting('work_mem'), current_setting('hash_mem_multiplier'), current_setting('max_parallel_workers_per_gather'), current_setting('jit'), current_setting('temp_file_limit'), current_setting('statement_timeout'))";
 const PINNED = '4MB / 2 / 0 / off / 256MB';
 
