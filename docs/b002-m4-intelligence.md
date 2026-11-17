@@ -1363,3 +1363,44 @@ On a 1-CPU-limited container, 10 iterations per mode (broken: 6), each with a co
 | Warm, 0022 | 859 / 968 ms | 1,033 / 1,136 ms | 30,002 |
 
 Warm is unchanged within noise. The cold defect no longer reproduces.
+
+On the full 4-CPU host, 10 iterations per mode (broken: 5), each with a concurrent collector, at `79d722f`:
+
+| Mode | Purge p50 / p95 | Control wait p50 / p95 | Index tuples read per purge |
+|---|---|---|---|
+| Cold, 0021 (before) | 2,855 / 2,875 ms | 2,913 / 2,975 ms | 100,040,000 |
+| Cold, 0022 | 418 / 487 ms | 483 / 577 ms | 40,000 |
+| Warm, 0021 (before) | 459 / 531 ms | 525 / 662 ms | 30,002 |
+| Warm, 0022 | 445 / 578 ms | 518 / 646 ms | 30,002 |
+
+External lock contention, measured separately from execution:
+- The purge backend was in a lock wait in 0 of 834 / 919 samples (fixed) and 0 of 2,290 (broken).
+- Each control waited only for the purge holding its own source (PF-4).
+- Purges of different sources never blocked each other. A collector on another source was never blocked.
+
+RT-13 itself, unchanged, at `79d722f`:
+
+| Run | Maximum purge | Control wait |
+|---|---|---|
+| Three suite passes | 500–618 ms | 471–587 ms |
+| 29 targeted runs | 487–792 ms | 465–762 ms |
+
+**One targeted run failed** (1 of 30) before its timing line was printed, so it was not a timing assertion. The server logged no error. The failure message was not captured (filtered output). The 20 reruns with full output all passed. A pre-existing barrier race is the candidate (R-44).
+
+**Write path and other contracts.** One run of `m4-coverage-bench` measured warm p95 15.79 ms against the 15 ms C1 contract (p50 14.56 ms; the earlier 90d6c46 run measured 8.63 / 9.67 ms) with the same plan and buffers. Eligibility does not read `si.observations`. On one 30,000-run database, alternating with and without the 0022 index (3 rounds each):
+
+| Phase | With the index | Without the index |
+|---|---|---|
+| Warm p95 | 9.67 / 9.96 / 13.52 ms | 9.77 / 9.81 / 10.01 ms |
+| Warm p50 | 8.69–8.88 ms | 8.48–8.56 ms |
+| Cold p95 | 25.6–30.0 ms | 24.3–39.3 ms |
+
+After a container restart (new host), the coverage bench missed the C1 limits again, and so did the baseline:
+
+| Commit | Cold p95 | Result |
+|---|---|---|
+| `79d722f` (with 0022) | 40.13 ms | NOT MET |
+| `90d6c46` (control, no 0022) | 43.63 ms | NOT MET |
+
+The C1 margin is a property of the host and pre-existing (R-39), not an effect of 0022. Hosted CI measured 6.85 / 17.1 ms (CI #140). The limits are not relaxed.
+
