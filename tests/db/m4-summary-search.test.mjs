@@ -321,6 +321,47 @@ test('SS-2d: the in-statement guard falls back even when eligibility is wrong (c
   await both(x, alice, s, R('north'), 'summary');
 });
 
+// M4-P3.2-CLOSE-01 (IM7 of M4-P3.2-ACCEPT-01): the guard's CURRENT-FINGERPRINT clause, decisive on its own. Double fault, in
+// this disposable database only: eligibility is wrong (an always-eligible coverage copy, as SS-2d) AND the normalizer
+// fingerprint changed (as SS-2b) before any backfill. Every readable run still has a status, so a guard that only counted
+// statuses would pass; but every status, identity and summary row carries the OLD fingerprint, so a summary page under the
+// current fingerprint finds no identity and would answer differently from the oracle. Only `ss.normalizer = fp` in the
+// guard sends the request to the observation path.
+test('SS-2e: wrong eligibility AND a stale fingerprint: the guard rejects statuses of the old fingerprint and the observation path answers exactly', async t => {
+  const x = await fresh(t);
+  const { s } = await small(x);
+  const alice = await reader(x);
+  await both(x, alice, s, R('north'), 'summary');
+  const old = (await x.admin.query('SELECT si.si_normalizer_fingerprint() AS f')).rows[0].f;
+  await asOwner(x.admin, a => a.query(`CREATE OR REPLACE FUNCTION si.si_summary_coverage(p_source_id text) RETURNS TABLE (eligible boolean, reasons text[])
+                                         LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp AS $c$ SELECT true, '{}'::text[] $c$`));   // WRONG ELIGIBILITY
+  await asOwner(x.admin, a => a.query(`CREATE OR REPLACE FUNCTION si.si_normalizer_fingerprint() RETURNS text LANGUAGE sql STABLE SET search_path = pg_catalog, pg_temp
+                                         AS $f$ SELECT 'v1|icu=simulated-upgrade|pg=16' $f$`));                                                 // NORMALIZER CHANGE
+  const cur = (await x.admin.query('SELECT si.si_normalizer_fingerprint() AS f')).rows[0].f;
+  assert.notEqual(cur, old);
+  // The state in which only the fingerprint clause can refuse the summary path:
+  const st = (await x.admin.query(`
+    WITH rr AS (SELECT si.si_readable_runs($1, NULL, NULL) AS a)
+    SELECT (SELECT (si.si_summary_coverage($1)).eligible) AS eligible, si.si_summary_drift_open($1) AS drift,
+           (SELECT cardinality(a) FROM rr) AS readable,
+           (SELECT count(*)::int FROM si.run_summary_status ss, rr WHERE ss.run_id = ANY (rr.a) AND ss.source_id = $1) AS statuses,
+           (SELECT count(*)::int FROM si.run_summary_status ss, rr WHERE ss.run_id = ANY (rr.a) AND ss.source_id = $1 AND ss.normalizer = $2) AS statuses_old,
+           (SELECT count(*)::int FROM si.run_summary_status ss WHERE ss.source_id = $1 AND ss.normalizer = $3) AS statuses_current,
+           (SELECT count(*)::int FROM si.advertiser_identities i WHERE i.source_id = $1 AND i.normalizer = $3) AS identities_current,
+           (SELECT count(*)::int FROM si.advertiser_identities i WHERE i.source_id = $1 AND i.normalizer = $2) AS identities_old`, [s, old, cur])).rows[0];
+  assert.ok(st.readable > 0, JSON.stringify(st));
+  assert.deepEqual(st, { eligible: true, drift: false, readable: st.readable, statuses: st.readable, statuses_old: st.readable, statuses_current: 0,
+                         identities_current: 0, identities_old: st.identities_old }, 'precondition: wrong eligibility, no drift, a status for every readable run, all of the OLD fingerprint');
+  assert.ok(st.identities_old > 0);
+  for (const r of [R('north'), R('contoso', { limit: 1 }), R('labs'), R('synthetic', { n: ['META'] })]) {
+    const want = await oracle(x, s, r);
+    assert.ok(want.out === 'ok' && want.doc.hits.length > 0, `precondition: the oracle answer for ${r.q} is not empty (a summary page under the current fingerprint would be): ${JSON.stringify(want).slice(0, 200)}`);
+    const got = await search(alice, s, r);
+    assert.equal(got.path, 'observations', `${r.q}: statuses of the old fingerprint must not admit the summary path (IM7)`);
+    assert.deepEqual(got, { ...want, path: 'observations' }, `${r.q}: the observation path answers exactly`);
+  }
+});
+
 // ------------------------------------------------------------------------------------------------ SS-3 security
 test('SS-3: authorization, availability and readability stay live on the summary path', async t => {
   const x = await fresh(t);

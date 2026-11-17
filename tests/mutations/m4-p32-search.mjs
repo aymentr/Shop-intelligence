@@ -41,6 +41,9 @@ const M = [
     edits: [['count(DISTINCT (c.network, c.native_ad_id))::int AS distinct_ads', 'count(*)::int AS distinct_ads']], detector: /^not ok \d+ - SS-1 \(seed 11\)/m },
   { id: 'SSX11', why: 'source lock omitted (controls no longer wait for the summary page)',
     edits: [['PERFORM 1 FROM si.sources x WHERE x.source_id = p_source_id FOR SHARE;', 'PERFORM 1 FROM si.sources x WHERE x.source_id = p_source_id;']], detector: /^not ok \d+ - SS-4a:/m },
+  // M4-P3.2-CLOSE-01 (IM7 of M4-P3.2-ACCEPT-01): only the guard's current-fingerprint condition removed.
+  { id: 'SSX12', why: 'guard accepts summary statuses of any normalizer fingerprint (IM7)',
+    edits: [[' AND ss.source_id = p_source_id AND ss.normalizer = fp)', ' AND ss.source_id = p_source_id)']], detector: /^not ok \d+ - SS-2e:/m },
 ];
 const restore = () => { writeFileSync(F, original); if (!readFileSync(F).equals(original)) throw new Error(`FATAL: ${F} not restored`); console.log(`restored byte-for-byte: ${F} ${sha(original)}`); };
 const suite = () => {

@@ -1558,6 +1558,7 @@ request ─► argument checks ─► intent claim (durability gate) ─► sour
 | Stale normalizer fingerprint (ICU or major-version change) | every run STALE → observation path until backfill re-derives | SS-2b |
 | Incomplete coverage outside the requested period | observation path (coverage is source-wide: conservative) | SS-2c |
 | Coverage wrong or raced (an always-eligible copy installed) | the in-statement guard falls back on a status gap or open drift | SS-2d, SSX2, SSX9 |
+| Coverage wrong AND a stale fingerprint (statuses exist for every readable run, all of the old fingerprint) | only the guard's current-fingerprint clause refuses the summary path; the observation path answers exactly | SS-2e, SSX12 (M4-P3.2-CLOSE-01) |
 | Missing identity / corrupt or mismatched summaries (owner or superuser tampering) | **served** until `si_verify_summaries` records drift (contract B); from then on the observation path, exactly; rebuild and a clean verification restore the summary path | SS-8 |
 | Purge during a read | the purge takes the source `FOR NO KEY UPDATE SKIP LOCKED`: it skips a source a reader holds and removes nothing; afterwards it purges; answers exact | SS-4b |
 | Backfill during reads | each answer equals the oracle; observation path until coverage is complete, then summary | SS-4c |
@@ -1589,6 +1590,7 @@ The oracle is computed in JavaScript from raw observations: runs readable by the
 | SSX9 | open drift ignored by the guard | SS-2d |
 | SSX10 | observation path: distinct ads counted as observations | SS-1 |
 | SSX11 | source lock omitted | SS-4a |
+| SSX12 | guard accepts statuses of any normalizer fingerprint (IM7 of M4-P3.2-ACCEPT-01; added by M4-P3.2-CLOSE-01) | SS-2e |
 
 DR-1 runs SS-0, SS-1 (seed 11), SS-1b, SS-2a, SS-3 and SS-8 on the restored cluster.
 
@@ -1730,3 +1732,22 @@ R-47.
 - **SCALE-1.** Asserts the summary path, and keeps its pinned-memory and lock-wait checks on the forced observation path.
 - **Readability bench.** Expects 0023 as the active search definition.
 - **Migration lists.** Extended to 23.
+
+### 16.8 M4-P3.2-CLOSE-01: the fingerprint clause of the guard (IM7)
+
+**Why it was untested.**
+- SS-2b changes the fingerprint with correct eligibility, which already falls back.
+- SS-2d breaks eligibility but keeps the fingerprint, so its guard failures come from a missing status or open drift.
+- No test reached the state in which `ss.normalizer = fp` is the only failing condition, so removing it (IM7) survived both the candidate suite and the independent oracle.
+
+**SS-2e (test only; 0023 unchanged).** A double fault, created in the disposable test database: an always-eligible coverage copy (as SS-2d), then a changed normalizer fingerprint before any backfill (as SS-2b). The test first asserts the precondition:
+- eligibility says yes;
+- no drift is open;
+- every readable run has a status, all under the old fingerprint and none under the current one;
+- no identity exists under the current fingerprint, so a summary page would be empty;
+- the oracle answers are not empty.
+
+Then four requests (selective, `limit` 1, a second identity, and broad with a network filter) must each take the observation path and equal the oracle.
+
+**SSX12** removes only that clause. It is killed by SS-2e: the request takes the summary path (`'summary'` instead of `'observations'`).
+
