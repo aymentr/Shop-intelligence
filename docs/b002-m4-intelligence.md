@@ -1571,7 +1571,7 @@ request ─► argument checks ─► intent claim (durability gate) ─► sour
 The oracle is computed in JavaScript from raw observations: runs readable by the unchanged per-run predicate `si_evidence_readable` (0007), the period, the networks, the normalizer (database), grouping, distinct `(network, native_ad_id)` pairs, UTF-8 byte order, cursors, `has_more` and the cap. Every SS-1 request is checked on the summary path and on the forced observation path (owner drift event), with an extra inclusive request at each page boundary.
 
 - SS-1 (3 seeds): 226–242 pages and 144–168 inclusive positions per seed, two sources, 3 networks, fullwidth, combining marks, ligatures, `ß`/`SS`, dotted İ, emoji, ideographic space, 1,000-character names, 12 spellings (truncation), INVALID/pending/expired runs, period and network filters.
-- SS-2a–d fallback; SS-3 security; SS-4a–d concurrency; SS-5 pagination boundaries (limits 1/2/50, inclusive/exclusive, positions between and beyond names, U+10FFFF); SS-6 caps at the exact boundary (cap = matching observations − 1 and = matching observations) and the byte bound, both paths; SS-7 malformed inputs identical on both paths; SS-8 trusted-owner boundary; SS-9 18,000-character names, no temporary file.
+- SS-2a–d fallback; SS-3 security; SS-4a–d concurrency (SS-4d: about 125–140 answers during 30 publications, each equal to the oracle of one of the 31 readable states the publisher committed; 10 of 10 runs under full CPU load); SS-5 pagination boundaries (limits 1/2/50, inclusive/exclusive, positions between and beyond names, U+10FFFF); SS-6 caps at the exact boundary (cap = matching observations − 1 and = matching observations) and the byte bound, both paths; SS-7 malformed inputs identical on both paths; SS-8 trusted-owner boundary; SS-9 18,000-character names, no temporary file.
 - Existing suites now exercise the summary path (their sources are eligible): SRV-*, REM-*, COLD-*, IDG-*, INT-*, SUM-4 (search identical before and after backfill). The SRV-M mutant "search distinct ads counted as observations" now breaks the summary union; its observation-path twin is SSX10.
 
 `tests/mutations/m4-p32-search.mjs` (CI job `summary-search`), each mutant killed by its named detector, file restored byte for byte, restored baseline green:
@@ -1591,3 +1591,142 @@ The oracle is computed in JavaScript from raw observations: runs readable by the
 | SSX11 | source lock omitted | SS-4a |
 
 DR-1 runs SS-0, SS-1 (seed 11), SS-1b, SS-2a, SS-3 and SS-8 on the restored cluster.
+
+### 16.5 Performance (`tests/slow/m4-summary-search-bench.test.mjs`; local PostgreSQL 16.15 container, fsync off, 4 CPUs)
+
+**Method.**
+- One synthetic source built through the product write path. The layout is the M4-P3.0 one (§14.5): 10 observations per run, 200 advertisers plus a rare one; 5% INVALID, 3% pending and 5% expired-not-purged runs; unsupported GOOGLE evidence.
+- COLD is the build database: autovacuum off, never analyzed. WARM is a clone after VACUUM ANALYZE.
+- Every figure is a **complete library request**: intent, durability gate, lock, grant, availability, readable runs, page and audit. Each is p50 / p95 over 20 requests, after one untimed request per variant (installing a function writes catalog WAL that the gate waits to see flushed).
+- Three variants on the same data:
+  - **0018**: the pre-0023 text, installed side by side for the measurement only.
+  - **0023 summary**: the source is eligible.
+  - **0023 fallback**: an open drift event forces the observation path (eligibility call plus the 0018 statement).
+- All three variants returned **identical pages** (hits and `has_more`), or the identical typed refusal, for every query and layout (asserted).
+- Queries:
+  - *selective*: `advertiser 01`, 10 identities;
+  - *broad*: `synthetic`, every identity. At 30,000 runs it matches about 250,000 observations, so **every variant refuses it** with `SCAN_LIMIT`, the unchanged cap; the figure is the time to that refusal;
+  - *rare* and *none*: the fixed cost of a request.
+
+| Runs (readable) | State | Query | 0018 p50 / p95 | 0023 summary p50 / p95 | 0023 fallback p50 / p95 |
+|---|---|---|---|---|---|
+| 1,000 (825) | cold | selective | 62 / 97 ms | **13 / 15 ms** | 67 / 75 ms |
+| | | broad | 155 / 212 ms | **23 / 27 ms** | 152 / 184 ms |
+| | | none | 59 / 87 ms | **9 / 11 ms** | 60 / 72 ms |
+| | warm | selective | 63 / 97 ms | **15 / 22 ms** | 67 / 76 ms |
+| | | broad | 162 / 204 ms | **24 / 29 ms** | 173 / 236 ms |
+| 10,000 (8,270) | cold | selective | 650 / 748 ms | **75 / 88 ms** | 603 / 673 ms |
+| | | broad | 1,667 / 1,746 ms | **178 / 217 ms** | 1,666 / 1,773 ms |
+| | | rare | 531 / 598 ms | **51 / 80 ms** | 534 / 611 ms |
+| | | none | 523 / 571 ms | **52 / 66 ms** | 520 / 554 ms |
+| | warm | selective | 607 / 654 ms | **77 / 90 ms** | 654 / 742 ms |
+| | | broad | 1,652 / 1,782 ms | **163 / 216 ms** | 1,748 / 1,922 ms |
+| | | none | 533 / 598 ms | **52 / 79 ms** | 554 / 614 ms |
+| 30,000 (25,001) | cold | selective | 1,846 / 1,943 ms | **223 / 267 ms** | 1,801 / 1,941 ms |
+| | | broad (refused) | 3,993 / 4,215 ms | **526 / 552 ms** | 4,153 / 4,381 ms |
+| | | rare | 1,615 / 1,731 ms | **133 / 157 ms** | 1,644 / 1,793 ms |
+| | | none | 1,566 / 1,678 ms | **131 / 141 ms** | 1,639 / 1,714 ms |
+| | warm | selective | 1,801 / 1,869 ms | **220 / 238 ms** | 1,786 / 1,874 ms |
+| | | broad (refused) | 3,963 / 4,180 ms | **500 / 604 ms** | 4,023 / 4,180 ms |
+| | | none | 1,630 / 1,750 ms | **140 / 164 ms** | 1,589 / 1,683 ms |
+
+**Reading the table.**
+- Search requests are **8–12× faster** at 10,000 and 30,000 runs.
+- The fallback costs what 0018 cost; the eligibility call adds about 2–47 ms, see below.
+- The **reader floor** (*none*) at 30,000 runs, about 131–140 ms, is the readable-run selection (§14.5: 102–155 ms) plus eligibility, the guard and the request machinery. The page itself is no longer O(observations).
+- M4-P3.0 reader targets (p95 ≤ 100 ms at 10,000 runs, ≤ 400 ms at 30,000 runs):
+  - **met** for the selective, rare and empty queries, cold and warm, at both scales;
+  - **not met** for the broad query, which matches every identity: 216–217 ms at 10,000 runs, and 552–604 ms at 30,000 runs, where it is refused.
+
+  The bench asserts the targets for rare and none, and a ≥ 2× improvement at p50 for every query; the others are reported.
+
+**Under load** (a collector publishing continuously and a purge loop removing expired runs while the reader searches; 20 requests per query):
+
+| Runs | Variant | Published / purged during the measurement | Selective p50 / p95 | Rare p50 / p95 | Refusals |
+|---|---|---|---|---|---|
+| 10,000 | 0023 summary | +109 / 8 | 73 / 1,979 ms | 46 / 113 ms | 1 × `BUSY` |
+| 10,000 | 0018 | +968 / 10 | 634 / 729 ms | 572 / 2,417 ms | 2 × `BUSY` |
+| 30,000 | 0023 summary | +144 / 2 | 210 / 310 ms | 122 / 1,841 ms | 2 × `BUSY` |
+
+- Every 0023 request under load took the summary path: publication and purge keep coverage complete.
+- The p95 spikes and the `BUSY` refusals occur on both variants. A request that arrives while a purge holds the source waits for it, up to `lock_timeout` = 2 s, then gets `SI_READ_BUSY`, which the library reports for retry. The durability gate also waits for the publisher's WAL to be flushed. Both behaviors pre-date 0023 (§16.6).
+
+**The summary statement alone** (EXPLAIN ANALYZE of a verbatim copy, the request's readable runs bound as parameters):
+
+| Runs | Query | Cold | Warm |
+|---|---|---|---|
+| 10,000 | selective | 50.8 ms, 44,950 buffers | 37.7 ms, 21,810 buffers |
+| 10,000 | broad | 133 ms, 173,714 buffers | 132 ms, 137,264 buffers |
+| 30,000 | selective | 121 ms, 134,966 buffers | 98 ms, 65,226 buffers |
+| 30,000 | broad | 431 ms, 519,625 buffers | 415 ms, 409,911 buffers |
+
+- **Temporary files:** none, in any plan, at any layout.
+- **Plan shape**, the same cold and warm:
+  - the identity scan of the source;
+  - one index probe per matching identity on `run_advertiser_summaries_by_identity`, with the hashed membership test on the readable runs;
+  - a primary-key lookup of each page row's run (`finished_at`);
+  - per-identity aggregates for the page only.
+
+  An earlier draft materialized every matching summary row; it wrote about 10 MB of temporary files for the broad query at 30,000 runs and was replaced before acceptance.
+- **The guard** is an index-only scan of `run_summary_status` over the readable runs: 825 / 8,270 / 25,001 rows.
+
+**Eligibility** (`si_summary_coverage`, once per request, as the reader calls it):
+
+| Runs | Cold p50 / p95 | Warm p50 / p95 |
+|---|---|---|
+| 1,000 | 1.9 / 2.6 ms | 1.5 / 2.0 ms |
+| 10,000 | 8.7 / 12.5 ms | 4.0 / 5.1 ms |
+| 30,000 | 31.8 / 47.0 ms | 9.6 / 12.5 ms |
+
+The C1 reference contract (hosted CI, ≥ 100 calls at 30,000 runs: warm p95 ≤ 15 ms, cold p95 ≤ 40 ms) is unchanged and still asserted by `m4-coverage-bench` in the `summary-close` job. These local figures are host-dependent variation (§15.21).
+
+**At the observation cap** (`tests/slow/m4-remediation-scale.test.mjs`, SCALE-1: one source, 200,000 observations of one advertiser in 400 runs, local):
+
+| Search | 0023 summary path | Observation path (forced fallback, = 0018) |
+|---|---|---|
+| Concentrated (200,000 candidates) | **46 ms, 0 MB** temporary files | 3,000 ms, 52 MB temporary files (49.8 MB with the reader's `work_mem = 1GB`: the pinned setting still applies) |
+| No match | **8 ms** | 992 ms |
+
+SCALE-1 now asserts the summary-path outcome with no temporary file, and keeps its pinned-memory and lock-wait checks on the observation statement.
+
+**History (unchanged by 0023)**, the complete library request with all pages:
+
+| Runs | Rare advertiser (1 page) | Frequent advertiser |
+|---|---|---|
+| 1,000 | 7–10 ms | 9–14 ms |
+| 10,000 | 29–42 ms | 179–297 ms (5 pages) |
+| 30,000 | 86–106 ms | 1.5–2.0 s (15 pages: about 100–130 ms per page, each page re-reading the readable runs and the advertiser's observations) |
+
+R-47.
+
+### 16.6 Limitations and risks
+
+1. **Trusted owner (R-46).** The read path checks structural completeness in the page's snapshot, not content. Owner or superuser tampering with summary rows is served until verification records the drift (SS-8). Scheduled `verify-summaries.sql` is part of the deployment contract.
+2. **History is not summary-backed (R-47).** See §16.2. Frequent advertisers at 30,000 runs take about 1.5–2.0 s for a complete multi-page history.
+3. **Fallback is silent (R-48).** An ineligible source returns to the 0018 latency; no counter records it.
+4. **The observation cap is kept (R-49).** The broad query at 30,000 runs is refused exactly as before, only faster.
+5. **The reader floor is the readable-run selection.** It is O(readable runs of the source): about 130–165 ms of every request at 30,000 runs, the selection plus eligibility and the guard. Period-bounded readability and eligibility are a further design step (R-39).
+6. **Contention, unchanged.** A reader waits for a purge that holds the source (up to `lock_timeout` = 2 s, then `SI_READ_BUSY`). The durability gate waits for concurrent WAL to be flushed (R-26 class), on both paths (§16.5, load).
+7. **Unchanged.** R-26, R-29, R-37, R-39, R-40, R-42 and R-45 remain open. Data-carrying deployment, the real-evidence pilot and production remain NO-GO.
+
+### 16.7 Regression (local, on the candidate)
+
+| Suite | Result |
+|---|---|
+| `npm run typecheck`, `npm test`, `npm run demo` | pass; 60 / 60 unit tests |
+| `node tests/db/run.mjs` (two full passes) | 516 / 516 each: 495 earlier tests, plus M1w, the 0022 pin and SS-0–SS-9 |
+| Integrity gate and FK_AUDIT on the migrated template | 0 rows each |
+| Crash durability (AUD-12a, crash mutants, INT-19, R35) | 22 / 22 |
+| Targeted mutants step2-* (9) and D7 | all killed |
+| DR-1 clean-cluster restore | PASS, including the new summary-backed search checks |
+| M4-P3.1 campaigns: MX1–MX17, RTX1–RTX2, BX1–BX3 | every non-equivalent mutant killed; MX10 equivalent as declared |
+| SSX1–SSX11 | all killed; restored baseline green |
+| Slow: real deadlines, scheduled version, remediation scale, cold scale, readability bench (10,000), summaries bench, VR-12 | pass |
+| `m4-summary-search-bench` | 1,000 / 10,000 / 30,000 runs, §16.5 |
+
+**Changes to existing tests:**
+- **m4-remediation, m4-server-intelligence, m4-cold-identity.** Their mutant harnesses now take the history text from its own latest definition. History is not in 0023, so slicing it from the search function's file no longer works.
+- **SRV-M distinct-ads mutant.** It now targets the summary union (§16.4).
+- **SCALE-1.** Asserts the summary path, and keeps its pinned-memory and lock-wait checks on the forced observation path.
+- **Readability bench.** Expects 0023 as the active search definition.
+- **Migration lists.** Extended to 23.

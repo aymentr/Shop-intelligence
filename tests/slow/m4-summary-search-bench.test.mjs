@@ -8,12 +8,13 @@
 // For every layout, COLD (the build database: autovacuum off, never analyzed) and WARM (a clone after VACUUM ANALYZE):
 //   * search, three variants on the same data: BEFORE (the 0018 text, installed side by side for the measurement only),
 //     SUMMARY (0023, eligible source) and FALLBACK (0023 with an open drift: the observation path plus the eligibility
-//     call); four queries: selective ('advertiser 01', 10 identities), broad ('synthetic', every identity), rare, none;
+//     call); four queries: selective ('advertiser 01', 10 identities), broad ('synthetic', every identity; at 30,000 runs it
+//     matches about 250,000 observations and every variant refuses it with SCAN_LIMIT, the unchanged cap), rare, none;
 //   * history (unchanged by 0023), a rare and a frequent advertiser;
 //   * eligibility alone (si_summary_coverage), and the plans (EXPLAIN ANALYZE, BUFFERS) of a verbatim copy of the
 //     summary statement with the request's readable runs bound as parameters (the function's own custom plan);
 //   * at the largest layout, search under concurrent publication and purge.
-// Asserted: identical documents (hits, has_more) from all three variants; the SUMMARY variant takes the summary path and
+// Asserted: identical documents (hits, has_more) or identical typed refusals from all three variants; the SUMMARY variant takes the summary path and
 // FALLBACK the observation path; no error; from 10,000 runs SUMMARY at least 2x faster than BEFORE at p50 for every query;
 // SUMMARY p95 <= the M4-P3.0 reader targets (10,000 runs: 100 ms, 30,000 runs: 400 ms) for the fixed-cost rare and empty
 // queries, cold and warm (selective and broad are reported as MET / NOT MET against the same targets). C1 (eligibility at 30,000 runs) keeps its own reference bench (m4-coverage-bench, unchanged).
@@ -95,8 +96,9 @@ async function readerSession(db) {
 /** One library search page; a request the durability gate refused once and the library retried (R-26) is counted apart. */
 async function timed(c, fn) {
   const c0 = c.calls, p0 = c.paths.length, t0 = performance.now();
-  const value = await fn();
-  return { ms: performance.now() - t0, retried: c.calls - c0 > 1, path: c.paths.slice(p0).at(-1) ?? null, value };
+  let value, refusal = null;
+  try { value = await fn(); } catch (e) { if (e?.name !== 'IntelligenceFailed') throw e; refusal = e.code; }   // a typed refusal is a complete request
+  return { ms: performance.now() - t0, retried: c.calls - c0 > 1, path: c.paths.slice(p0).at(-1) ?? null, value, refusal };
 }
 const counting = c => ({ query: (...a) => { if (String(a[0]).includes('si.si_search_advertisers(') || String(a[0]).includes('si.si_advertiser_history(')) c.calls++; return c.query(...a); } });
 const docOf = page => page.hits.map(h => ({ ...h }));
@@ -119,6 +121,9 @@ async function measure(label, db, runs) {
     ];
     for (const [v, install] of variants) {
       await install();
+      // One untimed request: installing a function writes catalog WAL, which the next request's durability gate waits to see
+      // flushed (R-26 class, not the page); the measured requests start after it.
+      await INTEL.searchAdvertisers(cc, { sources: [SRC], query: 'zzz-none', limit: 20 }).catch(() => {});
       for (const { k, q } of QUERIES) {
         const key = `${v}:${k}`; out.search[key] = []; out.paths[key] = new Set();
         for (let i = 0; i < N; i++) {
@@ -126,7 +131,7 @@ async function measure(label, db, runs) {
             const r = await timed(alice, () => INTEL.searchAdvertisers(cc, { sources: [SRC], query: q, limit: 20 }));
             if (r.retried) out.retried++; else out.search[key].push(r.ms);
             out.paths[key].add(r.path);
-            if (i === 0) out.docs[key] = JSON.stringify(docOf(r.value));
+            if (i === 0) out.docs[key] = r.refusal ? `REFUSED:${r.refusal}` : JSON.stringify(docOf(r.value));
           } catch (e) { out.errors.push(`${key}:${e.code ?? e.message}`); }
         }
       }
@@ -137,7 +142,8 @@ async function measure(label, db, runs) {
     for (const [k, name] of [['rare', 'Rare Synthetic'], ['frequent', 'Advertiser 010 Synthetic']]) {
       out.history[k] = [];
       for (let i = 0; i < N; i++) {
-        try { const r = await timed(alice, () => INTEL.advertiserHistory(cc, SRC, name)); out.history[k].push(r.ms); out.historyPages[k] = Math.ceil(r.value.observations.length / 100) || 1; }
+        try { const r = await timed(alice, () => INTEL.advertiserHistory(cc, SRC, name)); if (r.refusal) throw Object.assign(new Error(r.refusal), { code: r.refusal });
+              out.history[k].push(r.ms); out.historyPages[k] = Math.ceil(r.value.observations.length / 100) || 1; }
         catch (e) { out.errors.push(`history:${k}:${e.code ?? e.message}`); }
       }
     }
@@ -154,7 +160,7 @@ async function measure(label, db, runs) {
                        nodes: plan.filter(l => /->|^\S/.test(l)).slice(0, 40).map(l => l.replace(/\s+\(actual rows=(\d+) loops=(\d+)\)/, ' [rows $1 x$2]').replace(/\s{2,}/g, ' ').trim()) };
     }
   } finally { await admin.end().catch(() => {}); await alice.end().catch(() => {}); }
-  for (const [key, a] of Object.entries(out.search)) console.log(`# SSB ${label} ${runs} runs: search ${key.padEnd(18)} ${fmt(a)} path ${[...out.paths[key]].join('/')}`);
+  for (const [key, a] of Object.entries(out.search)) console.log(`# SSB ${label} ${runs} runs: search ${key.padEnd(18)} ${fmt(a)} path ${[...out.paths[key]].join('/')}${out.docs[key]?.startsWith('REFUSED') ? ` (${out.docs[key]})` : ''}`);
   console.log(`# SSB ${label} ${runs} runs (${out.readable} readable, ${out.observations} observations, ${out.summaryRows} summary rows): eligibility ${fmt(out.eligibility)}; history (complete, all pages) rare ${fmt(out.history.rare)}, frequent ${fmt(out.history.frequent)} (${out.historyPages.frequent} pages); R-26 retries ${out.retried}; errors ${JSON.stringify(out.errors)}`);
   for (const [k, p] of Object.entries(out.plans)) console.log(`# SSB ${label} ${runs} runs: plan (${k}) ${p.exec}; ${p.buffers}; temp nodes ${p.temp} | ${p.nodes.join(' | ')}`);
   return out;
@@ -210,23 +216,30 @@ test('SSB: complete search and history requests before and after 0023, cold and 
       const warm = await measure('WARM', warmDb, runs); check(warm); results.push(warm);
     } finally { await dropDatabase(warmDb); }
   }
-  // Under load (largest layout, build database): a collector publishing and a purge loop removing expired runs while
-  // the reader searches. Every request must take the summary path (publication and purge keep coverage complete).
-  {
+  // Under load (largest layout, build database): a collector publishing and a purge loop removing expired runs while the
+  // reader searches, with 0023 (summary path) and, for comparison, the 0018 text. Every 0023 request must take the summary
+  // path (publication and purge keep coverage complete). The durability gate waits for the publisher's WAL to be flushed
+  // on both variants (R-26 class); the comparison isolates it from the page.
+  for (const variant of ['SUMMARY', 'BEFORE']) {
     await asOwner(x.admin, a => a.query(`UPDATE si.sources SET supported_networks = '{META,TIKTOK,GOOGLE}' WHERE source_id = $1`, [SRC]));
+    await asOwner(x.admin, a => a.query(variant === 'SUMMARY' ? FN23 : FN18));
     const alice = await readerSession(db), cc = counting(alice), collector = await connect({ user: 'si_collector', database: db });
+    await INTEL.searchAdvertisers(cc, { sources: [SRC], query: 'zzz-none', limit: 20 }).catch(() => {});
     let stop = false, published = 0, purged = 0;
-    const pub = (async () => { while (!stop) { await publish(x, collector, built + published); published++; } })();
+    const pub = (async () => { while (!stop) { await publish(x, collector, built + published + (variant === 'BEFORE' ? 100000 : 0)); published++; } })();
     const pur = (async () => { while (!stop) { const r = (await x.si_retention.query('SELECT * FROM si.si_purge_due(2)')).rows[0]; if (r?.outcome === 'PURGED') purged += Number(r.runs_purged); await new Promise(z => setTimeout(z, 20)); } })();
     const load = { selective: [], rare: [] }, paths = new Set(), errors = [];
     try {
       for (let i = 0; i < N; i++) for (const [k, q] of [['selective', 'advertiser 01'], ['rare', 'rare']]) {
-        try { const r = await timed(alice, () => INTEL.searchAdvertisers(cc, { sources: [SRC], query: q, limit: 20 })); if (!r.retried) load[k].push(r.ms); paths.add(r.path); }
+        try { const r = await timed(alice, () => INTEL.searchAdvertisers(cc, { sources: [SRC], query: q, limit: 20 })); if (r.refusal) errors.push(r.refusal); if (!r.retried) load[k].push(r.ms); paths.add(r.path); }
         catch (e) { errors.push(e.code ?? e.message); }
       }
     } finally { stop = true; await pub; await pur; await collector.end(); await alice.end(); }
-    console.log(`# SSB LOAD ${built} runs (+${published} published, ${purged} purged during the measurement): search selective ${fmt(load.selective)}, rare ${fmt(load.rare)}; paths ${[...paths].join('/')}; errors ${JSON.stringify(errors)}`);
-    assert.deepEqual(errors, []); assert.deepEqual([...paths], ['summary']);
+    console.log(`# SSB LOAD ${variant} ${built} runs (+${published} published, ${purged} purged during the measurement): search selective ${fmt(load.selective)}, rare ${fmt(load.rare)}; paths ${[...paths].join('/')}; refusals ${JSON.stringify(errors)}`);
+    // BUSY (SI_READ_BUSY: the source lock was not granted within lock_timeout = 2 s because a purge held it) is the
+    // documented typed refusal of both variants under a concurrent purge; anything else fails.
+    assert.deepEqual(errors.filter(e => e !== 'BUSY'), [], `${variant} under load: no refusal other than BUSY`);
+    if (variant === 'SUMMARY') assert.deepEqual([...paths], ['summary']);
   }
   console.log(`# SSB summary ${JSON.stringify(results.map(r => ({ l: r.label, runs: r.runs, readable: r.readable,
     search: Object.fromEntries(Object.entries(r.search).map(([k, a]) => [k, [pct(a, 50), pct(a, 95)].map(v => +v.toFixed(1))])),

@@ -223,7 +223,7 @@ jobs:
         run: docker compose up -d --wait db
       - run: npm ci
       - run: npm run build
-      - name: Summary-backed reader requests at 1,000 / 10,000 / 30,000 runs (identical pages on all three variants; summary p95 <= 100 / 400 ms asserted at 10,000 / 30,000)
+      - name: Summary-backed reader requests at 1,000 / 10,000 / 30,000 runs (identical pages or refusals on 0018, 0023 summary and 0023 fallback; >= 2x faster; fixed-cost p95 <= 100 / 400 ms)
         run: SI_SSB_RUNS=1000,10000,30000 node tests/db/run.mjs tests/slow/m4-summary-search-bench.test.mjs
       - name: Summary-search mutation campaign SSX1-SSX11 (unsafe fallback, authorization, distinct union, stale readability, ...; file restored)
         run: CI=true node tests/mutations/m4-p32-search.mjs

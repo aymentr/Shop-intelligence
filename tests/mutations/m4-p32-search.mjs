@@ -15,7 +15,6 @@ const F = 'db/migrations/0023_summary_backed_search.up.sql';
 const original = readFileSync(F);
 const sha = b => createHash('sha256').update(b).digest('hex').slice(0, 12);
 const GRANT = 'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g';
-const NET = '                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))\n';
 const M = [
   { id: 'SSX1', why: 'unsafe fallback: the summary path is taken whatever eligibility and the guard say',
     edits: [['    IF cov.eligible IS TRUE THEN\n', '    IF true THEN\n'], ['           AND (SELECT g.ok FROM guard g)),', '           ),'],
@@ -27,13 +26,11 @@ const M = [
     edits: [['count(DISTINCT u.ad_id)::int AS distinct_ads', 'count(u.ad_id)::int AS distinct_ads']], detector: /^not ok \d+ - SS-1b:/m },
   { id: 'SSX4', why: 'stale readability: summary rows of runs that are not readable now (live readability ignored)',
     edits: [['                                AND s.run_id = ANY (readable_runs)                    -- no join: a hashed membership test\n', ''],
-            ['                                AND s.run_id = ANY (readable_runs)\n', '']], detector: /^not ok \d+ - SS-3:/m },
+            ['                                AND s.run_id = ANY (readable_runs)\n', '', 3]], detector: /^not ok \d+ - SS-3:/m },
   { id: 'SSX5', why: 'authorization bypass: the grant check is omitted',
     edits: [[GRANT, 'IF NOT FOUND OR false AND NOT EXISTS (SELECT 1 FROM si.reader_grants g']], detector: /^not ok \d+ - SS-3:/m },
   { id: 'SSX6', why: 'network filter ignored on the summary path',
-    edits: [[NET + '                             OFFSET 0) s                                              -- correlated index probe per identity\n',
-             '                             OFFSET 0) s                                              -- correlated index probe per identity\n'],
-            [NET + '                             OFFSET 0) s),\n', '                             OFFSET 0) s),\n']], detector: /^not ok \d+ - SS-1 \(seed 11\)/m },
+    edits: [['AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))', '', 4]], detector: /^not ok \d+ - SS-1 \(seed 11\)/m },
   { id: 'SSX7', why: 'inclusive cursor ignored on the summary path',
     edits: [['OR (p_after_inclusive AND e.nn = p_after)', '']], detector: /^not ok \d+ - SS-5:/m },
   { id: 'SSX8', why: 'observation cap ignored on the summary path',
@@ -54,8 +51,11 @@ const outcomes = [];
 try {
   for (const m of M) {
     let src = original.toString('utf8');
-    for (const [from] of m.edits) if (src.split(from).length !== 2) throw new Error(`${m.id}: expected exactly one anchor in ${F}: ${from.slice(0, 80)}`);
-    for (const [from, to] of m.edits) src = src.replace(from, () => to);
+    // Each edit names its anchor and how many times it occurs (default once); every occurrence is replaced.
+    for (const [from, to, count = 1] of m.edits) {
+      if (src.split(from).length !== count + 1) throw new Error(`${m.id}: expected ${count} anchor(s) in ${F}: ${from.slice(0, 80)}`);
+      src = src.split(from).join(to);
+    }
     try {
       writeFileSync(F, src, 'utf8');
       const { r, out } = suite();

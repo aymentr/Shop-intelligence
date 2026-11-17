@@ -103,52 +103,45 @@ BEGIN
                AND (SELECT count(*) FROM si.run_summary_status ss
                      WHERE ss.run_id = ANY (readable_runs) AND ss.source_id = p_source_id AND ss.normalizer = fp)
                    = cardinality(readable_runs) AS ok),
-      hit AS MATERIALIZED (                                                     -- every matching summary row: identity and count only
-        SELECT i.identity_id, s.observations
+      hit AS MATERIALIZED (                                                     -- one row per matching identity: its observations
+        SELECT i.identity_id, s.n
           FROM si.advertiser_identities i
-         CROSS JOIN LATERAL (SELECT s.observations FROM si.run_advertiser_summaries s
-                              WHERE s.identity_id = i.identity_id AND s.source_id = p_source_id
+         CROSS JOIN LATERAL (SELECT sum(s.observations) AS n FROM si.run_advertiser_summaries s
+                              WHERE s.identity_id = i.identity_id AND s.source_id = p_source_id    -- index probe per identity
                                 AND s.run_id = ANY (readable_runs)                    -- no join: a hashed membership test
-                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))
-                             OFFSET 0) s                                              -- correlated index probe per identity
-         WHERE i.source_id = p_source_id AND i.normalizer = fp AND strpos(i.normalized_name, q) > 0
+                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))) s
+         WHERE i.source_id = p_source_id AND i.normalizer = fp AND strpos(i.normalized_name, q) > 0 AND s.n IS NOT NULL
            AND (SELECT g.ok FROM guard g)),
-      counted AS (SELECT coalesce(sum(h.observations), 0)::bigint AS n FROM hit h),
+      counted AS (SELECT coalesce(sum(h.n), 0)::bigint AS n FROM hit h),
       keys AS (                                                                 -- the page's identities, in cursor order
-        SELECT d.identity_id, e.nn
-          FROM (SELECT DISTINCT h.identity_id FROM hit h) d
+        SELECT h.identity_id, e.nn
+          FROM hit h
          CROSS JOIN LATERAL (SELECT i.normalized_name AS nn FROM si.advertiser_identities i
-                              WHERE i.identity_id = d.identity_id OFFSET 0) e          -- the name once per identity, by primary key
+                              WHERE i.identity_id = h.identity_id OFFSET 0) e          -- the name once per identity, by primary key
          WHERE p_after IS NULL OR e.nn COLLATE "C" > p_after OR (p_after_inclusive AND e.nn = p_after)
          ORDER BY e.nn COLLATE "C"
          LIMIT p_limit + 1),
-      prow AS MATERIALIZED (                                                    -- their summary rows, arrays included
-        SELECT k.identity_id, s.run_id, s.network, s.observations, s.ad_ids, s.names,
-               (SELECT r.finished_at FROM si.collection_runs r WHERE r.run_id = s.run_id) AS finished_at
+      grouped AS (                                                              -- per page identity, nothing materialized
+        SELECT k.nn, b.observations, d.distinct_ads, b.runs_with_evidence, b.first_observed_at, b.last_observed_at, b.networks, sp.names
           FROM keys k
-         CROSS JOIN LATERAL (SELECT s.run_id, s.network, s.observations, s.ad_ids, s.names FROM si.run_advertiser_summaries s
+         CROSS JOIN LATERAL (SELECT sum(s.observations)::int AS observations, count(DISTINCT s.run_id)::int AS runs_with_evidence,
+                                    min(f.finished_at) AS first_observed_at, max(f.finished_at) AS last_observed_at,
+                                    array_agg(DISTINCT s.network COLLATE "C" ORDER BY s.network COLLATE "C") AS networks
+                               FROM si.run_advertiser_summaries s
+                              CROSS JOIN LATERAL (SELECT r.finished_at FROM si.collection_runs r WHERE r.run_id = s.run_id OFFSET 0) f
                               WHERE s.identity_id = k.identity_id AND s.source_id = p_source_id
                                 AND s.run_id = ANY (readable_runs)
-                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))
-                             OFFSET 0) s),
-      base AS (
-        SELECT p.identity_id,
-               sum(p.observations)::int AS observations,
-               count(DISTINCT p.run_id)::int AS runs_with_evidence,
-               min(p.finished_at) AS first_observed_at, max(p.finished_at) AS last_observed_at,
-               array_agg(DISTINCT p.network COLLATE "C" ORDER BY p.network COLLATE "C") AS networks
-          FROM prow p GROUP BY p.identity_id),
-      ads AS (                                                                  -- distinct ads = |union of ad_ids| (D1)
-        SELECT p.identity_id, count(DISTINCT u.ad_id)::int AS distinct_ads
-          FROM prow p CROSS JOIN LATERAL unnest(p.ad_ids) AS u(ad_id) GROUP BY p.identity_id),
-      spellings AS (
-        SELECT p.identity_id, array_agg(DISTINCT u.nm COLLATE "C" ORDER BY u.nm COLLATE "C") AS names
-          FROM prow p CROSS JOIN LATERAL unnest(p.names) AS u(nm) GROUP BY p.identity_id),
-      grouped AS (
-        SELECT k.nn, b.observations, a.distinct_ads, b.runs_with_evidence, b.first_observed_at, b.last_observed_at,
-               b.networks, sp.names
-          FROM keys k JOIN base b ON b.identity_id = k.identity_id JOIN ads a ON a.identity_id = k.identity_id
-          JOIN spellings sp ON sp.identity_id = k.identity_id)
+                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))) b
+         CROSS JOIN LATERAL (SELECT count(DISTINCT u.ad_id)::int AS distinct_ads           -- distinct ads = |union of ad_ids| (D1)
+                               FROM si.run_advertiser_summaries s CROSS JOIN LATERAL unnest(s.ad_ids) AS u(ad_id)
+                              WHERE s.identity_id = k.identity_id AND s.source_id = p_source_id
+                                AND s.run_id = ANY (readable_runs)
+                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))) d
+         CROSS JOIN LATERAL (SELECT array_agg(DISTINCT u.nm COLLATE "C" ORDER BY u.nm COLLATE "C") AS names
+                               FROM si.run_advertiser_summaries s CROSS JOIN LATERAL unnest(s.names) AS u(nm)
+                              WHERE s.identity_id = k.identity_id AND s.source_id = p_source_id
+                                AND s.run_id = ANY (readable_runs)
+                                AND (cardinality(p_networks) = 0 OR s.network = ANY (p_networks))) sp)
     SELECT (SELECT g.ok FROM guard g), (SELECT c.n FROM counted c),
            (SELECT coalesce(jsonb_agg(jsonb_build_object(
              'normalized_name', g.nn, 'names', to_jsonb(g.names[1:10]), 'names_truncated', cardinality(g.names) > 10,

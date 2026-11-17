@@ -60,6 +60,14 @@ test('SCALE-1: 200,000 observations of one advertiser — one-page refusal, boun
   const h1 = await measure('library history (bound 5,000, page 1)', () => INTEL.advertiserHistory(alice, src, 'Dominant Synthetic', { pageSize: 1 }));
   assert.deepEqual([h1.outcome, h1.requests], ['IntelligenceFailed:SCAN_LIMIT', 1]);
 
+  // M4-P3.2 (0023): the source is eligible, so search pages come from the summaries: same outcome, no temporary file.
+  const cs = await measure('concentrated search, summary path (0023)', () => INTEL.searchAdvertisers(alice, { sources: [src], query: 'dominant' }));
+  assert.deepEqual([cs.outcome, cs.tempBytes], ['ok:1', 0]);
+  const ns = await measure('no-match search, summary path (0023)', () => INTEL.searchAdvertisers(alice, { sources: [src], query: 'nothing-matches' }));
+  assert.equal(ns.outcome, 'ok:0');
+  // The checks below are about the observation statement (its pinned work_mem and lock wait): the fallback is forced by an
+  // open drift event (FORCED FALLBACK fixture, owner) and cleared afterwards.
+  await x.admin.query(`INSERT INTO si.summary_events (source_id, kind, finding) VALUES ($1, 'DRIFT_DETECTED', 'MISSING')`, [src]);
   // D3: concentrated and no-match searches complete within the pinned bounds; a relaxed session changes nothing.
   const c = await measure('concentrated search (200,000 candidates)', () => INTEL.searchAdvertisers(alice, { sources: [src], query: 'dominant' }));
   assert.equal(c.outcome, 'ok:1');
@@ -80,4 +88,5 @@ test('SCALE-1: 200,000 observations of one advertiser — one-page refusal, boun
   console.log(`# SCALE-1 SUSPEND issued during a concentrated search page waited ${wait} ms; the page: ${await p}`);
   assert.ok(wait < 10000, 'bounded by the reader statement timeout (10 s)');
   await lift(x.si_rights_admin, src);
+  await x.admin.query(`INSERT INTO si.summary_events (source_id, kind) VALUES ($1, 'DRIFT_CLEARED')`, [src]);
 });
