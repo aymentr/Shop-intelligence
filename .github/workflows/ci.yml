@@ -167,8 +167,8 @@ jobs:
         run: docker compose up -d --wait db
       - run: npm ci
       - run: npm run build
-      - name: Summary eligibility cost at 30,000 runs (C1; cold and warm; reported against the 10 ms target)
-        run: node tests/db/run.mjs tests/slow/m4-coverage-bench.test.mjs
+      - name: Summary eligibility cost at 30,000 runs (C1 reference environment; >= 100 calls; warm p95 <= 15 ms, cold p95 <= 40 ms asserted)
+        run: SI_CB_REFERENCE=1 SI_CB_N=100 node tests/db/run.mjs tests/slow/m4-coverage-bench.test.mjs
       - name: Summary mutation campaign MX1-MX17 (C2; every non-equivalent mutant killed by its detector; files restored)
         run: CI=true node tests/mutations/m4-p31-close.mjs
       - name: Database logs on failure
@@ -199,6 +199,8 @@ jobs:
         run: SI_RT13_BROKEN=1 SI_RT13_N=3 SI_RT13_MODES=cold node tests/db/run.mjs tests/slow/m4-rt13-purge-bench.test.mjs
       - name: Deliberate break of 0022 (RTX1, RTX2 killed by PF-1 cold; file restored)
         run: CI=true node tests/mutations/m4-rt13-purge-fk.mjs
+      - name: Deliberate breaks of the deterministic test barriers (BX1-BX3; R-43, R-44; file restored)
+        run: CI=true node tests/mutations/m4-test-barriers.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db

@@ -1404,3 +1404,106 @@ After a container restart (new host), the coverage bench missed the C1 limits ag
 
 The C1 margin is a property of the host and pre-existing (R-39), not an effect of 0022. Hosted CI measured 6.85 / 17.1 ms (CI #140). The limits are not relaxed.
 
+
+## 15D. M4-P3.1-TEST-CLOSE-01: deterministic test barriers, the C1 contract and the 0022 readiness requirement
+
+**Status:** branch `claude/b002-m4-p3-1-test-close-01` from `e06b9da` (the RT-13 candidate, unchanged). Test, CI and documentation changes only: no product SQL, migration, production function, reader, authorization or retention change. Pending a separate reviewer's sign-off.
+
+### 15.18 R-43: the REM-M source-lock barrier
+
+**Defect.**
+- The barrier ("the reader is in the instrumented pause") matched any `PgSleep` wait of the reader.
+- `si_search_advertisers` (0018) calls `si_claim_read_intent` (0017) before it takes the source lock, and the durability gate inside it waits with `pg_sleep(0.005)`, holding no lock.
+- So when foreign WAL is not yet flushed, the barrier could fire before the lock. The SUSPEND then committed first, and the search correctly failed closed (`SOURCE_UNAVAILABLE`), which is the wrong baseline for the test.
+- Reproduced at `e06b9da` (FINAL-ACCEPT-01): 4 of 15 runs under concurrent foreign WAL.
+- Deterministically reproduced here: the decoy state of REM-B3 satisfies the old condition with no source lock held.
+
+**Correction** (`tests/db/barriers.mjs`, used by `scnSearchLockRun` in `m4-remediation.test.mjs`):
+
+| | Before | After |
+|---|---|---|
+| How the reader is held | `pg_sleep(1.5)` | A marked pause: transaction-local `application_name` set to a per-run marker with a random nonce, then a loop on `pg_try_advisory_xact_lock` of a key the test holds |
+| Barrier condition | Any `PgSleep` of `si_reader_alice` | That session's pid, with that marker, `active` |
+| How the SUSPEND is classified | Elapsed time > 500 ms | Observed blocked by the reader, or completed, while the reader is still held |
+
+- The reader stays held until the test releases the key; no elapsed time decides anything.
+- The pause is a try-lock loop, not a lock wait, so the function's own `lock_timeout = 2s` cannot fire.
+- The `waited` / `immediate` outcomes keep their meaning.
+- The mutant ("search source lock omitted") is still killed: `ok:0, suspend-immediate`.
+
+**Marker scope.** The marker is set with `set_config(..., true)`. In the search function it would be reverted in any case, because the locked block is always left by rolling back its subtransaction (`SI_READ_RELEASE`). TB-6 checks the scope in a function without such a block.
+
+**Tests:**
+
+| Test | What it checks |
+|---|---|
+| REM-B1 (quiet WAL, ×3) | Held at the pause with the source lock; SUSPEND observed blocked; verdict reached while held; marker gone after the read |
+| REM-B2 (concurrent foreign WAL, ×5) | The baseline stays exact |
+| REM-B3 (decoy) | A test-held sleep before the claim reproduces the state the old barrier confused (`PgSleep`, no source lock): it is reached and not matched. The marked pause, later, holds the lock |
+| REM-B4 (mutant) | With no lock, the pause is reached holding no source lock; SUSPEND completes while the reader is held; outcome is the mutant's (quiet, foreign WAL, and decoy plus foreign WAL) |
+
+### 15.19 R-44: the RT-13 contention barrier
+
+**Defect.** The loop in RT-13 stopped as soon as the control session read `idle`, which is also the state of a session whose query has not been received yet. RT-13 then failed "contention proven" before printing its timing line.
+- At `e06b9da`: 1 of 300 isolated trials (FINAL-ACCEPT-01).
+- Here, with a deliberately delayed query start: TB-1 (50 ms delay) is deterministic; TB-3 (0–20 ms delays) fails in 95 of 100 held trials.
+
+**Correction.** `observeCall` (`tests/db/barriers.mjs`) tracks the control as not-started → running → blocked (by the expected holder) → completed → failed. An unblocked observation ends only when the call itself completes or fails. If neither happens within the bound, it fails with a full snapshot of both sessions and their locks.
+- RT-13 uses it. Its assertions, the 5 s bounds included, are unchanged; the contention assertion message now carries the trace and the snapshot.
+- Tests in `m4-test-barriers.test.mjs`:
+
+| Test | What it checks |
+|---|---|
+| TB-1 | Negative control: the legacy loop, verbatim, is wrong with a delayed start |
+| TB-2 | Not-started, then blocked |
+| TB-3 | 100 trials always blocked; the legacy loop's misses are counted and must be > 0 |
+| TB-4 | Completed and failed (with its SQLSTATE) |
+| TB-5 | Unexpected holder: full diagnostics |
+| TB-6 | Marker scope |
+
+### 15.20 Deliberate breaks of the barriers
+
+`tests/mutations/m4-test-barriers.mjs` (CI job `purge-latency`) applies each mutant to `tests/db/barriers.mjs` with exactly one anchor and restores it byte for byte:
+
+| Mutant | Break | Detector |
+|---|---|---|
+| BX1 | Barrier back to "any `PgSleep`" | REM-B3 (also REM-B2) |
+| BX2 | Idle taken as completed | TB-2 (also TB-3) |
+| BX3 | Marker session-wide | TB-6 |
+
+All three are killed, and the restored baseline is green.
+
+### 15.21 C1: the approved contract
+
+- **Reference environment:** the hosted CI runner (job `summary-close`, `SI_CB_REFERENCE=1`).
+- **Limits, at 30,000 runs, at least 100 calls per measurement, asserted there:** warm p95 ≤ 15 ms, cold p95 ≤ 40 ms. A reference run with fewer calls or another scale is refused.
+- **Fingerprint:** evaluated once per invocation (CV-2, MX16).
+- **Eligibility semantics:** exact (CV-1 over randomized states, MX3/MX17). Nothing is cached.
+- **The original 10 ms target** is still reported.
+- **On any other host:** the same limits are measured and printed as MET or NOT MET, labelled host-dependent and not asserted. Correctness and the relative assertions against 0020 (cold at least 10× faster, warm not slower) are asserted everywhere.
+- **Local variation** observed on the development host (FINAL-ACCEPT-01, 8 rounds of 20 calls on one 30,000-run database): cold p95 35.7–56.1 ms, warm 8.8–32.6 ms, with the same plan and buffers.
+
+### 15.22 F2: deployment readiness requirement for `observations_by_ad_fk` (future; nothing deployed)
+
+The 5 s emergency-control bound depends on this index (§15.14). Before any deployment that carries data, readiness must show all of the following:
+
+1. The index exists on `si.observations` with key exactly `(ad_id, source_id, network, native_ad_id)`, btree, non-partial.
+2. It is valid and ready.
+3. There is no other, invalid index from a failed concurrent build (an INVALID index is ignored by the planner and would silently bring back the quadratic purge).
+
+```sql
+-- Readiness (read-only). PASS = ok is true (false when the index is missing or wrong), and no rows from the second query.
+SELECT coalesce(bool_and(i.indisvalid AND i.indisready AND i.indpred IS NULL AND am.amname = 'btree'
+                AND pg_get_indexdef(i.indexrelid) = 'CREATE INDEX observations_by_ad_fk ON si.observations USING btree (ad_id, source_id, network, native_ad_id)'), false) AS ok
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_am am ON am.oid = c.relam
+ WHERE i.indexrelid = to_regclass('si.observations_by_ad_fk');
+SELECT indexrelid::regclass FROM pg_index WHERE indrelid = 'si.observations'::regclass AND NOT (indisvalid AND indisready);
+```
+
+**Populated databases.** Migration 0022 builds the index non-concurrently inside the migrator's transaction, which blocks writes to `si.observations` for the duration of the build (R-42). It is correct for empty, development and synthetic databases. A populated deployment requires a reviewed procedure:
+1. `CREATE INDEX CONCURRENTLY` outside a transaction, in a maintenance window, with a `lock_timeout`.
+2. On failure, drop the INVALID index and retry.
+3. Pass the readiness check above.
+4. Record migration 0022 as applied, with its checksums, under the migrator's advisory lock.
+
+This is a future deployment requirement. Migration 0022 is unchanged here and no production migration was run.

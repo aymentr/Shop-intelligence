@@ -8,6 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { latestDefinition } from './durability-fixtures.mjs';
+import { observeCall, snapshot } from './barriers.mjs';
 import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
@@ -543,16 +544,15 @@ test('RT-13 (gates): purge timing and SUSPEND / TERMINATE waits against a maximu
     }
     await sleep(30);                                                     // the purge holds the source by now
     const c0 = performance.now();
-    const ctl = settle(control(ra, src, kind).then(r => ({ r, ms: performance.now() - c0 })));
-    let blocked = false;
-    for (let i = 0; i < 400 && !blocked; i++) {
-      blocked = (await x.admin.query('SELECT $2::int = ANY (pg_blocking_pids($1)) AS b', [raPid, retPid])).rows[0].b;
-      if (!blocked) { const st = (await x.admin.query('SELECT state FROM pg_stat_activity WHERE pid = $1', [raPid])).rows[0]; if (st?.state === 'idle') break; }
-    }
-    const pr = await p, cr = await ctl;
+    // M4-P3.1-TEST-CLOSE-01 (R-44): the control is observed until it is blocked by the purge, completes or fails. An idle
+    // control session whose query has not started yet is "not-started", never "completed" (the old loop's race).
+    const obs = await observeCall(x.admin, { waiterPid: raPid, holderPid: retPid, call: () => control(ra, src, kind).then(r => ({ r, ms: performance.now() - c0 })) });
+    const blocked = obs.state === 'blocked';
+    const diag = blocked ? '' : `; trace ${obs.trace.join('>')}; ${await snapshot(x.admin, [raPid, retPid])}`;
+    const pr = await p, cr = await obs.result;
     assert.equal(cr.status, 'ok', `${kind} recorded: ${cr.code ?? ''}`);
     assert.deepEqual([pr.r.outcome, pr.r.runs_purged, pr.r.observations_purged, pr.r.identities_purged], ['PURGED', MAX_PURGE_RUNS, 10000, 10000]);
-    assert.ok(blocked, `${kind} was observed waiting for the purge (contention proven)`);
+    assert.ok(blocked, `${kind} was observed waiting for the purge (contention proven)${diag}`);
     gate.push({ kind, purgeMs: pr.ms, waitMs: cr.value.ms });
   }
   console.log(`# RT-13 purge batch of 2 runs (1000 obs) ms: median ${ms[2].toFixed(0)}, max ${ms[4].toFixed(0)}; ` +

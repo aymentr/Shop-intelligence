@@ -2,18 +2,24 @@
 // One synthetic database built through the product write path (collector reconnected every 500 runs: R-37 workaround,
 // documented), 90% of the runs in the measured source. Measured on the same data: the 0021 function and the 0020 text
 // (installed side by side as si_test_coverage_0020), COLD (never analyzed, new connection) and WARM (VACUUM ANALYZE);
-// first call, p50 and p95 over SI_CB_N (default 20) calls; plans (EXPLAIN ANALYZE, BUFFERS) logged.
+// first call, p50 and p95 over SI_CB_N (default and minimum 100) calls; plans (EXPLAIN ANALYZE, BUFFERS) logged.
 //   node tests/db/run.mjs tests/slow/m4-coverage-bench.test.mjs        (SI_CB_RUNS, default 30000)
 // Asserted: identical results; 0021 at least 10x faster than 0020 at p95 cold (no statistics: 0020 evaluates the
 // fingerprint per run) and not slower warm; 0021 p95 <= 40 ms cold and <= 15 ms warm (revised C1 contract, CLOSE-02). The
 // acceptance target (p95 <= 10 ms) is REPORTED, not asserted: an exact check is O(runs of the source) (docs §15.7).
+// M4-P3.1-TEST-CLOSE-01 (approved C1 contract, docs §15D): the hosted CI runner is the REFERENCE environment
+// (SI_CB_REFERENCE=1, set by the summary-close job). There the latency limits are asserted, on at least 100 calls per
+// measurement. On any other host they are measured and reported as host-dependent variation, with the same limits printed
+// as MET or NOT MET; correctness (identical eligibility) and the relative assertions against 0020 are asserted everywhere.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { asOwner, connect, createSources, dropDatabase, freshDatabase, recordRights, roles } from '../db/helpers.mjs';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 
-const RUNS = Number(process.env.SI_CB_RUNS ?? 30000), N = Number(process.env.SI_CB_N ?? 20), TARGET = 10;
+const RUNS = Number(process.env.SI_CB_RUNS ?? 30000), N = Number(process.env.SI_CB_N ?? 100), TARGET = 10;
+const REFERENCE = process.env.SI_CB_REFERENCE === '1';
+if (REFERENCE && (N < 100 || RUNS !== 30000)) throw new Error(`C1 reference measurement requires >= 100 calls at 30,000 runs (got ${N} at ${RUNS})`);
 // M4-P3.1-CLOSE-02: the revised C1 acceptance contract (approved): p95 <= 15 ms warm, <= 40 ms cold, at 30,000 runs.
 // The original 10 ms target is still reported, as MET or NOT MET.
 const LIMIT = { WARM: 15, COLD: 40 };
@@ -66,8 +72,9 @@ test('CB: summary eligibility at 30,000 runs — 0021 vs 0020, cold and warm', {
     if (/COLD/.test(label)) assert.ok(out['0021'].p95 * 10 <= out['0020'].p95, `${label}: at least 10x faster than 0020 at p95`);
     else assert.ok(out['0021'].p95 <= out['0020'].p95, `${label}: not slower than 0020 at p95`);
     const limit = /COLD/.test(label) ? LIMIT.COLD : LIMIT.WARM;
-    console.log(`# CB ${label}: revised contract p95 <= ${limit} ms ${out['0021'].p95 <= limit ? 'MET' : 'NOT MET'} (${out['0021'].p95.toFixed(2)} ms)`);
-    assert.ok(out['0021'].p95 <= limit, `${label}: 0021 p95 ${out['0021'].p95.toFixed(2)} ms <= ${limit} ms (revised C1 contract)`);
+    console.log(`# CB ${label}: revised contract p95 <= ${limit} ms ${out['0021'].p95 <= limit ? 'MET' : 'NOT MET'} (${out['0021'].p95.toFixed(2)} ms, n=${N}; ` +
+                `${REFERENCE ? 'REFERENCE environment: asserted' : 'local host: host-dependent variation, reported only'})`);
+    if (REFERENCE) assert.ok(out['0021'].p95 <= limit, `${label}: 0021 p95 ${out['0021'].p95.toFixed(2)} ms <= ${limit} ms (C1 contract, reference environment)`);
   };
   await measure('COLD (no statistics)');
   for (const c of Object.values(x)) await c.end().catch(() => {});

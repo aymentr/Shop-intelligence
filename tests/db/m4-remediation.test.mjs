@@ -21,6 +21,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { asOwner, cfg, connect, control, createSources, freshDatabase, lift, recordRights, roles, settle } from './helpers.mjs';
+import { PAUSE_SQL, armPause, awaitMarkedPause, inMarkedPause, observeCall, pauseMarker, releasePause, snapshot } from './barriers.mjs';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { provisionReaderPrincipal } from '../../dist/persistence/bootstrap.js';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { grantReader, revokeReader, beginRead } from '../../dist/persistence/reader.js';
@@ -423,22 +425,68 @@ async function scnIdentityGuard(x, sql = COLLIDING) {
   const s = await source(x); await collect(x, s, [AD('Acme Synthetic', 'a'), AD('Acme Synthetic Labs', 'b')]);
   return libOutcome(INTEL.advertiserHistory(await reader(x), s, 'Acme Synthetic')); }
 /** The source lock: a SUSPEND issued while a search page is being computed must wait for it (instrumented pause). Without the
- *  lock the SUSPEND commits mid-page and the page, checked AVAILABLE, silently releases nothing (ok:0): the FD21 defect. */
-async function scnSearchLock(x, mutantSql) {
-  // 0016/0018: the pause is before the readable-run statement (after the lock and the availability check).
-  const pause = "  PERFORM pg_sleep(coalesce(nullif(current_setting('si.test_pause', true), ''), '0')::float);\n    readable_runs := si.si_readable_runs(";
-  await asOwner(x.admin, a => a.query(mutate(mutantSql ?? SEARCH_FN, '    readable_runs := si.si_readable_runs(', pause)));
+ *  lock the SUSPEND commits mid-page and the page, checked AVAILABLE, silently releases nothing (ok:0): the FD21 defect.
+ *  M4-P3.1-TEST-CLOSE-01 (R-43): the reader is held at a MARKED pause (tests/db/barriers.mjs) placed after the lock and the
+ *  availability check; the barrier matches only that pause (marker + session), never the durability gate's own
+ *  pg_sleep before the lock. The SUSPEND is classified by what it did while the reader was held there: blocked by the
+ *  reader (waited) or completed (immediate). No elapsed-time threshold. Options (REM-B tests): `decoy` adds a second
+ *  test-held pause BEFORE the read-intent claim (a PgSleep wait with no lock held, the state the old barrier confused);
+ *  `noise` writes foreign unflushed WAL from another session until the barrier fires. */
+async function scnSearchLockRun(x, { mutantSql, decoy = false, noise = false } = {}) {
+  let text = mutate(mutantSql ?? SEARCH_FN, '    readable_runs := si.si_readable_runs(', PAUSE_SQL + '    readable_runs := si.si_readable_runs(');
+  if (decoy) text = mutate(text, '  PERFORM si.si_claim_read_intent(who, p_source_id, p_intent_id, cur, p_limit);',
+    "  IF coalesce(current_setting('si.test_decoy_key', true), '') <> '' THEN\n" +
+    "    WHILE NOT pg_try_advisory_xact_lock(current_setting('si.test_decoy_key')::bigint) LOOP PERFORM pg_sleep(0.005); END LOOP;\n  END IF;\n" +
+    '  PERFORM si.si_claim_read_intent(who, p_source_id, p_intent_id, cur, p_limit);');
+  await asOwner(x.admin, a => a.query(text));
   const s = await source(x); await collect(x, s, [AD('Northwind Synthetic', 'lk')]);
-  const alice = await reader(x); await alice.query(`SET si.test_pause = '1.5'`);
-  // Barrier: the reader's backend is inside the instrumented pause, i.e. past the lock and the availability check.
+  const alice = await reader(x);
+  const alicePid = (await alice.query('SELECT pg_backend_pid() AS p')).rows[0].p;
+  const raPid = (await x.si_rights_admin.query('SELECT pg_backend_pid() AS p')).rows[0].p;
+  const holder = await x.connect(undefined);                                 // test superuser session holding the pause locks
+  const pause = pauseMarker(); await armPause(holder, alice, pause);
+  const ev = {};
+  let decoyKey = null;
+  if (decoy) { decoyKey = pauseMarker().key; await holder.query('SELECT pg_advisory_lock($1::bigint)', [decoyKey]);
+    await alice.query(`SELECT set_config('si.test_decoy_key', $1, false)`, [decoyKey]); }
+  let noisy = noise;
+  const noiser = noise ? (async () => { const c = await x.connect(undefined);
+    while (noisy) { await c.query(`SELECT pg_logical_emit_message(false, 'si-rem-b', repeat('x', 200))`); await sleep(1); } })() : null;
+  const relLock = async () => (await x.admin.query(`SELECT count(*)::int AS n FROM pg_locks WHERE pid = $1 AND locktype = 'relation'
+                                                       AND relation = 'si.sources'::regclass AND mode = 'RowShareLock' AND granted`, [alicePid])).rows[0].n === 1;
   const search = INTEL.searchAdvertisers(alice, { sources: [s], query: 'north' }).then(p => `search:ok:${p.hits.length}`, e => `search:${e.code}`);
-  const paused = async () => (await x.admin.query(`SELECT count(*)::int AS n FROM pg_stat_activity WHERE usename = 'si_reader_alice'
-                                                     AND datname = current_database() AND wait_event = 'PgSleep'`)).rows[0].n === 1;
-  for (let i = 0; !(await paused()); i++) { if (i > 100) return 'value:the read never reached its pause'; await new Promise(r => setTimeout(r, 50)); }
-  const t0 = performance.now();
-  await control(x.si_rights_admin, s, 'SUSPEND');
-  const waited = performance.now() - t0;                                      // the pause is 1.5 s
-  return `value:${await search},suspend-${waited > 500 ? 'waited' : 'immediate'}`;
+  try {
+    if (decoy) {
+      // The confusable state: the reader sleeps (PgSleep) before the claim and before the source lock.
+      for (let i = 0; ; i++) {
+        const r = (await x.admin.query(`SELECT wait_event FROM pg_stat_activity WHERE pid = $1`, [alicePid])).rows[0];
+        if (r?.wait_event === 'PgSleep') break;
+        if (i > 3000) throw new Error(`decoy never reached: ${await snapshot(x.admin, [alicePid])}`);
+        await sleep(2);
+      }
+      ev.decoy = { legacyBarrierWouldFire: true, markedPause: await inMarkedPause(x.admin, alicePid, pause.mark), sourceLockHeld: await relLock() };
+      await holder.query('SELECT pg_advisory_unlock($1::bigint)', [decoyKey]);
+    }
+    await awaitMarkedPause(x.admin, alicePid, pause.mark);
+    noisy = false; if (noiser) await noiser;
+    ev.atBarrier = { sourceLockHeld: await relLock(), marked: await inMarkedPause(x.admin, alicePid, pause.mark) };
+    const obs = await observeCall(x.admin, { waiterPid: raPid, holderPid: alicePid, call: () => control(x.si_rights_admin, s, 'SUSPEND') });
+    ev.trace = obs.trace;
+    const stillHeld = await inMarkedPause(x.admin, alicePid, pause.mark);    // the verdict was reached while the reader was held
+    await releasePause(holder, pause);
+    const ctl = await obs.result;
+    if (ctl.status !== 'ok') return { outcome: `value:suspend-failed:${ctl.code}`, ev };
+    ev.verdictWhileHeld = stillHeld;
+    const result = await search;
+    // The marker is transaction-local: once the read's transaction ended it is gone from the session.
+    ev.markerCleared = (await x.admin.query('SELECT application_name AS a FROM pg_stat_activity WHERE pid = $1', [alicePid])).rows[0]?.a !== pause.mark;
+    return { outcome: `value:${result},suspend-${obs.state === 'blocked' ? 'waited' : obs.state === 'completed' ? 'immediate' : obs.state}`, ev };
+  } finally { noisy = false; await releasePause(holder, pause).catch(() => {}); await search.catch(() => {}); }
+}
+async function scnSearchLock(x, mutantSql) {
+  const { outcome, ev } = await scnSearchLockRun(x, { mutantSql });
+  assert.equal(ev.verdictWhileHeld ?? true, true, `the SUSPEND verdict was reached while the reader was held at the pause: ${JSON.stringify(ev)}`);
+  return outcome;
 }
 const DB_MUTANTS = [
   { name: 'search period end inclusive', scenario: scnSearchPeriodEnd, baseline: 'ok:0', mutant: 'ok:1',
@@ -467,6 +515,38 @@ for (const m of DB_MUTANTS) {
     assert.equal(killed, m.mutant, `${m.name}: mutant outcome (killed for the intended reason)`);
   });
 }
+
+// M4-P3.1-TEST-CLOSE-01 (R-43): the REM-M source-lock barrier, verified on its own.
+const LOCKLESS = DB_MUTANTS.find(m => m.lock).sql;
+const BASE = 'value:search:ok:1,suspend-waited', KILLED = 'value:search:ok:0,suspend-immediate';
+test('REM-B1 (quiet WAL): the barrier holds the reader at the marked pause, past the source lock; the SUSPEND is observed blocked by the reader', async t => {
+  for (let i = 0; i < 3; i++) {
+    const { outcome, ev } = await scnSearchLockRun(await fresh(t, 'm4rb1'));
+    assert.equal(outcome, BASE, JSON.stringify(ev));
+    assert.deepEqual([ev.atBarrier, ev.verdictWhileHeld, ev.trace.at(-1), ev.markerCleared], [{ sourceLockHeld: true, marked: true }, true, 'blocked', true], JSON.stringify(ev));
+  }
+});
+test('REM-B2 (concurrent foreign WAL): the durability gate may sleep before the lock; the barrier still matches only the marked pause', async t => {
+  for (let i = 0; i < 5; i++) {
+    const { outcome, ev } = await scnSearchLockRun(await fresh(t, 'm4rb2'), { noise: true });
+    assert.equal(outcome, BASE, JSON.stringify(ev));
+    assert.equal(ev.atBarrier.sourceLockHeld, true, JSON.stringify(ev));
+  }
+});
+test('REM-B3 (cannot fire before the intended pause): a PgSleep wait before the claim and the lock (the old barrier condition) is not the marked pause', async t => {
+  const { outcome, ev } = await scnSearchLockRun(await fresh(t, 'm4rb3'), { decoy: true, noise: true });
+  // Negative control: the confusable state was really reached (PgSleep, no source lock) and the barrier did not match it.
+  assert.deepEqual(ev.decoy, { legacyBarrierWouldFire: true, markedPause: false, sourceLockHeld: false }, JSON.stringify(ev));
+  assert.equal(outcome, BASE, JSON.stringify(ev));
+  assert.deepEqual(ev.atBarrier, { sourceLockHeld: true, marked: true }, JSON.stringify(ev));
+});
+test('REM-B4 (mutant still killed): without the source lock the marked pause is reached holding no lock and the SUSPEND completes while the reader is held', async t => {
+  for (const o of [{}, { noise: true }, { decoy: true, noise: true }]) {
+    const { outcome, ev } = await scnSearchLockRun(await fresh(t, 'm4rb4'), { mutantSql: LOCKLESS, ...o });
+    assert.equal(outcome, KILLED, JSON.stringify(ev));
+    assert.deepEqual([ev.atBarrier, ev.verdictWhileHeld, ev.trace.at(-1)], [{ sourceLockHeld: false, marked: true }, true, 'completed'], JSON.stringify(ev));
+  }
+});
 
 async function mutatedLibrary(t, edits) {
   const dir = mkdtempSync(join(tmpdir(), 'si-rem-mutant-'));
