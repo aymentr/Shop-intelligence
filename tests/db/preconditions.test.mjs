@@ -119,6 +119,7 @@ test('D5b decision A: hardened disposable database passes shared readiness and p
   delete env.SI_PRODUCTION;
   const r = spawnSync(process.execPath, [cli, 'preflight', '--production'], { encoding: 'utf8', env });
   assert.equal(r.status, 0, r.stdout + r.stderr);
-  // 5 operational + 4 D5b + 7 collector logging (incl. session role) checks
-  assert.equal((r.stdout.match(/^ok /gm) ?? []).length, 16, r.stdout);
+  // 5 operational + 4 D5b + 7 collector logging (incl. session role) checks + 1 index readiness (M4-P3.3 Phase 1)
+  assert.equal((r.stdout.match(/^ok /gm) ?? []).length, 17, r.stdout);
+  assert.match(r.stdout, /^ok   index_readiness_observations_by_ad_fk: PASS /m);
 });

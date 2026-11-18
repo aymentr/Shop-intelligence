@@ -89,6 +89,17 @@ never authorizes anything, and no evidence can be read in this milestone.
 SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js verification run [--limit N] | status | failures
 ```
 
+Index readiness and populated adoption of 0022 (M4-P3.3 Phase 1, docs §17): `db/ops/readiness.sql` is a read-only
+schema check of the 0022 index (PASS = zero rows; not an evidence-integrity check). On a populated database, build the
+index concurrently outside any transaction, then record 0022 under the migrator lock; production preflight requires
+readiness from version 22 on:
+
+```bash
+SI_DATABASE_URL=<si_migrator login> node dist/persistence/cli.js build-index --version 22 [--lock-timeout-ms N] [--replace-invalid]
+SI_DATABASE_URL=<si_migrator login> node dist/persistence/cli.js adopt --version 22 [--lock-timeout-ms N]
+SI_DATABASE_URL=<any login>         node dist/persistence/cli.js readiness      # exit 1 with every failure code
+```
+
 Internal retrieval (0008): a dedicated principal (`si_reader_<name>`, provisioned with
 `provisionReaderPrincipal`) with a per-source grant (`si_grant_reader`, by `si_rights_admin`) can read
 bounded pages of VALID, currently authorized synthetic evidence through `readEvidence`

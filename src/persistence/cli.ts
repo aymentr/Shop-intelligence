@@ -6,6 +6,11 @@
  *   node dist/persistence/cli.js up [--to N]
  *   node dist/persistence/cli.js down --to N --allow-destructive
  *   node dist/persistence/cli.js status
+ *   node dist/persistence/cli.js readiness             db/ops/readiness.sql: the 0022 index (exit 1 on any failure)
+ *   node dist/persistence/cli.js build-index --version 22 [--lock-timeout-ms N] [--replace-invalid]
+ *                                                     CREATE INDEX CONCURRENTLY of the 0022 index (populated databases; docs §17)
+ *   node dist/persistence/cli.js adopt --version 22 [--lock-timeout-ms N]
+ *                                                     record 0022 as applied after build-index (advisory lock, readiness PASS)
  *   node dist/persistence/cli.js preflight            operational preconditions (deployment check, D7)
  *   node dist/persistence/cli.js preflight --collector   also checks collector logging safety in a
  *                                                     real collector session (SI_COLLECTOR_DATABASE_URL)
@@ -30,7 +35,8 @@
  */
 import pg from 'pg';
 import { bootstrapCluster, bootstrapDatabase, LOGIN_ROLES, type LoginRole } from './bootstrap.js';
-import { migrateDown, migrateUp, migrationStatus } from './migrate.js';
+import { adoptMigration, buildIndexConcurrently, migrateDown, migrateUp, migrationStatus } from './migrate.js';
+import { checkIndexReadiness, checkIndexReadinessPrecondition } from './readiness.js';
 import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
 import { assertProductionReady } from './production-readiness.js';
 import { DEFAULT_PURGE_RUNS, overdueRetention, purgeDue, purgeFailures, RetentionFailed, retentionStatus } from './retention.js';
@@ -121,6 +127,18 @@ async function main(): Promise<void> {
     } else if (command === 'status') {
       const s = await migrationStatus(client);
       console.log(JSON.stringify({ applied: s.applied.map(a => a.version), pending: s.pending, problem: s.problem }));
+    } else if (command === 'readiness') {
+      const failures = await checkIndexReadiness(client);
+      for (const f of failures) console.log(`FAIL ${f.code} ${f.object}`);
+      if (failures.length) process.exitCode = 1; else console.log('readiness PASS (si.observations_by_ad_fk)');
+    } else if (command === 'build-index' || command === 'adopt') {
+      const version = Number(arg('--version'));
+      const lt = arg('--lock-timeout-ms');
+      const lockTimeoutMs = lt === undefined ? undefined : Number(lt);
+      const r = command === 'build-index'
+        ? await buildIndexConcurrently(client, { version, ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }), replaceInvalid: process.argv.includes('--replace-invalid') })
+        : await adoptMigration(client, { version, ...(lockTimeoutMs === undefined ? {} : { lockTimeoutMs }) });
+      console.log(JSON.stringify(r));
     } else if (command === 'preflight') {
       const results = await checkOperationalPreconditions(client);
       if (process.argv.includes('--production')) results.push(...await checkProductionAdvisoryPermissions(client));
@@ -131,6 +149,7 @@ async function main(): Promise<void> {
         await col.connect();
         try { results.push(...await checkCollectorLogging(col)); } finally { await col.end(); }
       }
+      if (process.argv.includes('--production')) results.push(...await checkIndexReadinessPrecondition(client));
       for (const p of results) console.log(`${p.ok ? 'ok  ' : 'FAIL'} ${p.name}: ${p.actual} (expected ${p.expected})`);
       if (results.some(p => !p.ok)) process.exitCode = 1;
     } else if (command === 'retention') {
@@ -138,7 +157,7 @@ async function main(): Promise<void> {
     } else if (command === 'verification') {
       await verification(client, process.argv[3]);
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures>');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | readiness | build-index --version 22 [--lock-timeout-ms N] [--replace-invalid] | adopt --version 22 [--lock-timeout-ms N] | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures>');
     }
   } finally {
     await client.end();

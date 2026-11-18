@@ -252,6 +252,10 @@ gate_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ER
 audit_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_restore_admin -d si_template_test < db/ops/fk-audit.sql)
 [[ -z "$audit_out" ]] || { echo "DR-1 FK_AUDIT FAILED on the restored cluster:"; echo "$audit_out"; exit 1; }
 echo 'DR-1 restored evidence-reference integrity gate and FK_AUDIT PASS'
+# M4-P3.3 Phase 1 (R-45): schema readiness of the 0022 index on the restored cluster (zero rows; not an integrity check).
+ready_out=$(docker exec -i -e PGPASSWORD=local-test-only "$name" psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_restore_admin -d si_template_test < db/ops/readiness.sql)
+[[ -z "$ready_out" ]] || { echo "DR-1 readiness FAILED on the restored cluster:"; echo "$ready_out"; exit 1; }
+echo 'DR-1 restored readiness of the 0022 index PASS'
 # Migration 0020 on the restored cluster: summaries equal the independent recomputation; lifecycle invariance and purge.
 SI_TEST_PGHOST=127.0.0.1 SI_TEST_PGPORT="$target_port" SI_TEST_ADMIN_USER=si_restore_admin \
   SI_TEST_ADMIN_PASSWORD=local-test-only SI_TEST_ROLE_PASSWORD=local-test-only \

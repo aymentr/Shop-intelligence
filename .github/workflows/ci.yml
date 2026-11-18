@@ -54,8 +54,13 @@ jobs:
           audit=$(docker compose exec -T -e PGPASSWORD=local-test-only db psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_bootstrap -d si_template_test < db/ops/fk-audit.sql)
           [ -z "$audit" ] || { echo "FK_AUDIT FAILED:"; echo "$audit"; exit 1; }
           echo "integrity gate PASS, FK_AUDIT PASS"
-      - name: Crash durability of read intents (AUD-12a, crash-detected mutants, INT-19; restarts PostgreSQL)
-        run: node tests/db/run.mjs tests/crash/m3-durability-crash.test.mjs tests/crash/m3-durability-fixtures.test.mjs tests/crash/m4-status-durability.test.mjs tests/crash/m3-r35-durability.test.mjs
+      - name: Deployment verification — schema readiness of the 0022 index (db/ops/readiness.sql; zero rows; not an integrity check)
+        run: |
+          ready=$(docker compose exec -T -e PGPASSWORD=local-test-only db psql -X -v ON_ERROR_STOP=1 -At -h 127.0.0.1 -U si_bootstrap -d si_template_test < db/ops/readiness.sql)
+          [ -z "$ready" ] || { echo "readiness FAILED:"; echo "$ready"; exit 1; }
+          echo "readiness PASS"
+      - name: Crash durability of read intents (AUD-12a, crash-detected mutants, INT-19) and of the concurrent 0022 build (MIG-C1, MIG-C2); restarts PostgreSQL
+        run: node tests/db/run.mjs tests/crash/m3-durability-crash.test.mjs tests/crash/m3-durability-fixtures.test.mjs tests/crash/m4-status-durability.test.mjs tests/crash/m3-r35-durability.test.mjs tests/crash/m4-adopt-crash.test.mjs
       - name: Targeted D5b mutant execution (expected regression failure)
         run: node tests/mutations/step2-d5b.mjs
       - name: Targeted role-bootstrap mutant execution (expected regression failure)
@@ -227,6 +232,33 @@ jobs:
         run: SI_SSB_RUNS=1000,10000,30000 node tests/db/run.mjs tests/slow/m4-summary-search-bench.test.mjs
       - name: Summary-search mutation campaign SSX1-SSX11 (unsafe fallback, authorization, distinct union, stale readability, ...; file restored)
         run: CI=true node tests/mutations/m4-p32-search.mjs
+      - name: Database logs on failure
+        if: failure()
+        run: docker compose logs db
+      - name: Stop database
+        if: always()
+        run: docker compose down -v
+
+  populated-adoption:
+    # M4-P3.3 Phase 1 (R-42, R-45): populated adoption of 0022 (CREATE INDEX CONCURRENTLY outside a transaction, then
+    # `adopt` under the migrator lock) rehearsed at 1,000,000 observations with a concurrent writer, a cancelled build and
+    # its recovery; and the deliberate breaks of the readiness gate and the adoption procedure.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start PostgreSQL 16 (localhost only)
+        run: docker compose up -d --wait db
+      - run: npm ci
+      - run: npm run build
+      - name: Populated adoption rehearsal (1,000,000 observations; writer never in a lock wait during the concurrent build)
+        run: SI_ADOPT_ROWS=1000000 node tests/db/run.mjs tests/slow/m4-adopt-rehearsal.test.mjs
+      - name: Readiness and adoption deliberate breaks (RX1-RX5, AX1-AX4; files restored)
+        run: CI=true node tests/mutations/m4-p33-p1.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db

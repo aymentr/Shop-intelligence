@@ -1751,3 +1751,165 @@ Then four requests (selective, `limit` 1, a second identity, and broad with a ne
 
 **SSX12** removes only that clause. It is killed by SS-2e: the request takes the summary path (`'summary'` instead of `'observations'`).
 
+## 17. M4-P3.3 Phase 1: index readiness and populated adoption of 0022 (R-45, R-42)
+
+**Status:** branch `claude/b002-m4-p3-3-p1-implement-01` from `54cf5d4`. No migration changes: 0001–0023 are byte-identical.
+New: `db/ops/readiness.sql`, `src/persistence/readiness.ts`, `buildIndexConcurrently` and `adoptMigration` in
+`src/persistence/migrate.ts`, the CLI commands `readiness`, `build-index` and `adopt`, and the readiness check in
+production preflight. Phase 2 (batched verification) and Phase 3 (path observability) are not part of this phase.
+
+### 17.1 Readiness (`db/ops/readiness.sql`)
+
+A read-only catalog check of one physical structure; **not** an evidence-integrity check (that is
+`integrity-gate.sql`, `fk-audit.sql` and `verify-summaries.sql`; RDY-20 shows that each check is blind to the other's
+subject). PASS = zero rows; each row is `code | object`. It is run by:
+
+| Where | How |
+|---|---|
+| Operators | `cli.js readiness` (exit 1 on failure) or `psql -f db/ops/readiness.sql` |
+| Production preflight | `index_readiness_observations_by_ad_fk`, last check of `assertProductionReady`: NOT_APPLICABLE below schema version 22, required from 22 on |
+| CI | the integration job, on the migrated template |
+| DR-1 | on the restored cluster |
+| `adopt` | inside its transaction, as the condition for recording 0022 |
+
+Failure matrix (each tested in `tests/db/m4-readiness.test.mjs` with the exact set of codes):
+
+| Fault | Codes | Test |
+|---|---|---|
+| index missing | INDEX_MISSING | RDY-1 |
+| `indisvalid` false (failed or cancelled concurrent build) | INDEX_NOT_VALID | RDY-2, MIG-4/5 |
+| `indisready` false | INDEX_NOT_READY | RDY-3 |
+| `indislive` false | INDEX_NOT_LIVE | RDY-4 |
+| a relation of that name that is not an index | NOT_AN_INDEX | RDY-5 |
+| index on another table | INDEX_WRONG_TABLE, INDEX_WRONG_DEFINITION | RDY-6 |
+| another access method (brin) | INDEX_WRONG_ACCESS_METHOD, INDEX_WRONG_OPCLASS ×4, INDEX_WRONG_DEFINITION | RDY-7 |
+| key order changed | INDEX_WRONG_KEY, INDEX_WRONG_DEFINITION | RDY-8 |
+| key column missing | INDEX_WRONG_KEY, INDEX_WRONG_DEFINITION | RDY-9 |
+| collation | INDEX_WRONG_COLLATION, INDEX_WRONG_DEFINITION | RDY-10 |
+| operator class | INDEX_WRONG_OPCLASS, INDEX_WRONG_DEFINITION | RDY-11 |
+| DESC / NULLS FIRST | INDEX_WRONG_DIRECTION, INDEX_WRONG_DEFINITION | RDY-12, RDY-13 |
+| INCLUDE column | INDEX_INCLUDED_COLUMNS, INDEX_WRONG_DEFINITION | RDY-14 |
+| partial | INDEX_PARTIAL, INDEX_WRONG_DEFINITION | RDY-15 |
+| expression key | INDEX_EXPRESSION, INDEX_WRONG_KEY, INDEX_WRONG_DEFINITION | RDY-16 |
+| UNIQUE (catch-all) | INDEX_WRONG_DEFINITION | RDY-17 |
+| invalid leftover index elsewhere in schema si | INVALID_INDEX_ARTIFACT | RDY-18, RDY-19 |
+
+### 17.2 Populated adoption
+
+Migration 0022 builds its index inside the migrator's transaction and blocks writers for the duration of the build. On a
+populated database:
+
+```
+state:  V21 (no index) --build-index--> V21 + building --ok--> V21 + ready index --adopt--> V22 (recorded) --up--> V23
+                               |                 |
+                               |                 +-- cancelled / failed / connection lost --> V21 + invalid index
+                               |                       --build-index (refuses: INVALID_INDEX_PRESENT)
+                               |                       --build-index --replace-invalid --> drops exactly that index, rebuilds
+                               +-- lock timeout --> V21 (nothing left)
+```
+
+**`build-index --version 22`** (outside any transaction; PostgreSQL refuses CREATE INDEX CONCURRENTLY inside one):
+- the applied set must be exactly 1..21 with byte-identical files; 22 or later → ALREADY_APPLIED, nothing done;
+- the local 0022 files must equal the pinned checksums, and the statement built is 0022's own with CONCURRENTLY added;
+- another invalid index in schema si → INVALID_ARTIFACTS_PRESENT (never dropped: it may belong to someone else);
+- a ready index of the required definition → ALREADY_BUILT;
+- an **invalid** index of the required name **and** definition → INVALID_INDEX_PRESENT, unless `--replace-invalid`; then
+  that same object (oid re-checked) is dropped concurrently and rebuilt;
+- anything else under that name (valid with another definition, another table, not an index) → INDEX_CONFLICT, never dropped;
+- `lock_timeout` (default 5 s) bounds every lock wait; a timeout before the catalog entry exists leaves nothing.
+
+**`adopt --version 22`**, one transaction, run as si_owner, under the migrator's advisory lock (`up`, `down` and
+adoptions serialize):
+- the same applied-set and pinned-checksum checks (WRONG_VERSION, CHECKSUM_MISMATCH, NOT_ADOPTABLE); 22 already recorded
+  → ALREADY_APPLIED, with readiness still required;
+- `LOCK TABLE si.observations IN SHARE UPDATE EXCLUSIVE MODE` (bounded by `lock_timeout`): no CREATE / DROP / REINDEX of
+  any index on the table, concurrent or not, until commit; reads and writes continue;
+- readiness must PASS (else INDEX_NOT_READY with every code); this is the catalog-equivalence condition;
+- then the same `si.schema_migrations` row `up` writes (0022's exact checksums, `applied_by` = the login), and one row in
+  `si.schema_adoptions`: version, checksums, index oid, definition, size, `readiness = PASS`, server version, who, when.
+  The table is created by the first adoption, owned by si_owner, append-only (UPDATE, DELETE and TRUNCATE refused),
+  readable by si_monitor and si_migrator only.
+
+**Race with a concurrent migrator.** The build takes no advisory lock (holding one across a concurrent build could
+deadlock with a waiting migrator whose snapshot the build must outwait). Instead:
+- a `migrate up` that reaches 0022 during the build waits for the build's lock and then fails on the existing name,
+  recording nothing (MIG-10);
+- a migrator that applied 0022 first makes the build report ALREADY_APPLIED;
+- `adopt` re-verifies everything under the advisory lock and the table lock.
+
+So 0022 is never recorded without a ready index.
+
+**Rollback.** `migrate down --to 21` reverses an adoption exactly like an application (0022's down file, a brief exclusive
+lock for `DROP INDEX`). The adoption evidence is kept. A second adoption adds a second evidence row (MIG-12).
+
+**Supported procedure** (populated database, maintenance window):
+1. Stop or pause the migration runner; take a backup.
+2. Check for long-running transactions (a concurrent build waits for every older snapshot): `pg_stat_activity`.
+3. `cli.js build-index --version 22 --lock-timeout-ms 5000` as si_migrator. Watch `pg_stat_progress_create_index`. On
+   failure: inspect `cli.js readiness`. Rerun with `--replace-invalid` only when the only failures are INDEX_NOT_VALID /
+   NOT_READY / NOT_LIVE of the index itself. Remove a foreign INVALID_INDEX_ARTIFACT by hand after identifying its owner.
+4. `cli.js readiness` → PASS.
+5. `cli.js adopt --version 22` → ADOPTED (or ALREADY_APPLIED).
+6. `cli.js up` → applies 0023 and later.
+7. Production preflight → `index_readiness_observations_by_ad_fk: PASS`.
+
+### 17.3 Tests and deliberate breaks
+
+`tests/db/m4-adopt.test.mjs`, each on its own version-21 database with 20,000 synthetic rows:
+
+| Test | What it checks |
+|---|---|
+| MIG-1 | Build, adopt and up as si_migrator; exact checksums and evidence; the catalog equals a normal migration to 23, apart from the adoption log's own objects |
+| MIG-2 | Wrong versions; ALREADY_APPLIED; only 22 is adoptable |
+| MIG-3 | Repeated invocation |
+| MIG-4 | Deterministic cancelled concurrent build (held in its wait phase): adopt refuses, the build refuses without `--replace-invalid`, the replacement touches no other index |
+| MIG-5 | Lost build session |
+| MIG-6 | Lock timeout of the build and of adopt |
+| MIG-7 | 20 inserts during the held build: max 5 ms, and the rows are in the index |
+| MIG-8 | Cleanup never drops a valid wrong index, an invalid wrong index or a foreign artifact |
+| MIG-9 | Modified 0022 or applied files fail closed |
+| MIG-10 | A racing migrator |
+| MIG-11 | Adopt waits on the migrator lock |
+| MIG-12 | Rollback, append-only evidence, re-adoption |
+| MIG-13 | Privileges; a refused adoption leaves no open transaction |
+| MIG-14 | The build refuses to run inside a transaction |
+| MIG-15 | The CLI |
+| MIG-C1, MIG-C2 | `tests/crash/m4-adopt-crash.test.mjs`: a server restart (SIGKILL of the build's backend, then crash recovery) while the build waits for older snapshots, and while it scans 500,000 rows. Committed rows survive; readiness reports only the index's own codes; adopt and the plain build refuse; `--replace-invalid` touches no other index; adopt and up converge |
+
+`tests/mutations/m4-p33-p1.mjs` removes each check; each mutant must be killed by its named test:
+
+| Mutant | Removed check | Detector |
+|---|---|---|
+| RX1 | validity | RDY-2 |
+| RX2 | readiness | RDY-3 |
+| RX3 | key order | RDY-8 |
+| RX4 | artifacts | RDY-18 |
+| RX5 | definition catch-all | RDY-17 |
+| AX1 | catalog equivalence in adopt | MIG-4 |
+| AX2 | version check | MIG-2 |
+| AX3 | pinned checksums | MIG-9 |
+| AX4 | foreign artifacts in the build | MIG-8 |
+
+`tests/slow/m4-adopt-rehearsal.test.mjs` rehearses a cancelled build, its recovery, adopt and up with a concurrent writer.
+It runs at 1,000,000 rows in the CI job `populated-adoption`, and at 10,000,000 locally.
+
+### 17.4 Rehearsal results (local test container, PostgreSQL 16.15, tmpfs, fsync off; synthetic)
+
+| Observations (table size) | Concurrent build | Writer (1 row per transaction) | Lock-wait samples | Index | WAL during the build | Adopt / up |
+|---|---|---|---|---|---|---|
+| 1,000,000 (403 MB) | 667 ms | 145 inserts, p50 2.0 / p95 5.3 / max 16.9 ms | 0 / 113 | 56 MB | 52.2 MB | 24 ms / 12 ms |
+| 10,000,000 (4,036 MB) | 5,421 ms | 1,261 inserts, p50 1.9 / p95 3.7 / max 14.7 ms | 0 / 902 | 560 MB | 520.3 MB | 21 ms / 7 ms |
+| 1,000,000, 0022's own build (comparison) | 439 ms | 4 inserts, max 417.8 ms | 64 / 68 | | | |
+
+In each run, a first concurrent build was cancelled mid-scan, which left `INDEX_NOT_READY` and `INDEX_NOT_VALID`. Adopt
+refused it. The replacement build (`--replace-invalid`) is the measured one. The 10,000,000 comparison build was not run:
+the test container's tmpfs cannot hold two such databases. The non-concurrent build is shorter, but blocks every writer
+for its whole duration; the concurrent build never did.
+
+### 17.5 Limits
+
+- A synthetic rehearsal on a test container (tmpfs, fsync off) is not evidence of production-storage performance.
+- The readiness check proves a structure, not compliance: organizational, privacy and infrastructure readiness are
+  outside SQL.
+- The adoption log is owner-controlled (contract B), like `si.schema_migrations`.
+
