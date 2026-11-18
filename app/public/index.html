@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="si-csrf" content="__CSRF_TOKEN__">
+  <title>Shop Intelligence — Demo</title>
+  <link rel="stylesheet" href="/app.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div class="synthetic-banner" role="note">
+    <strong>Synthetic data</strong> · local demonstration · invented sources and advertisers · no live market data, no sales or spend data
+  </div>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#/overview">
+        <span class="brand-mark" aria-hidden="true">SI</span>
+        <span class="brand-text">Shop Intelligence<small>Demo V1</small></span>
+      </a>
+      <nav>
+        <a href="#/overview" data-nav="overview">Overview</a>
+        <a href="#/explorer" data-nav="explorer">Advertiser explorer</a>
+        <a href="#/operations" data-nav="operations">Collection &amp; publication</a>
+      </nav>
+      <div class="sidebar-foot">
+        <p>Reads run as the dedicated analyst principal. Every read is authorized and audited by the database.</p>
+      </div>
+    </aside>
+    <main id="main" tabindex="-1">
+      <div class="loading">Loading…</div>
+    </main>
+  </div>
+</body>
+</html>

@@ -6,7 +6,7 @@ A TypeScript **offline-only** evaluation harness for future multi-network advert
 
 - Strict parsing, network-scoped identities, deduplication, collection runs and basic diagnostic ratios.
 - Fail-closed rights for evaluation, retention, subscriber display, media mirroring and exports.
-- Synthetic fixture adapters only. **No live platform API integrations, scraping, HTTP requests, UI, or commercially licensed ad dataset**. The B-002 PostgreSQL foundation persists rights, runs and synthetic evidence; the offline ingestion harness (`npm run demo`) is not connected to it end-to-end.
+- Synthetic fixture adapters only. **No live platform API integrations, scraping, outbound HTTP requests, or commercially licensed ad dataset**. The only UI is the local, loopback-only DEMO-V1 interface on synthetic data (below); it is not customer display. The B-002 PostgreSQL foundation persists rights, runs and synthetic evidence; the offline ingestion harness (`npm run demo`) is not connected to it end-to-end.
 - An `ALLOWED` flag is an internal gate, **not legal authorization**. Real permissions require independently documented source agreements.
 - Synthetic fixture links use `example.org` and are never fetched.
 - Runtime dependency: `pg`. Development dependencies include `typescript`, `@types/node`, and `@types/pg`; versions are pinned in `package.json` and locked in `package-lock.json`. Requires Node 22+.
@@ -19,6 +19,19 @@ npm run typecheck
 npm test
 npm run demo
 ```
+
+## Local demo interface (DEMO-V1, synthetic data only)
+
+```bash
+npm ci
+npm run app        # disposable PostgreSQL 16.15 container + seeded synthetic data
+# open http://127.0.0.1:4173/   (Ctrl+C stops it and removes the container)
+```
+
+It covers an overview, an advertiser explorer (the summary-backed search), advertiser detail with its evidence history,
+and collection and publication with source controls. It uses only the existing database functions and roles, binds to
+127.0.0.1 only, and keeps credentials on the server. Real-evidence pilot and production: NO-GO.
+Details, workflows, tests and limitations: `docs/demo-v1.md`. API tests: `npm run test:app` (needs `docker compose up -d --wait db`).
 
 ## Current model
 

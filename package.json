@@ -15,7 +15,10 @@
     "db:status": "node dist/persistence/cli.js status",
     "demo": "npm run build && node demo.mjs",
     "demo:lifecycle": "npm run build && bash demo/run.sh",
-    "demo:intelligence": "npm run build && DEMO_PROGRAM=demo/intelligence.mjs bash demo/run.sh"
+    "demo:intelligence": "npm run build && DEMO_PROGRAM=demo/intelligence.mjs bash demo/run.sh",
+    "app": "npm run build:app && bash demo/app.sh",
+    "test:app": "npm run build:app && node tests/db/run.mjs tests/app/demo-app.test.mjs",
+    "build:app": "npm run build && node -e \"require('node:fs').rmSync('app/dist',{recursive:true,force:true})\" && tsc -p tsconfig.app.json"
   },
   "engines": {
     "node": ">=22"

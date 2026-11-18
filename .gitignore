@@ -5,3 +5,4 @@ dist/
 *.log
 coverage/
 demo-report*.json
+app/dist/
