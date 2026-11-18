@@ -26,7 +26,10 @@
  * the gate checks a live collector session's effective logging settings and fails closed without it.
  *
  * Retention commands print only codes, ids, times and counts; a failure prints
- * "RETENTION_FAILED code=<code> sqlstate=<state> recorded=<bool>", never a database message.
+ * "RETENTION_FAILED code=<code> sqlstate=<state> recorded=<bool>", never a database message; a refusal by the production
+ * gate is code=PRECONDITION, followed by the content-free PRODUCTION_PREFLIGHT_FAILED line (M4-P3.3-P1-OPS-01).
+ * Under SI_PRODUCTION=1, `retention purge` and the read-only status commands tolerate unrelated invalid index artifacts
+ * that cannot matter to them, with a WARN line each; every other command is strict (docs §17.5).
  * Nothing is scheduled by this CLI.
  *
  * bootstrap sets login passwords only if SI_ROLE_PASSWORD_<ROLE> (e.g.
@@ -38,7 +41,8 @@ import { bootstrapCluster, bootstrapDatabase, LOGIN_ROLES, type LoginRole } from
 import { adoptMigration, buildIndexConcurrently, migrateDown, migrateUp, migrationStatus } from './migrate.js';
 import { checkIndexReadiness, checkIndexReadinessPrecondition } from './readiness.js';
 import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
-import { assertProductionReady } from './production-readiness.js';
+import { assertProductionReady, ProductionGateRefused } from './production-readiness.js';
+import type { ReadinessScope } from './readiness.js';
 import { DEFAULT_PURGE_RUNS, overdueRetention, purgeDue, purgeFailures, RetentionFailed, retentionStatus } from './retention.js';
 import { DEFAULT_VERIFY_RUNS, verificationFailures, verificationStatus, VerificationFailed, verifyReceipts } from './verification.js';
 
@@ -82,6 +86,19 @@ async function verification(client: pg.Client, sub: string | undefined): Promise
   }
 }
 
+/**
+ * M4-P3.3-P1-OPS-01 (docs §17.5): the readiness scope of the production gate for this command. Only `retention purge`
+ * ('purge') and the read-only status commands ('diagnostic') may tolerate UNRELATED invalid index artifacts (with a
+ * warning); every other command, including `preflight --production`, is 'strict'. All other gate checks are unchanged.
+ */
+function readinessScopeFor(command: string | undefined, sub: string | undefined): ReadinessScope {
+  if (command === 'retention' && sub === 'purge') return 'purge';
+  if ((command === 'retention' && (sub === 'status' || sub === 'overdue' || sub === 'failures')) ||
+      (command === 'verification' && (sub === 'status' || sub === 'failures')) ||
+      command === 'status' || command === 'readiness') return 'diagnostic';
+  return 'strict';
+}
+
 /** A live collector session for the production gate, or null (the gate then fails closed). */
 async function collectorSession(): Promise<pg.Client | null> {
   const curl = process.env.SI_COLLECTOR_DATABASE_URL;
@@ -104,7 +121,10 @@ async function main(): Promise<void> {
     if (process.env.SI_PRODUCTION === '1' ||
         (command === 'preflight' && process.argv.includes('--production'))) {
       const col = await collectorSession();
-      try { await assertProductionReady(client, { collector: col }); } finally { await col?.end().catch(() => {}); }
+      try {
+        const { warnings } = await assertProductionReady(client, { collector: col, readinessScope: readinessScopeFor(command, process.argv[3]) });
+        for (const w of warnings) console.error(`WARN PRODUCTION_PREFLIGHT_TOLERATED: ${w}`);
+      } finally { await col?.end().catch(() => {}); }
     }
     if (command === 'bootstrap') {
       const passwords: Partial<Record<LoginRole, string>> = {};
@@ -173,6 +193,14 @@ main().catch(err => {
   }
   if (err instanceof VerificationFailed) {
     console.error(`VERIFICATION_FAILED code=${err.code} sqlstate=${err.sqlstate ?? 'none'} recorded=${err.recorded}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (process.argv[2] === 'retention' && err instanceof ProductionGateRefused) {
+    // M4-P3.3-P1-OPS-01: a gate refusal is a precondition failure, not a connection failure. Both lines are content-free
+    // (check names, catalog object names, settings).
+    console.error('RETENTION_FAILED code=PRECONDITION sqlstate=none recorded=false');
+    console.error(err.message);
     process.exitCode = 1;
     return;
   }

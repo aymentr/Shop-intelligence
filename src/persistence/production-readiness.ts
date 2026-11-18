@@ -12,11 +12,22 @@
  */
 import type { ClientBase } from 'pg';
 import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions, type PreconditionResult } from './preconditions.js';
-import { checkIndexReadinessPrecondition } from './readiness.js';
+import { checkIndexReadinessPrecondition, type ReadinessScope } from './readiness.js';
 
 export interface ProductionReadinessOptions {
   /** A live session of the si_collector login, connected to the same database as `client`. */
   collector?: ClientBase | null;
+  /**
+   * M4-P3.3-P1-OPS-01: how the 0022 readiness check treats UNRELATED invalid index artifacts. 'strict' (default) for every
+   * deployment and normal command; 'purge' / 'diagnostic' only for `retention purge` and the read-only status commands
+   * (readiness.ts, docs §17.5). Every other check of this gate is identical in every scope.
+   */
+  readinessScope?: ReadinessScope;
+}
+
+/** The gate refused: carries the content-free failure line, so callers can report it under an accurate code. */
+export class ProductionGateRefused extends Error {
+  constructor(message: string) { super(message); this.name = 'ProductionGateRefused'; }
 }
 
 async function collectorChecks(client: ClientBase, collector: ClientBase | null | undefined): Promise<PreconditionResult[]> {
@@ -33,17 +44,19 @@ async function collectorChecks(client: ClientBase, collector: ClientBase | null 
   }
 }
 
-export async function assertProductionReady(client: ClientBase, options: ProductionReadinessOptions = {}): Promise<void> {
+export async function assertProductionReady(client: ClientBase, options: ProductionReadinessOptions = {}): Promise<{ warnings: string[] }> {
   const checks = [
     ...await checkOperationalPreconditions(client),
     ...await checkProductionAdvisoryPermissions(client),
     ...await collectorChecks(client, options.collector)
   ];
   // M4-P3.3 Phase 1 (R-45): from schema version 22 on, the 0022 index must pass db/ops/readiness.sql.
-  checks.push(...await checkIndexReadinessPrecondition(client));
+  const readiness = await checkIndexReadinessPrecondition(client, options.readinessScope ?? 'strict');
+  checks.push(...readiness);
   const failed = checks.filter(check => !check.ok);
   if (failed.length > 0) {
-    throw new Error('PRODUCTION_PREFLIGHT_FAILED: ' +
+    throw new ProductionGateRefused('PRODUCTION_PREFLIGHT_FAILED: ' +
       failed.map(check => check.name + '=' + check.actual).join('; '));
   }
+  return { warnings: readiness.flatMap(r => (r.warnings ?? []).map(w => `${r.name}: ${w}`)) };
 }

@@ -1,5 +1,5 @@
 // B-002 M4-P3.3 Phase 1: deliberate breaks of the readiness gate (db/ops/readiness.sql) and of the adoption procedure
-// (src/persistence/migrate.ts, readiness.ts, production-readiness.ts). Each mutant is applied with exactly one anchor; TypeScript mutants are compiled
+// (src/persistence/migrate.ts, readiness.ts, production-readiness.ts, cli.ts). Each mutant is applied with exactly one anchor; TypeScript mutants are compiled
 // (npm run build); the RDY and MIG suites run; the mutant is KILLED only if its named detector fails with an assertion.
 // Every file is restored byte for byte after each mutant (verified), dist/ is rebuilt, and the restored baseline must be green.
 //   CI=true node tests/mutations/m4-p33-p1.mjs
@@ -12,8 +12,8 @@ if (process.env.SI_PRODUCTION === '1') throw new Error('m4-p33-p1 refuses produc
 if (!['127.0.0.1', 'localhost', '::1'].includes(process.env.SI_TEST_PGHOST ?? '127.0.0.1')) throw new Error('loopback PostgreSQL test host required');
 
 const SQL = 'db/ops/readiness.sql', TS = 'src/persistence/migrate.ts';
-const RDY_TS = 'src/persistence/readiness.ts', GATE_TS = 'src/persistence/production-readiness.ts';
-const originals = new Map([SQL, TS, RDY_TS, GATE_TS].map(f => [f, readFileSync(f)]));
+const RDY_TS = 'src/persistence/readiness.ts', GATE_TS = 'src/persistence/production-readiness.ts', CLI_TS = 'src/persistence/cli.ts';
+const originals = new Map([SQL, TS, RDY_TS, GATE_TS, CLI_TS].map(f => [f, readFileSync(f)]));
 const sha = b => createHash('sha256').update(b).digest('hex').slice(0, 12);
 const M = [
   { id: 'RX1', file: SQL, why: 'validity check removed',
@@ -42,12 +42,29 @@ const M = [
     detector: /^not ok \d+ - MIG-8:/m },
   // M4-P3.3-P1-CLOSE-01: the acceptance review's surviving gate mutants (NX1, NX2, NX4), now detected by tests/db/m4-gate.test.mjs.
   { id: 'NX1', file: GATE_TS, why: 'the production gate (every SI_PRODUCTION=1 command) no longer runs the readiness check',
-    anchor: '  checks.push(...await checkIndexReadinessPrecondition(client));\n', to: '', detector: /^not ok \d+ - GATE-1:/m },
+    anchor: '  checks.push(...readiness);\n', to: '', detector: /^not ok \d+ - GATE-1:/m },
   { id: 'NX2', file: RDY_TS, why: 'exactly version 22 (adopted, before up) treated as NOT_APPLICABLE',
     anchor: '  if (version < INDEX_REQUIRED_FROM_VERSION) {', to: '  if (version <= INDEX_REQUIRED_FROM_VERSION) {', detector: /^not ok \d+ - GATE-3:/m },
   { id: 'NX4', file: TS, why: 'adopt reports ALREADY_APPLIED without checking readiness once 22 is recorded',
     anchor: "      if (failures.length) throw new MigrationError('INDEX_NOT_READY', `version ${opts.version} is recorded but the index is not ready: ${describe(failures)}`);\n",
     to: '', detector: /^not ok \d+ - GATE-5:/m },
+  // M4-P3.3-P1-OPS-01: the command-scoped emergency-operations exception (docs §17.5), detected by tests/db/m4-ops.test.mjs.
+  { id: 'OX1', file: CLI_TS, why: 'command restriction removed: every production command gets the purge tolerance',
+    anchor: "  return 'strict';\n}", to: "  return 'purge';\n}", detector: /^not ok \d+ - OPS-2:/m },
+  { id: 'OX2', file: RDY_TS, why: 'the 0022 index\'s own failures are suppressed in the tolerant scopes',
+    anchor: "  const blocking = all.filter(f => f.code !== 'INVALID_INDEX_ARTIFACT');", to: '  const blocking: ReadinessFailure[] = [];', detector: /^not ok \d+ - OPS-6:/m },
+  { id: 'OX3', file: CLI_TS, why: 'tolerated artifacts are no longer reported as warnings',
+    anchor: "        for (const w of warnings) console.error(`WARN PRODUCTION_PREFLIGHT_TOLERATED: ${w}`);\n", to: '        void warnings;\n',
+    detector: /^not ok \d+ - OPS-2:/m },
+  { id: 'OX4', file: RDY_TS, why: 'invalid SCHEMA indexes are tolerated like ad hoc artifacts',
+    anchor: " || SCHEMA_INDEXES.has(a.object)) { blocking.push(a); continue; }", to: ") { blocking.push(a); continue; }", detector: /^not ok \d+ - OPS-5:/m },
+  { id: 'OX5', file: RDY_TS, why: 'a READY artifact without a twin is tolerated by the purge',
+    anchor: '    else blocking.push(a);\n', to: "    else tolerated.push({ name: a.object, table: f.table, reason: 'mutant' });\n", detector: /^not ok \d+ - OPS-4:/m },
+  { id: 'OX6', file: RDY_TS, why: 'every artifact is treated as having an identical valid twin',
+    anchor: 'twin: r.twin === true', to: 'twin: true', detector: /^not ok \d+ - OPS-4:/m },
+  { id: 'OX7', file: CLI_TS, why: 'a gate refusal of a retention command is reported as a connection failure again',
+    anchor: "    console.error('RETENTION_FAILED code=PRECONDITION sqlstate=none recorded=false');", to: "    console.error('RETENTION_FAILED code=CONNECTION sqlstate=none recorded=false');",
+    detector: /^not ok \d+ - OPS-7:/m },
 ];
 // SI_MUT_ONLY=AX3,AX4 runs a subset (local diagnosis only; CI runs every mutant).
 const ONLY = (process.env.SI_MUT_ONLY ?? '').split(',').filter(Boolean);
@@ -58,7 +75,7 @@ const restoreAll = () => {
   console.log('restored byte-for-byte and rebuilt:', [...originals].map(([f, b]) => `${f.split('/').pop()} ${sha(b)}`).join(', '));
 };
 const suite = () => {
-  const r = spawnSync(process.execPath, ['tests/db/run.mjs', 'm4-readiness', 'm4-adopt', 'm4-gate'], { encoding: 'utf8', timeout: 3600000, maxBuffer: 64 * 1024 * 1024 });
+  const r = spawnSync(process.execPath, ['tests/db/run.mjs', 'm4-readiness', 'm4-adopt', 'm4-gate', 'm4-ops'], { encoding: 'utf8', timeout: 3600000, maxBuffer: 64 * 1024 * 1024 });
   return { r, out: (r.stdout ?? '') + '\n' + (r.stderr ?? '') };
 };
 const outcomes = [];

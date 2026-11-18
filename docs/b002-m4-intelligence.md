@@ -1927,6 +1927,7 @@ commands (`SI_PRODUCTION=1`; GATE-4). From version 22 on, the gate requires read
 | MIG-13 | Privileges; a refused adoption leaves no open transaction |
 | MIG-14 | The build refuses to run inside a transaction |
 | MIG-15 | The CLI |
+| OPS-0 to OPS-9 | `tests/db/m4-ops.test.mjs` (M4-P3.3-P1-OPS-01), the command-scoped exception through the production CLI as the documented logins: the manifest and read-only diagnostics (OPS-0); a healthy database (1); one unrelated not-ready artifact tolerated by purge and diagnostics with a warning, while `up`, `adopt`, `build-index`, `verification run`, `preflight --production` and `down` are refused (2); several artifacts, including a real REINDEX CONCURRENTLY leftover with a twin (3); a real ready UNIQUE artifact that breaks `si_purge_due`, refused (4); an invalid schema index (5); every failure of the 0022 index (6); another gate failure (7); unauthorized purge (8); purge under contention with deadlines and latency (9) |
 | GATE-1 to GATE-5 | `tests/db/m4-gate.test.mjs` (M4-P3.3-P1-CLOSE-01), on hardened disposable databases: the production gate itself (`assertProductionReady`) rejects an invalid or missing index at 23 (GATE-1); an `SI_PRODUCTION=1` command is refused before dispatch (GATE-2); at exactly version 22 after adoption a ready index passes and an invalid one is refused (GATE-3); 22 by the plain migration passes, and at 21 the recovery runs as production commands (GATE-4); an invalid index is refused by adoption and repeated adoption, before and after 22 is recorded (GATE-5) |
 | MIG-C1, MIG-C2 | `tests/crash/m4-adopt-crash.test.mjs`: a server restart (SIGKILL of the build's backend, then crash recovery) while the build waits for older snapshots, and while it scans 500,000 rows. Committed rows survive; readiness reports only the index's own codes; adopt and the plain build refuse; `--replace-invalid` touches no other index; adopt and up converge |
 
@@ -1946,6 +1947,13 @@ commands (`SI_PRODUCTION=1`; GATE-4). From version 22 on, the gate requires read
 | NX1 | the readiness check in the production gate (`assertProductionReady`) | GATE-1 |
 | NX2 | enforcement at exactly version 22 | GATE-3 |
 | NX4 | readiness when 22 is already recorded (adopt reports ALREADY_APPLIED) | GATE-5 |
+| OX1 | the command restriction (every command gets the purge tolerance) | OPS-2 |
+| OX2 | the 0022 index's own failures in the tolerant scopes | OPS-6 |
+| OX3 | the warnings for tolerated artifacts | OPS-2 |
+| OX4 | the schema-index exclusion | OPS-5 |
+| OX5 | the purge's ready-without-twin refusal | OPS-4 |
+| OX6 | the twin check (every artifact treated as twinned) | OPS-4 |
+| OX7 | the PRECONDITION code for a refused retention command (reverted to CONNECTION) | OPS-7 |
 
 NX1, NX2 and NX4 survived the Phase 1 suites in the acceptance review (M4-P3.3-P1-ACCEPT-01). NX1 was masked because
 `preflight --production` appends the readiness check a second time after the gate, and the only end-to-end test read that
@@ -1973,46 +1981,61 @@ refused it. The replacement build (`--replace-invalid`) is the measured one. The
 the test container's tmpfs cannot hold two such databases. The non-concurrent build is shorter, but blocks every writer
 for its whole duration; the concurrent build never did.
 
-### 17.5 Production gate scope and emergency operations (M4-P3.3-P1-CLOSE-01: PROPOSAL, not implemented)
+### 17.5 Production gate scope and emergency operations (M4-P3.3-P1-OPS-01: implemented)
 
-`assertProductionReady` runs before every CLI command when `SI_PRODUCTION=1`. From version 22 on it includes the
-readiness check, and with it INVALID_INDEX_ARTIFACT: any invalid index anywhere in schema si, including one unrelated to
-0022 (for example a failed REINDEX CONCURRENTLY of another index). Reproduced in the acceptance review.
+`assertProductionReady` runs before every CLI command when `SI_PRODUCTION=1`. From version 22 on it includes the readiness
+check, and with it INVALID_INDEX_ARTIFACT: any invalid index anywhere in schema si. The gate now has a readiness scope, chosen
+per command by the CLI (`readinessScopeFor`). Every other gate check is identical in every scope: the operational
+preconditions, D5b and collector logging.
 
-| Class | Commands | Gated today |
+| Class | Commands | Readiness scope |
 |---|---|---|
-| Deployment | `bootstrap`, `up`, `down`, `build-index`, `adopt`, `preflight --production` | yes |
-| Normal operations | `verification run` | yes |
-| Emergency retention / recovery | `retention purge` (deadline-bound deletion, also the emergency purge after TERMINATE_RETENTION) | yes |
-| Emergency source controls | SUSPEND / LIFT / TERMINATE_RETENTION: `si.si_record_source_control`, granted to si_rights_admin and called in SQL; no CLI path | **no**: not affected by the gate |
-| Read-only diagnostics | `status`, `readiness`, `retention status / overdue / failures`, `verification status / failures` | yes |
+| Deployment | `bootstrap`, `up`, `down`, `build-index`, `adopt`, `preflight --production` | `strict` |
+| Normal operations | `verification run` | `strict` |
+| Emergency retention | `retention purge` | `purge` |
+| Read-only diagnostics | `status`, `readiness`, `retention status / overdue / failures`, `verification status / failures` (they call STABLE functions only: OPS-0) | `diagnostic` |
+| Emergency source controls | SUSPEND / LIFT / TERMINATE_RETENTION: `si.si_record_source_control`, granted to si_rights_admin, called in SQL; no CLI path | not gated |
 
-Under `SI_PRODUCTION=1` the retention commands report any gate failure as `RETENTION_FAILED code=CONNECTION
-sqlstate=none recorded=false`: their deliberately content-free error mapping, unchanged since before Phase 1. This hides
-the cause. Other commands print the `PRODUCTION_PREFLIGHT_FAILED: ...` line with the codes.
-
-Can unrelated invalid indexes be ignored safely? For correctness, yes:
+**Why the approved exception is narrowed.** Not every "unrelated" invalid index is irrelevant to the purge. In PostgreSQL:
 - the planner never uses an invalid index;
-- a ready one is still maintained on writes (cost only); a not-ready one is not maintained;
-- no result, audit, authorization or durability check depends on them.
+- but an invalid index that is **ready** is still maintained by every INSERT and non-HOT UPDATE. That includes uniqueness
+  and exclusion enforcement (with waits on other transactions), expression and predicate evaluation, and btree key-size
+  limits.
 
-The 0022 index's own failures are different: the RT-13 purge bound and the emergency-control wait depend on that index
-(§15C), so they must keep blocking.
+The purge (`si.si_purge_due`, 0006) UPDATEs si.collection_runs and INSERTs into si.purge_log and, on failure,
+si.purge_failures. OPS-4 reproduces the consequence with a real cancelled `CREATE UNIQUE INDEX CONCURRENTLY` on
+si.purge_log: the leftover is invalid, but `si_purge_due` fails with 23505 on two runs of one source. An invalid
+**schema** index (an interrupted DROP or REINDEX of a migration index) removes a plan the purge bound or a diagnostic
+relies on.
 
-**Proposal (requires approval; production behavior change, not implemented):**
-1. No global bypass, and no change to the operational, D5b and collector-logging checks; every command keeps them.
-2. Only for `retention purge` and the read-only diagnostics, INVALID_INDEX_ARTIFACT entries naming an index other than
-   `observations_by_ad_fk` become a reported warning instead of a gate failure. They are still printed, with their codes.
-   Every own-index code still blocks every command, and deployment and normal-operation commands keep the full check.
-3. The retention CLI reports a gate refusal as its own code (e.g. `code=PRECONDITION`) instead of `code=CONNECTION`,
-   still content-free.
-4. Tests and mutants for each: an unrelated artifact allows `retention purge` and `status` but blocks `up` / `adopt` /
-   `verification run`; an own-index failure blocks all of them.
+So an INVALID_INDEX_ARTIFACT is tolerated, with a warning, only when:
+- it is not a schema index (`SCHEMA_INDEXES` in readiness.ts: every index of 0001-0023 and of the adoption log; OPS-0 pins
+  it to the migrated catalog);
+- and, for `purge`, it is either:
+  - **not ready**: never maintained, never used; or
+  - **ready with a twin**: a valid, ready, live index on the same table with the identical definition (a REINDEX
+    CONCURRENTLY `_ccnew` / `_ccold` leftover, whose writes behave exactly like its twin's).
 
-Until approved, the documented response to an unrelated INVALID_INDEX_ARTIFACT that blocks production commands is:
-identify it (`cli.js readiness` without `SI_PRODUCTION`, or `psql -f db/ops/readiness.sql`), confirm it is a failed
-concurrent build, and drop it as the owner (`DROP INDEX CONCURRENTLY si.<name>`). Emergency source controls remain
-available throughout.
+Everything else blocks:
+- every failure of observations_by_ad_fk itself (missing, invalid, not ready, not live, wrong definition, not an index),
+  in every scope;
+- an invalid schema index;
+- for `purge`, a ready artifact without a twin.
+
+Behaviour:
+- **A tolerated artifact** is printed on stderr before the command runs:
+  `WARN PRODUCTION_PREFLIGHT_TOLERATED: index_readiness_observations_by_ad_fk: INVALID_INDEX_ARTIFACT:<name> on <table>
+  (<reason>; scope <scope>)`. The command then runs with its own authorization and audit unchanged; for example, a non-retention
+  login still gets `RETENTION_FAILED code=PRIVILEGE` (OPS-8).
+- **A gate refusal of a retention command** is now `RETENTION_FAILED code=PRECONDITION sqlstate=none recorded=false`,
+  followed by the content-free `PRODUCTION_PREFLIGHT_FAILED: ...` line. It used to be `code=CONNECTION`. Other commands
+  print the `PRODUCTION_PREFLIGHT_FAILED` line as before.
+- **Before OPS-01:** any invalid index in schema si refused every production command, and the retention commands
+  reported it as `code=CONNECTION` (reproduced in the acceptance review, probe MIG-6).
+
+Response to a blocking artifact: identify it (`cli.js readiness` without `SI_PRODUCTION`, or `psql -f
+db/ops/readiness.sql`), confirm it is a failed concurrent build, and drop it as the owner (`DROP INDEX CONCURRENTLY
+si.<name>`). Emergency source controls remain available throughout.
 
 ### 17.6 Limits
 
