@@ -257,7 +257,7 @@ jobs:
       - run: npm run build
       - name: Populated adoption rehearsal (1,000,000 observations; writer never in a lock wait during the concurrent build)
         run: SI_ADOPT_ROWS=1000000 node tests/db/run.mjs tests/slow/m4-adopt-rehearsal.test.mjs
-      - name: Readiness and adoption deliberate breaks (RX1-RX5, AX1-AX4; files restored)
+      - name: Readiness, adoption and production-gate deliberate breaks (RX1-RX5, AX1-AX4, NX1, NX2, NX4; files restored)
         run: CI=true node tests/mutations/m4-p33-p1.mjs
       - name: Database logs on failure
         if: failure()

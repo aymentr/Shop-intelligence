@@ -1802,11 +1802,46 @@ populated database:
 ```
 state:  V21 (no index) --build-index--> V21 + building --ok--> V21 + ready index --adopt--> V22 (recorded) --up--> V23
                                |                 |
-                               |                 +-- cancelled / failed / connection lost --> V21 + invalid index
-                               |                       --build-index (refuses: INVALID_INDEX_PRESENT)
-                               |                       --build-index --replace-invalid --> drops exactly that index, rebuilds
-                               +-- lock timeout --> V21 (nothing left)
+                               |                 +-- cancelled / lock timeout while waiting / failed / connection lost /
+                               |                 |   server restart --> V21 + INVALID index (INDEX_NOT_VALID, maybe NOT_READY)
+                               |                 |      --build-index                    refuses: INVALID_INDEX_PRESENT
+                               |                 |      --build-index --replace-invalid  drops exactly that index, rebuilds
+                               |                 +-- interrupted during the --replace-invalid DROP --> INDEX_NOT_LIVE / NOT_READY:
+                               |                        same recovery (--replace-invalid)
+                               +-- lock timeout acquiring the table lock (before the catalog entry exists) --> V21, nothing left
 ```
+
+**Waits, lock timeouts and invalid leftovers (corrected in M4-P3.3-P1-CLOSE-01).** CREATE INDEX CONCURRENTLY first takes
+SHARE UPDATE EXCLUSIVE on si.observations, then creates the index's catalog entry, as INVALID, in its own committed
+transaction. After that it waits more than once without blocking writers:
+- for every transaction holding a write lock on the table, before the build and before the validation scan;
+- for every transaction whose snapshot predates the validation, including read-only ones such as a long report or an idle
+  `BEGIN ... REPEATABLE READ` session (`pg_stat_progress_create_index.phase` shows `waiting for ...`).
+
+These are lock waits, and the session's `lock_timeout` (`--lock-timeout-ms`, default 5 s) bounds every one of them.
+`statement_timeout` is set to 0 for the build.
+
+Consequences:
+- **Before the catalog entry exists:** a timeout acquiring the table lock leaves nothing behind.
+- **During any later wait** (reproduced in the acceptance review, probe MIG-1): a timeout, a cancellation, a terminated
+  session or a server restart leaves the INVALID index. The planner ignores it; a ready one is still maintained on writes.
+  The build reports `BUILD_FAILED ...; an invalid index was left (...): rerun with --replace-invalid`.
+- **Long transactions:** a single transaction older than the build that stays open longer than the timeout makes every
+  attempt fail. Find it in `pg_stat_activity` (`xact_start`, `backend_xmin`) and end it, or raise `--lock-timeout-ms`
+  (at most 600000) for the maintenance window. The wait does not block writers (MIG-7: max 5 ms).
+
+**Safe cleanup and retry.** `--replace-invalid` is the only automatic cleanup. It:
+- drops an index only when it is named `observations_by_ad_fk`, is on si.observations, has exactly the required
+  definition, and its only readiness failures are the index's own INDEX_NOT_VALID / INDEX_NOT_READY / INDEX_NOT_LIVE;
+- re-reads the same oid immediately before `DROP INDEX CONCURRENTLY`, then rebuilds.
+
+It never drops:
+- a valid index of another definition;
+- an invalid index of another definition (INDEX_CONFLICT; acceptance probe MIG-5);
+- any INVALID_INDEX_ARTIFACT elsewhere in schema si. Those are refused (INVALID_ARTIFACTS_PRESENT) and must be identified
+  and dropped by an operator.
+
+Retrying is safe at every state above: each command re-reads the catalog and the applied set first.
 
 **`build-index --version 22`** (outside any transaction; PostgreSQL refuses CREATE INDEX CONCURRENTLY inside one):
 - the applied set must be exactly 1..21 with byte-identical files; 22 or later → ALREADY_APPLIED, nothing done;
@@ -1816,7 +1851,8 @@ state:  V21 (no index) --build-index--> V21 + building --ok--> V21 + ready index
 - an **invalid** index of the required name **and** definition → INVALID_INDEX_PRESENT, unless `--replace-invalid`; then
   that same object (oid re-checked) is dropped concurrently and rebuilt;
 - anything else under that name (valid with another definition, another table, not an index) → INDEX_CONFLICT, never dropped;
-- `lock_timeout` (default 5 s) bounds every lock wait; a timeout before the catalog entry exists leaves nothing.
+- `lock_timeout` (default 5 s) bounds every lock wait, including the snapshot waits: see **Waits, lock timeouts and invalid
+  leftovers** above.
 
 **`adopt --version 22`**, one transaction, run as si_owner, under the migrator's advisory lock (`up`, `down` and
 adoptions serialize):
@@ -1842,9 +1878,26 @@ So 0022 is never recorded without a ready index.
 **Rollback.** `migrate down --to 21` reverses an adoption exactly like an application (0022's down file, a brief exclusive
 lock for `DROP INDEX`). The adoption evidence is kept. A second adoption adds a second evidence row (MIG-12).
 
+**Operational recovery when a migrator command is interrupted.**
+
+| Interrupted | Database state afterwards | Recovery |
+|---|---|---|
+| `build-index` (cancel, timeout, lost session, server restart) | V21 + invalid `observations_by_ad_fk` | `build-index --version 22 --replace-invalid`, then `adopt` (MIG-4, MIG-5, MIG-C1, MIG-C2) |
+| `build-index --replace-invalid` during its DROP | V21 + index not live / not ready, or no index | rerun `build-index --version 22 --replace-invalid` (or plain `build-index` if it is gone); by analysis, not separately rehearsed |
+| `adopt` (any point: one transaction) | V21, nothing recorded, no evidence row, advisory lock released (acceptance probe MIG-3) | rerun `adopt --version 22` |
+| `adopt` refused (WRONG_VERSION, INDEX_NOT_READY, CHECKSUM_MISMATCH, lock timeout) | unchanged | fix the reported cause; rerun |
+| `up` that raced the build (failed at 22 on the existing name) | applied set unchanged at 21 (each migration is one transaction) | let the build finish, `adopt`, then `up` (MIG-10) |
+| `down` run while a build was in progress (the build holds no advisory lock) | e.g. V20 + a ready index; `adopt` refuses WRONG_VERSION; `up` stops at 22 on the existing name | `up --to 21`, then `adopt` (acceptance probe MIG-5). Avoid it: pause every migrator for the window (step 1) |
+| `up` to 23 after adoption | V22 (0023 rolled back as one transaction) | rerun `up` |
+
+At version 21 the production gate reports the readiness check NOT_APPLICABLE, so this recovery also runs as production
+commands (`SI_PRODUCTION=1`; GATE-4). From version 22 on, the gate requires readiness PASS for every production command
+(GATE-1, GATE-2, GATE-3).
+
 **Supported procedure** (populated database, maintenance window):
-1. Stop or pause the migration runner; take a backup.
-2. Check for long-running transactions (a concurrent build waits for every older snapshot): `pg_stat_activity`.
+1. Stop or pause every migration runner, including any `down` (the build holds no advisory lock); take a backup.
+2. Check for long-running transactions (a concurrent build waits for every older snapshot and every open writer):
+   `pg_stat_activity`. Choose `--lock-timeout-ms` longer than the longest transaction that cannot be ended.
 3. `cli.js build-index --version 22 --lock-timeout-ms 5000` as si_migrator. Watch `pg_stat_progress_create_index`. On
    failure: inspect `cli.js readiness`. Rerun with `--replace-invalid` only when the only failures are INDEX_NOT_VALID /
    NOT_READY / NOT_LIVE of the index itself. Remove a foreign INVALID_INDEX_ARTIFACT by hand after identifying its owner.
@@ -1874,6 +1927,7 @@ lock for `DROP INDEX`). The adoption evidence is kept. A second adoption adds a 
 | MIG-13 | Privileges; a refused adoption leaves no open transaction |
 | MIG-14 | The build refuses to run inside a transaction |
 | MIG-15 | The CLI |
+| GATE-1 to GATE-5 | `tests/db/m4-gate.test.mjs` (M4-P3.3-P1-CLOSE-01), on hardened disposable databases: the production gate itself (`assertProductionReady`) rejects an invalid or missing index at 23 (GATE-1); an `SI_PRODUCTION=1` command is refused before dispatch (GATE-2); at exactly version 22 after adoption a ready index passes and an invalid one is refused (GATE-3); 22 by the plain migration passes, and at 21 the recovery runs as production commands (GATE-4); an invalid index is refused by adoption and repeated adoption, before and after 22 is recorded (GATE-5) |
 | MIG-C1, MIG-C2 | `tests/crash/m4-adopt-crash.test.mjs`: a server restart (SIGKILL of the build's backend, then crash recovery) while the build waits for older snapshots, and while it scans 500,000 rows. Committed rows survive; readiness reports only the index's own codes; adopt and the plain build refuse; `--replace-invalid` touches no other index; adopt and up converge |
 
 `tests/mutations/m4-p33-p1.mjs` removes each check; each mutant must be killed by its named test:
@@ -1889,6 +1943,19 @@ lock for `DROP INDEX`). The adoption evidence is kept. A second adoption adds a 
 | AX2 | version check | MIG-2 |
 | AX3 | pinned checksums | MIG-9 |
 | AX4 | foreign artifacts in the build | MIG-8 |
+| NX1 | the readiness check in the production gate (`assertProductionReady`) | GATE-1 |
+| NX2 | enforcement at exactly version 22 | GATE-3 |
+| NX4 | readiness when 22 is already recorded (adopt reports ALREADY_APPLIED) | GATE-5 |
+
+NX1, NX2 and NX4 survived the Phase 1 suites in the acceptance review (M4-P3.3-P1-ACCEPT-01). NX1 was masked because
+`preflight --production` appends the readiness check a second time after the gate, and the only end-to-end test read that
+output. NX2 was masked because RDY-21 covered versions 21 and 23 only. The review's other survivors are recorded, not added:
+
+| Mutant | Assessment |
+|---|---|
+| NX5 | the oid re-check before the drop; it matters only with concurrent owner DDL, and is not atomic with the drop itself (owner trusted, contract B) |
+| NX6 | equivalent: any definition difference already yields INDEX_WRONG_DEFINITION, which fails the own-failure test |
+| NX7 | equivalent for safety: adopt re-checks readiness |
 
 `tests/slow/m4-adopt-rehearsal.test.mjs` rehearses a cancelled build, its recovery, adopt and up with a concurrent writer.
 It runs at 1,000,000 rows in the CI job `populated-adoption`, and at 10,000,000 locally.
@@ -1906,7 +1973,48 @@ refused it. The replacement build (`--replace-invalid`) is the measured one. The
 the test container's tmpfs cannot hold two such databases. The non-concurrent build is shorter, but blocks every writer
 for its whole duration; the concurrent build never did.
 
-### 17.5 Limits
+### 17.5 Production gate scope and emergency operations (M4-P3.3-P1-CLOSE-01: PROPOSAL, not implemented)
+
+`assertProductionReady` runs before every CLI command when `SI_PRODUCTION=1`. From version 22 on it includes the
+readiness check, and with it INVALID_INDEX_ARTIFACT: any invalid index anywhere in schema si, including one unrelated to
+0022 (for example a failed REINDEX CONCURRENTLY of another index). Reproduced in the acceptance review.
+
+| Class | Commands | Gated today |
+|---|---|---|
+| Deployment | `bootstrap`, `up`, `down`, `build-index`, `adopt`, `preflight --production` | yes |
+| Normal operations | `verification run` | yes |
+| Emergency retention / recovery | `retention purge` (deadline-bound deletion, also the emergency purge after TERMINATE_RETENTION) | yes |
+| Emergency source controls | SUSPEND / LIFT / TERMINATE_RETENTION: `si.si_record_source_control`, granted to si_rights_admin and called in SQL; no CLI path | **no**: not affected by the gate |
+| Read-only diagnostics | `status`, `readiness`, `retention status / overdue / failures`, `verification status / failures` | yes |
+
+Under `SI_PRODUCTION=1` the retention commands report any gate failure as `RETENTION_FAILED code=CONNECTION
+sqlstate=none recorded=false`: their deliberately content-free error mapping, unchanged since before Phase 1. This hides
+the cause. Other commands print the `PRODUCTION_PREFLIGHT_FAILED: ...` line with the codes.
+
+Can unrelated invalid indexes be ignored safely? For correctness, yes:
+- the planner never uses an invalid index;
+- a ready one is still maintained on writes (cost only); a not-ready one is not maintained;
+- no result, audit, authorization or durability check depends on them.
+
+The 0022 index's own failures are different: the RT-13 purge bound and the emergency-control wait depend on that index
+(§15C), so they must keep blocking.
+
+**Proposal (requires approval; production behavior change, not implemented):**
+1. No global bypass, and no change to the operational, D5b and collector-logging checks; every command keeps them.
+2. Only for `retention purge` and the read-only diagnostics, INVALID_INDEX_ARTIFACT entries naming an index other than
+   `observations_by_ad_fk` become a reported warning instead of a gate failure. They are still printed, with their codes.
+   Every own-index code still blocks every command, and deployment and normal-operation commands keep the full check.
+3. The retention CLI reports a gate refusal as its own code (e.g. `code=PRECONDITION`) instead of `code=CONNECTION`,
+   still content-free.
+4. Tests and mutants for each: an unrelated artifact allows `retention purge` and `status` but blocks `up` / `adopt` /
+   `verification run`; an own-index failure blocks all of them.
+
+Until approved, the documented response to an unrelated INVALID_INDEX_ARTIFACT that blocks production commands is:
+identify it (`cli.js readiness` without `SI_PRODUCTION`, or `psql -f db/ops/readiness.sql`), confirm it is a failed
+concurrent build, and drop it as the owner (`DROP INDEX CONCURRENTLY si.<name>`). Emergency source controls remain
+available throughout.
+
+### 17.6 Limits
 
 - A synthetic rehearsal on a test container (tmpfs, fsync off) is not evidence of production-storage performance.
 - The readiness check proves a structure, not compliance: organizational, privacy and infrastructure readiness are
