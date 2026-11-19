@@ -90,7 +90,16 @@ immutability(tgname, relname, sha) AS (VALUES
   ('trg_sweep_identities_no_truncate', 'summary_sweep_identities', '5ceda0cd80d126d91eb44ae59de6b818ce6a936726365bbf624c36212285eae5'),
   ('trg_sweep_runs_append_only', 'summary_sweep_runs', 'cc94467ea5e5cb0f3940b33f9b0f1ae488357ddedf4dfeef14c88d94472955d0'),
   ('trg_sweep_runs_no_truncate', 'summary_sweep_runs', 'c40eb06c4c6bd5d98ae1a68163b702c56cc50871a788f4938b52704a72b6748c'),
-  ('trg_sweeps_no_truncate', 'summary_sweeps', '9168a1f2478bcc085d8eb0b670a8dc4233ae117bea9b263e65d8e5543b27f62e')),
+  ('trg_sweeps_no_truncate', 'summary_sweeps', '9168a1f2478bcc085d8eb0b670a8dc4233ae117bea9b263e65d8e5543b27f62e'),
+  ('trg_control_timings_append_only', 'source_control_timings', '8377595ae56fb2860286653a6d5fa7d7b52605a94445ae65a2ea31cbfde9c9b6'),   -- 0026
+  ('trg_control_timings_no_truncate', 'source_control_timings', '1dad624ce1e1ae4f48272f461dcfe8f737044039eb3689096b432b69323443db'),
+  ('trg_read_failures_append_only', 'read_failures', '679c695ae144f094f0cffcc907e1cbe6f94a710f3cfaa199f05ea2265194effb'),
+  ('trg_read_failures_no_truncate', 'read_failures', 'aa25c120600e37e7f2197a9c1986abf8fb438839318a42c6b5566e0e7a3d4bae'),
+  ('trg_read_path_events_append_only', 'read_path_events', '5db3fb6108864810730d26733c49fb9777e9319ba878ef0b30054d4cff609a7c'),
+  ('trg_read_path_events_no_truncate', 'read_path_events', 'f5a125884677b92265cb53a94c3a391cf79fc977c27b672ed9b714c1ca75d933'),
+  ('trg_control_failures_append_only', 'source_control_failures', '385dae63e1164138616da59f2117181c83b9934ac417e366d73270445ec056cf'),
+  ('trg_control_failures_no_truncate', 'source_control_failures', '922344d72c19dc233ab5e655b25619ea3840811ff182566ae4d0aef526bc7248'),
+  ('trg_source_control_timing', 'source_controls', '7913d4fcd9511164fe980517278312c48fe69eac822b0d639879c803eb1c9535')),
 -- Exact bodies (SHA-256 of prosrc) and attributes of the security-critical functions: every immutability/lifecycle
 -- trigger function, the eligibility function and everything it and verification evaluate. Owner-only (no grant).
 functions(fn, sha, secdef, volatility, config) AS (VALUES
@@ -115,7 +124,10 @@ functions(fn, sha, secdef, volatility, config) AS (VALUES
   ('si.si_summary_clear_drift(text,bigint)', 'b4c3601ea8c49b86af1544e8eb17b08b3682c5cb8e9c3bef343ff2e640b7f228', false, 'v', 'search_path=pg_catalog, pg_temp'),  -- 0025
   ('si.si_sweep_verify_run(uuid,text,integer)', 'b8c9f5150281f04269528a0c7dfb6c6a63b0c6358fc214e08945aa9cc4c8b49a', false, 'v', 'search_path=pg_catalog, pg_temp'),
   ('si.trg_summary_sweep_transition()', '34db09c595569823f306efae89442c03e9737623f43cbab3c65e27ac600d8f5d', false, 'v', 'search_path=pg_catalog, pg_temp'),
-  ('si.trg_sweep_records_append_only()', 'b882ecd81310163e794ff5a9f87302c2eb906b96f283bfee530d9e50811dc241', false, 'v', 'search_path=pg_catalog, pg_temp')),
+  ('si.trg_sweep_records_append_only()', 'b882ecd81310163e794ff5a9f87302c2eb906b96f283bfee530d9e50811dc241', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.si_record_read_path(text,text,text,uuid,text,text,timestamp with time zone)', '5fd3ea9013c9892ef0505b04d828578e89e86f420c608c876a582415d71861a2', false, 'v', 'search_path=pg_catalog, pg_temp'),  -- 0026
+  ('si.trg_source_control_timing()', '21c1b7630552ddce13fc76bd20cc69057374523cf626149d889c56250a587ea8', true, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.trg_telemetry_append_only()', '7ff1fb4550f76b09ee452685b16fad4457c61abed8666ac764846f6f0335978a', false, 'v', 'search_path=pg_catalog, pg_temp')),
 fn AS (
   SELECT f.*, p.oid, p.prosecdef, p.provolatile::text AS provolatile, array_to_string(p.proconfig, ';') AS proconfig,
          encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') AS actual_sha, pg_get_userbyid(p.proowner) AS owner,
@@ -131,7 +143,9 @@ tables(relname, acl) AS (VALUES
   ('run_summary_status', '{si_owner=arwdDxt/si_owner}'), ('summary_events', '{si_owner=arwdDxt/si_owner}'),
   ('summary_sweeps', '{si_owner=arwdDxt/si_owner}'), ('summary_sweep_batches', '{si_owner=arwdDxt/si_owner}'),            -- 0024
   ('summary_sweep_runs', '{si_owner=arwdDxt/si_owner}'), ('summary_sweep_identities', '{si_owner=arwdDxt/si_owner}'),
-  ('summary_sweep_failures', '{si_owner=arwdDxt/si_owner}'), ('summary_drift_clearances', '{si_owner=arwdDxt/si_owner}'))
+  ('summary_sweep_failures', '{si_owner=arwdDxt/si_owner}'), ('summary_drift_clearances', '{si_owner=arwdDxt/si_owner}'),
+  ('read_path_events', '{si_owner=arwdDxt/si_owner}'), ('read_failures', '{si_owner=arwdDxt/si_owner}'),                  -- 0026
+  ('source_control_timings', '{si_owner=arwdDxt/si_owner}'), ('source_control_failures', '{si_owner=arwdDxt/si_owner}'))
 SELECT 'FK_MISSING' AS check, conname AS detail FROM fk WHERE oid IS NULL
 UNION ALL
 SELECT 'FK_NOT_FOREIGN_KEY', conname FROM fk WHERE oid IS NOT NULL AND contype <> 'f'

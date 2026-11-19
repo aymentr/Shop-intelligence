@@ -100,7 +100,7 @@ test(`REH: populated adoption of 0022 at ${ROWS} observations (failure, retry, a
   const t3 = performance.now(); const a = await adoptMigration(mig2, { version: 22 }); const adoptMs = performance.now() - t3;
   const t4 = performance.now(); const up = await migrateUp(mig2); const upMs = performance.now() - t4;
   console.log(`# REH ${ROWS} adopt ${a.state} in ${adoptMs.toFixed(0)} ms; up ${JSON.stringify(up)} in ${upMs.toFixed(0)} ms`);
-  assert.equal(a.state, 'ADOPTED'); assert.deepEqual(up, [23, 24, 25]);
+  assert.equal(a.state, 'ADOPTED'); assert.deepEqual(up, [23, 24, 25, 26]);
   assert.deepEqual(await checkIndexReadiness(x.admin), []);
   // Comparison: 0022's own non-concurrent build under the same writer.
   if (PLAIN) {

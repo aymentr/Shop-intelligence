@@ -11,7 +11,10 @@ if (process.env.CI !== 'true') throw new Error('m4-p32-search requires CI=true')
 if (process.env.SI_PRODUCTION === '1') throw new Error('m4-p32-search refuses production mode');
 if (!['127.0.0.1', 'localhost', '::1'].includes(process.env.SI_TEST_PGHOST ?? '127.0.0.1')) throw new Error('loopback PostgreSQL test host required');
 
-const F = 'db/migrations/0023_summary_backed_search.up.sql';
+// M4-P3.3 Phase 3: 0026 replaces si_search_advertisers (the 0023 text with telemetry lines added); the mutants edit the
+// live definition, and only inside its function block (0026 also defines si_advertiser_history, which shares some anchors).
+const F = 'db/migrations/0026_operational_observability.up.sql';
+const BLOCK = ['CREATE OR REPLACE FUNCTION si.si_search_advertisers(', 'END $search$;'];
 const original = readFileSync(F);
 const sha = b => createHash('sha256').update(b).digest('hex').slice(0, 12);
 const GRANT = 'IF NOT FOUND OR NOT EXISTS (SELECT 1 FROM si.reader_grants g';
@@ -53,14 +56,16 @@ const suite = () => {
 const outcomes = [];
 try {
   for (const m of M) {
-    let src = original.toString('utf8');
+    const whole = original.toString('utf8'), b0 = whole.indexOf(BLOCK[0]), b1 = whole.indexOf(BLOCK[1], b0) + BLOCK[1].length;
+    if (b0 < 0 || b1 < BLOCK[1].length) throw new Error('search function block not found');
+    let src = whole.slice(b0, b1);
     // Each edit names its anchor and how many times it occurs (default once); every occurrence is replaced.
     for (const [from, to, count = 1] of m.edits) {
       if (src.split(from).length !== count + 1) throw new Error(`${m.id}: expected ${count} anchor(s) in ${F}: ${from.slice(0, 80)}`);
       src = src.split(from).join(to);
     }
     try {
-      writeFileSync(F, src, 'utf8');
+      writeFileSync(F, whole.slice(0, b0) + src + whole.slice(b1), 'utf8');
       const { r, out } = suite();
       const detected = m.detector.test(out), assertion = /AssertionError|ERR_ASSERTION/.test(out);
       const cls = r.error || r.signal || r.status === null ? 'INCONCLUSIVE' : r.status === 0 ? 'SURVIVED' : detected && assertion ? 'KILLED' : 'INCONCLUSIVE';

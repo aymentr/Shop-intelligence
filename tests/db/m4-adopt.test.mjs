@@ -80,9 +80,9 @@ test('MIG-1: build, adopt as si_migrator, then up: 0022 is recorded with its exa
                    [22, M22.name, M22.upSha256, M22.downSha256, 'observations_by_ad_fk', REQUIRED_INDEX_DEFINITION, 'PASS', 'si_migrator']);
   assert.equal(Number(ev[0].index_oid), Number(await oidOf(x.admin, 'si.observations_by_ad_fk')));
   assert.ok(Number(ev[0].index_bytes) > 0);
-  assert.deepEqual(await migrateUp(mig), [23, 24, 25]);
+  assert.deepEqual(await migrateUp(mig), [23, 24, 25, 26]);
   // Reference: a database migrated normally to 23. Equal except the adoption log's own objects.
-  const ref = await at(t, 25, 0);
+  const ref = await at(t, 26, 0);
   const strip = f => { const j = JSON.parse(f);
     j.relations = j.relations.filter(r => !/^schema_adoptions/.test(r.relname));
     j.columns = j.columns.filter(r => r.relname !== 'schema_adoptions');

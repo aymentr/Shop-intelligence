@@ -54,7 +54,7 @@ async function fresh(t, prefix) {
 
 test('IG-0: the gate pins each security-critical function to the body in the latest migration that defines it', () => {
   const pins = [...GATE.matchAll(/\('si\.([a-z_]+)\(([^)]*)\)', '([0-9a-f]{64})'/g)].map(m => ({ name: m[1], sha: m[3] }));
-  assert.equal(pins.length, 20, 'twenty pinned functions (four added by 0024)');
+  assert.equal(pins.length, 23, 'twenty-three pinned functions (four added by 0024, three by 0026)');
   const dir = new URL('../../db/migrations/', import.meta.url);
   const files = readdirSync(dir).filter(f => /^\d{4}_.*\.up\.sql$/.test(f)).sort().reverse();
   for (const p of pins) {

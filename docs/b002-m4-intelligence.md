@@ -2231,3 +2231,162 @@ Mutation campaign `tests/mutations/m4-p33-p2-close.mjs`: NM1–NM4 and CX1–CX6
 - Runs published after a sweep's boundary are restored to summary-backed reads at clearance on publication-time trust (CL-8). **Approval item (contract change, not implemented):** require that no completed run exists after the boundary at clearance, which in practice means suspending collection for the source during recovery.
 - §18.6 A–C are design only.
 
+
+## 19. M4-P3.3 Phase 3: content-free operational observability (migration 0026)
+
+### 19.0 Phase 0: what was inspected, and the minimum contract
+
+**Inspected:**
+- the read path: `si_search_advertisers` (0023: coverage, the in-snapshot guard, `SI_READ_PATH` DEBUG) and `si_advertiser_history` (0018);
+- the read-audit contract (0009/0010): an intent committed BEFORE the read in its own transaction; the read consumes it and writes `reader_access_log` in its own transaction;
+- summary coverage (0021), drift events (0020), sweeps and clearances (0024/0025);
+- emergency controls (0001: the `source_controls` BEFORE INSERT trigger takes the source row FOR UPDATE and reads `wall_clock_at` right after it);
+- the roles, and production readiness.
+
+**Finding that shapes the design:** a failed read raises, and its transaction rolls back. Anything a read records, it records only on success. Failure classification therefore cannot come from the server without changing the response semantics. The server-side truth for a failed or abandoned read is its intent left OPEN past its 60 s expiry. Phase 0 found no conflict that would require weakening a security or audit guarantee, so there was no stop.
+
+**Minimum contract:**
+
+| # | Requirement |
+|---|---|
+| 1 | **Content-free.** Stored and reported values are ids, role names, fixed codes, counts, durations and times. Never a query term, advertiser name, URL, ad content or reason/reference text (OB-14). |
+| 2 | **Never weakens a guarantee.** The audit of record stays `read_intents` and `reader_access_log`, unchanged. Telemetry is written AFTER the audit, in the same transaction: no event without its audit (OB-7). Telemetry can never fail a read or an emergency control: its writes run in a subtransaction whose error is swallowed with a `SI_TELEMETRY_LOST` warning (OB-8). Response documents, errors, pagination, grants, availability and lock order are unchanged (OB-0, OB-9, the full SS suite). |
+| 3 | **Least privilege.** Telemetry tables are owner-only and append-only. Only `si_monitor` executes the monitoring functions. A reader principal may only label its OWN still-OPEN intent with a fixed code. `si_rights_admin` may only append a fixed-code refusal (OB-6, OB-11b, OB-13). |
+| 4 | **Deterministic alerts.** Alerts are computed from these facts with explicit thresholds. No delivery is claimed: nothing in this repository sends an alert anywhere. |
+
+### 19.1 Search-path telemetry
+
+| Field (`si.read_path_events`, one row per SUCCESSFUL read) | Meaning |
+|---|---|
+| `intent_id`, `principal`, `source_id`, `recorded_at` | the audited request (no FK: telemetry must not lock-order or fail a read) |
+| `request_kind` | `search` or `history` |
+| `path` | `summary` or `observations` |
+| `fallback_reason` | NULL on the summary path; `DRIFT`, `INCOMPLETE` or `DRIFT,INCOMPLETE` (coverage); `GUARD` (eligible at coverage, but the in-snapshot guard failed: a change committed between the two statements, OB-3); `NOT_APPLICABLE` (history has no summary path, §16.2) |
+| `duration_us` | from function entry to just after the audit writes |
+
+**Failure accounting:**
+- **Client-reported:** `si.read_failures`. The reader library (`auditedCall`) reports the typed code of a failed search or history request, best effort, in its own transaction, via `si_record_read_failure`. That function accepts only the session's own intent, only while OPEN (never a consumed, successful one), once per intent, and only fixed codes.
+- **Server-side:** `si_read_path_status` counts the source's intents left OPEN past expiry, whether classified or not.
+- `si_read_path_status(window)` reports per source and kind: requests, paths, each fallback reason, p50/p95/max latency, reported failures by code, and expired OPEN intents.
+
+**Not covered:** evidence pages, source status and availability reads (unchanged, no telemetry); connection failures, which cannot be reported. Two read functions were replaced; lines were only ADDED to the 0023 and 0018 texts (OB-0).
+
+### 19.2 Verification health
+
+`si_verification_health(window)` reports per source:
+- open drift, and when the open drift was detected;
+- the last COMPLETED_CLEAN sweep and its age;
+- the active sweep, its phase and progress (runs and identities done / in scope);
+- the latest terminal state and stale reason;
+- BUSY, TIMEOUT and other batch failures in the window, and failures since the active sweep's last batch;
+- the last clearance (time, sweep), the last rebuild, and rebuilds since the open drift.
+
+Content-free (OB-10).
+
+### 19.3 Emergency-control observability
+
+**Committed controls:** an AFTER INSERT trigger on `source_controls` (0026) records `wait_ms = wall_clock_at − statement_timestamp()` for every committed control, in `si.source_control_timings`. `wall_clock_at` is read by the 0001 trigger right after it acquires the source row FOR UPDATE, so this is the source-lock wait.
+- The 0001 trigger, the control function and their semantics are unchanged. A failing timing write never fails the control (OB-8).
+- Measured (OB-11): uncontended SUSPEND 1.2–1.3 ms; LIFT behind a FOR SHARE holder kept 1.2 s: 1,227–1,254 ms.
+
+**Refused controls:** a refusal (for example `lock_timeout`) rolls back, so it is counted only by its client. `recordControlFailure` → `si_record_control_failure` (si_rights_admin; fixed codes LOCK_TIMEOUT, STATEMENT_TIMEOUT, ISOLATION, CLOCK_REGRESSION, COMPARE_AND_SET, BAD_ARGUMENT, OTHER; OB-11b).
+
+**Live lock waits:** `si_control_lock_waits()` reads `pg_locks`, which every role may read. It reports each waiting backend's role, its wait so far (`waitstart`), whether it waits on a `si.sources` row, and its blockers' pids and roles. A waiting `si_rights_admin` is an emergency control in flight (OB-11, OB-11b).
+- **Not visible:** the transaction age or state of other roles' sessions, which needs `pg_read_all_stats`. Not granted: see §19.4.
+
+`si_control_latency_status(window, budget)` reports per source and kind: committed controls, p50/p95/max wait, count over budget, refusals by code.
+
+**Measured with this telemetry (OB-17; local container, synthetic):**
+
+| Holder at the time of the control | Source-lock wait |
+|---|---|
+| none (10 SUSPEND/LIFT pairs) | max 1.6 ms |
+| an open, uncommitted clean sweep batch | 0.2 ms |
+| an idle verifier right after a sweep start (KEY SHARE) | 2,002.8 ms (the 2 s si_monitor idle bound, 0025) |
+| a reader page held 1 s inside the search (FOR SHARE) | 1,008.7 ms |
+| a purge batch | RT-13, unchanged (§15C) |
+
+### 19.4 Bounding continuously active transactions on PostgreSQL 16 (investigation; separate proposal, not implemented)
+
+| Mechanism (PostgreSQL 16) | Bounds a session that keeps issuing statements inside one transaction? |
+|---|---|
+| `statement_timeout` | No: per statement; a loop of short statements never trips it |
+| `idle_in_transaction_session_timeout` (si_monitor 2 s, 0025) | No: only idle time between statements |
+| `idle_session_timeout` | No: only outside a transaction |
+| `lock_timeout` (on the waiting control: 30 s) | Bounds the CONTROL's wait, by refusing it; does not end the holder |
+| `client_connection_check_interval`, TCP keepalives | Only a dead client during a running query |
+| `transaction_timeout` | Would bound it, but exists only from PostgreSQL 17 |
+| `pg_terminate_backend` by a supervisor | Yes, but needs privilege over the holder's role |
+
+**Conclusion:** PostgreSQL 16 has no in-database mechanism that bounds an actively-used transaction without new privileges. This exposure predates 0026: si_collector (publication FOR SHARE), si_rights_admin and si_monitor (KEY SHARE) can each hold the source row this way. 0026 makes it **observable** (CONTROL_WAITING, CONTROL_DEADLINE_BREACH, CONTROL_REFUSED) but does not bound it.
+
+**Proposal for approval** (changes outside observability, so not implemented):
+- **(a) Preferred long-term fix:** move to PostgreSQL 17 and set a per-role `transaction_timeout` (for example 15 s for si_monitor, 60 s for si_collector).
+- **(b) Interim on PostgreSQL 16:** a NOLOGIN role `si_session_guard`, made a member of si_collector and si_monitor only (not pg_signal_backend, which reaches every non-superuser backend). It would own one SECURITY DEFINER function that terminates a backend only when all of these hold:
+  - the backend holds a lock that an `si_rights_admin` backend has waited on for longer than the emergency budget;
+  - its role is one of those two;
+  - its transaction is older than a configured bound.
+
+  The scheduler calls the function every few seconds. Each termination would be recorded (pid, role, ages, codes only).
+- **Trade-offs to approve:**
+  - The guard's membership confers the privileges of those roles to its function.
+  - Terminating a publication rolls it back; its run is retried through the existing lease expiry.
+  - Emergency-control semantics are unchanged; it only shortens the wait.
+
+### 19.5 Alerting contract (`si_operational_alerts`, `cli.js ops alerts`; exit 2 if any)
+
+Deterministic: one row per firing alert from the current database state and the clock; every threshold is a parameter.
+
+| Alert | Fires when | Default threshold |
+|---|---|---|
+| `DRIFT_OPEN` | the source has open drift | — |
+| `VERIFICATION_OVERDUE` | no COMPLETED_CLEAN sweep, or the last is older than the maximum age | 24 h |
+| `VERIFICATION_FAILING` | BUSY + TIMEOUT + other batch failures in the window **≥** the maximum | 3 per hour |
+| `VERIFICATION_STALLED` | the latest sweep ended INCOMPLETE or STALE, none is active, and no clean sweep completed after it | — |
+| `PERSISTENT_FALLBACK` | search requests in the window ≥ the minimum AND the observation-path share **≥** the ratio | 20 requests, 0.5 |
+| `READER_LATENCY` | requests in the window ≥ the minimum AND p95 **>** the bound | 20 requests, 400 ms |
+| `CONTROL_DEADLINE_BREACH` | a committed control waited **>** the budget in the control window | 5,000 ms (M3-T14), 24 h |
+| `CONTROL_REFUSED` | a refused control was reported in the control window | ≥ 1 |
+| `CONTROL_WAITING` | an `si_rights_admin` backend is waiting now for longer than the budget | 5,000 ms |
+
+Boundaries are tested at the threshold, one step either side (OB-10, OB-11, OB-11b, OB-12).
+
+**Delivery:** none. No external system is connected or tested. An external scheduler must poll `ops alerts` and route its non-zero exit, as specified in §18.6 C.
+
+### 19.6 Operations and privileges
+
+```bash
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js ops status [--window-s 3600]   # read paths, verification health, controls, lock waits
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js ops alerts [--max-clean-age-s N] [--window-s N] [--fallback-min N] [--fallback-ratio R]
+                                    [--failure-max N] [--control-budget-ms N] [--control-window-s N] [--reader-p95-ms N] [--reader-min N]
+```
+
+- `ops` is a read-only diagnostic under the production gate (§17.5).
+- `si_monitor`: EXECUTE on the five monitoring functions.
+- `si_reader`: EXECUTE on `si_record_read_failure` only (AUD-8, SR-0).
+- `si_rights_admin`: EXECUTE on `si_record_control_failure`.
+- Tables: owner-only, append-only.
+- The integrity gate pins the new triggers, owner-only functions and table ACLs.
+
+### 19.7 Tests and deliberate breaks
+
+**Tests:** `tests/db/m4-observability.test.mjs`, OB-0 to OB-17 and OB-11b. They cover:
+- path classification and every fallback reason, including a deterministic GUARD schedule;
+- history requests;
+- failure accounting and the bounds of the failure label;
+- audit coupling, telemetry failure isolation, response and pagination equivalence;
+- verification health and its alerts, control waits (committed, live, refused) and their alerts, threshold boundaries;
+- privileges, content freedom, lifecycle interactions, and 0026 down/up;
+- the control-latency matrix (OB-17).
+
+**Mutation campaign:** `tests/mutations/m4-p33-p3.mjs`. TX1–TX12 target 0026 and LX1 the reader library, each with a named detector.
+
+### 19.8 Remaining risks
+
+| Risk | Severity |
+|---|---|
+| Telemetry growth: one row per successful read and per control, append-only, no pruning (as §18.6 B: a retention rule is a deployment decision) | Medium |
+| Client-reported failure and refusal codes carry the client's trust: a reader can mislabel only its own failed intents; a rights admin can add refusal counts. The server-side expired-intent count is the ground truth for reads | Low |
+| Latency values visible to si_monitor are a weak side channel on query complexity (no terms or counts are exposed) | Low |
+| Active transactions are observable, not bounded, on PostgreSQL 16 (§19.4 proposal) | Medium; approval item |
+| No alert delivery; an external scheduler is required (§18.6 C) | Medium (deployment) |

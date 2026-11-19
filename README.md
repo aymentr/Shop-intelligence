@@ -111,6 +111,15 @@ SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js summaries status
 SI_DATABASE_URL=<si_migrator login> node dist/persistence/cli.js summaries clear-drift --source S --sweep N
 ```
 
+Operational observability (0026, M4-P3.3 Phase 3, docs §19): content-free search-path telemetry (summary vs observation
+path, exact fallback reason, duration), failure accounting, verification health, emergency-control lock waits and a
+deterministic alerting contract. Nothing is delivered anywhere; an external scheduler must poll the alerts:
+
+```bash
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js ops status
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js ops alerts [--max-clean-age-s N] [--control-budget-ms N] ...   # exit 2 if any alert
+```
+
 Internal retrieval (0008): a dedicated principal (`si_reader_<name>`, provisioned with
 `provisionReaderPrincipal`) with a per-source grant (`si_grant_reader`, by `si_rights_admin`) can read
 bounded pages of VALID, currently authorized synthetic evidence through `readEvidence`

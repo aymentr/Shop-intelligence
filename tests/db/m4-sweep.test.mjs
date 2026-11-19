@@ -436,8 +436,8 @@ test('SW-15: 0025 and 0024 down restore the exact 0023 catalog; up re-applies id
   const ref = await freshDatabase(t, 'm4sw23', { migrate: false });
   const r = await roles(t, ref, ['admin']);
   await migrateUp(r.admin, { to: 23 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 23, allowDestructive: true }), [25, 24]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 23, allowDestructive: true }), [26, 25, 24]);
   assert.deepEqual(await schemaFingerprint(x.admin), await schemaFingerprint(r.admin));
-  assert.deepEqual(await migrateUp(x.admin), [24, 25]);
+  assert.deepEqual(await migrateUp(x.admin), [24, 25, 26]);
   assert.deepEqual(await schemaFingerprint(x.admin), v24);
 });

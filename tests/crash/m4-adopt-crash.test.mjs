@@ -62,7 +62,7 @@ async function crashAndRecover(t, db, rows, when) {
   assert.deepEqual([r.state, r.replacedInvalid], ['BUILT', true]);
   assert.deepEqual(await others(k), before, 'no other index was touched');
   assert.equal((await adoptMigration(m2, { version: 22 })).state, 'ADOPTED');
-  assert.deepEqual(await migrateUp(m2), [23, 24, 25]);
+  assert.deepEqual(await migrateUp(m2), [23, 24, 25, 26]);
   assert.deepEqual(await checkIndexReadiness(k), []);
 }
 

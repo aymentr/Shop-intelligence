@@ -131,7 +131,8 @@ export const availabilityCursor = (sourceId: string): string => `v1|${sourceId}|
 /** One content-free, audited request (its own committed, crash-durable intent), with the library's bounded fresh-intent
  *  retry on INTENT_NOT_DURABLE only. `onError` may map a database error to a typed failure first. */
 async function auditedCall(client: ClientBase, sourceId: string, cursor: string, sql: string, params: unknown[],
-  onError: (message: string, sqlstate: string | null) => Error | null = () => null, limit = 1): Promise<Record<string, unknown> | undefined> {
+  onError: (message: string, sqlstate: string | null) => Error | null = () => null, limit = 1,
+  kind: TelemetryKind | null = null): Promise<Record<string, unknown> | undefined> {
   for (let attempt = 1; ; attempt++) {
     const intentId = await beginRead(client, sourceId, { cursor, limit });
     try {
@@ -140,12 +141,28 @@ async function auditedCall(client: ClientBase, sourceId: string, cursor: string,
       const m = (err as { message?: unknown })?.message;
       const code = (err as { code?: unknown })?.code;
       const mapped = typeof m === 'string' ? onError(m, typeof code === 'string' ? code : null) : null;
+      const failure = mapped ? null : new ReadFailed(classifyReadError(err), typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null, intentId);
+      if (kind) await reportReadFailure(client, intentId, kind, mapped instanceof IntelligenceFailed || mapped instanceof ReadFailed ? mapped.code : failure?.code ?? 'INTERNAL');
       if (mapped) throw mapped;
-      const failure = new ReadFailed(classifyReadError(err), typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code) ? code : null, intentId);
-      if (failure.code === 'INTENT_NOT_DURABLE' && attempt < NOT_DURABLE_ATTEMPTS) continue;
+      if (failure!.code === 'INTENT_NOT_DURABLE' && attempt < NOT_DURABLE_ATTEMPTS) continue;
       throw failure;
     }
   }
+}
+
+/**
+ * M4-P3.3 Phase 3 (0026, docs §19.2): the CLIENT-REPORTED classification of a failed search / history request, for the
+ * session's own still-OPEN intent, in its own transaction. Best effort and content-free (a fixed code): it never changes
+ * the error the caller sees, and is skipped where no transaction can be run (connection lost). The server-side truth for
+ * a failed or abandoned read is its intent left OPEN past expiry.
+ */
+export type TelemetryKind = 'search' | 'history';
+const REPORTABLE = new Set(['BAD_ARGUMENT', 'BAD_CURSOR', 'NOT_AUTHORIZED', 'UNSAFE_SESSION', 'BUSY', 'ISOLATION', 'INTENT_INVALID',
+  'INTENT_UNCOMMITTED', 'INTENT_USED', 'INTENT_EXPIRED', 'INTENT_NOT_DURABLE', 'INTERNAL', 'SCAN_LIMIT', 'SOURCE_UNAVAILABLE',
+  'RESULT_TOO_LARGE', 'RESOURCE_LIMIT', 'IDENTITY_CONFLICT']);
+async function reportReadFailure(client: ClientBase, intentId: string, kind: TelemetryKind, code: string): Promise<void> {
+  if (!REPORTABLE.has(code)) return;                                             // CONNECTION: nothing can be recorded
+  try { await client.query('SELECT si.si_record_read_failure($1::uuid, $2, $3)', [intentId, kind, code]); } catch { /* telemetry only */ }
 }
 
 /**
@@ -398,7 +415,7 @@ export async function searchSourcePage(client: ClientBase, sourceId: string,
   const cursor = intelligenceScope('search', sourceId, [r.query, r.networks.join(','), from, to, r.after, String(r.afterInclusive)]);
   const row = await auditedCall(client, sourceId, cursor,
     'SELECT si.si_search_advertisers($1, $2::uuid, $3, $4::text[], $5::timestamptz, $6::timestamptz, $7, $8, $9) AS doc',
-    [r.query, r.networks, from, to, r.after, r.afterInclusive, r.limit], serverError(sourceId), r.limit);
+    [r.query, r.networks, from, to, r.after, r.afterInclusive, r.limit], serverError(sourceId), r.limit, 'search');
   const d = checkDoc(row?.doc, sourceId);
   const hits = d.hits;
   if (!Array.isArray(hits) || typeof d.has_more !== 'boolean' || hits.length > r.limit) throw new ReadFailed('INTERNAL', null);
@@ -502,7 +519,7 @@ export async function advertiserHistory(client: ClientBase, sourceId: string, ad
       const cursor = intelligenceScope('history', sourceId, [advertiserName, networks.join(','), from, to, after]);
       return auditedCall(client, sourceId, cursor,
         'SELECT si.si_advertiser_history($1, $2::uuid, $3, $4::text[], $5::timestamptz, $6::timestamptz, $7, $8) AS doc',
-        [advertiserName, networks, from, to, after, n], serverError(sourceId), n).then(row => checkDoc(row?.doc, sourceId));
+        [advertiserName, networks, from, to, after, n], serverError(sourceId), n, 'history').then(row => checkDoc(row?.doc, sourceId));
     }, n => { size = n; });
     const page = d.observations;
     if (!Array.isArray(page) || page.length > size || typeof d.summary !== 'object' || d.summary === null) throw new ReadFailed('INTERNAL', null);

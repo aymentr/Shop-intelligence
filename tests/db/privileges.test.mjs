@@ -53,15 +53,17 @@ const EXPECTED_EXECUTE = {
   si_read_source_availability: ['si_reader'],                                                           // 0012 (content-free source availability)
   si_search_advertisers: ['si_reader'], si_advertiser_history: ['si_reader'],                            // 0014 (server-side intelligence)
   si_summary_sweep_start: ['si_monitor'], si_summary_sweep_batch: ['si_monitor'],                       // 0024 (batched summary verification)
-  si_summary_sweep_record_failure: ['si_monitor'], si_summary_sweep_expire: ['si_monitor'], si_summary_verification_status: ['si_monitor']
+  si_summary_sweep_record_failure: ['si_monitor'], si_summary_sweep_expire: ['si_monitor'], si_summary_verification_status: ['si_monitor'],
+  si_record_read_failure: ['si_reader'], si_record_control_failure: ['si_rights_admin'], si_read_path_status: ['si_monitor'], si_verification_health: ['si_monitor'],          // 0026 (observability)
+  si_control_latency_status: ['si_monitor'], si_control_lock_waits: ['si_monitor'], si_operational_alerts: ['si_monitor']
 };
-const EXPECTED_DEFINER = ['si_advertiser_history', 'si_begin_read', 'si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_purge_due',
-                          'si_purge_failures', 'si_read_evidence', 'si_read_source_availability', 'si_read_source_status', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
+const EXPECTED_DEFINER = ['si_advertiser_history', 'si_begin_read', 'si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_control_latency_status', 'si_control_lock_waits', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_operational_alerts', 'si_purge_due',
+                          'si_purge_failures', 'si_read_evidence', 'si_read_path_status', 'si_read_source_availability', 'si_read_source_status', 'si_reap_expired_runs', 'si_record_control_failure', 'si_record_purge_failure', 'si_record_read_failure', 'si_record_rights_version',
                           'si_record_source_control', 'si_record_verification_failure', 'si_retention_status', 'si_revoke_reader', 'si_search_advertisers',
                           'si_summary_sweep_batch', 'si_summary_sweep_expire', 'si_summary_sweep_record_failure', 'si_summary_sweep_start',
-                          'si_summary_verification_status', 'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_open_run', 'trg_observation_purge_check',
+                          'si_summary_verification_status', 'si_verification_failures', 'si_verification_health', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_open_run', 'trg_observation_purge_check',
                           'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
-                          'trg_runs_publish_check', 'trg_runs_purge_check', 'trg_runs_purge_summaries', 'trg_runs_summary_check'];
+                          'trg_runs_publish_check', 'trg_runs_purge_check', 'trg_runs_purge_summaries', 'trg_runs_summary_check', 'trg_source_control_timing'];
 const EXPECTED_VOLATILITY = {
   si_record_rights_version: 'v', rights_valid_for_publish: 's', si_window_end: 's', si_publish_margin: 'i', si_retention_end: 's',
   trg_rights_insert: 'v', trg_append_only: 'v', trg_evidence_attribution: 'v', trg_rights_evidence_required: 'v', trg_sources_retire_final: 'v',
@@ -117,6 +119,9 @@ const EXPECTED_VOLATILITY = {
   trg_runs_purge_summaries: 'v', si_backfill_summaries: 'v', si_verify_summaries: 'v', si_rebuild_run_summaries: 'v', si_summary_coverage: 's',
   trg_sweep_records_append_only: 'v', trg_summary_sweep_transition: 'v', si_sweep_verify_run: 'v', si_summary_sweep_start: 'v',     // 0024
   si_summary_sweep_batch: 'v', si_summary_sweep_record_failure: 'v', si_summary_sweep_expire: 'v', si_summary_verification_status: 's',
+  // 0026 (observability)
+  si_record_read_failure: 'v', si_record_control_failure: 'v', si_read_path_status: 's', si_verification_health: 's', si_control_latency_status: 's', si_control_lock_waits: 'v',
+  si_operational_alerts: 'v', trg_source_control_timing: 'v', si_record_read_path: 'v', trg_telemetry_append_only: 'v',
   si_summary_clear_drift: 'v',
 };
 // 0015 (D3): resource bounds pinned on the two server-side reader functions; 0016 (N1b): plan_cache_mode pinned too.
@@ -384,6 +389,7 @@ test('SR-0 (0008, 0009): si_reader is a NOLOGIN group with no table privilege an
                                 'si.si_begin_read(text,text,integer)', 'si.si_read_evidence(text,uuid,text,integer)',
                                 'si.si_read_source_availability(text,uuid)',
                                 'si.si_read_source_status(text,uuid,timestamp with time zone,timestamp with time zone)',
+                                'si.si_record_read_failure(uuid,text,text)',                                                   // 0026: own failed intent only
                                 'si.si_search_advertisers(text,uuid,text,text[],timestamp with time zone,timestamp with time zone,text,boolean,integer)'].sort());
   assert.deepEqual((await c.admin.query(`SELECT setconfig FROM pg_db_role_setting WHERE setrole = 'si_reader'::regrole`)).rows, [], 'group settings are not inherited; principals carry their own');
 });

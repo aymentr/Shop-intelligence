@@ -75,7 +75,7 @@ export type ToleratedArtifact = { name: string; table: string; reason: string };
 export type ReadinessPreconditionResult = PreconditionResult & { warnings?: string[] };
 
 /**
- * The indexes the migrations (0001-0025) and the adoption log create in schema si. An invalid index with one of these
+ * The indexes the migrations (0001-0026) and the adoption log create in schema si. An invalid index with one of these
  * names is never tolerated. tests/db/m4-ops.test.mjs (OPS-0) requires this list to equal the migrated catalog.
  */
 export const SCHEMA_INDEXES: ReadonlySet<string> = new Set([
@@ -97,7 +97,10 @@ export const SCHEMA_INDEXES: ReadonlySet<string> = new Set([
   // 0024 (M4-P3.3 Phase 2: batched summary verification)
   'collection_runs_sweep_order', 'advertiser_identities_sweep_order', 'summary_sweeps_pkey', 'summary_sweeps_one_active',
   'summary_sweeps_by_source', 'summary_sweep_batches_pkey', 'summary_sweep_runs_pkey', 'summary_sweep_identities_pkey',
-  'summary_sweep_failures_pkey', 'summary_drift_clearances_pkey'
+  'summary_sweep_failures_pkey', 'summary_drift_clearances_pkey',
+  // 0026 (observability)
+  'read_path_events_pkey', 'read_path_events_by_time', 'read_failures_pkey', 'read_failures_by_time',
+  'source_control_timings_pkey', 'source_control_timings_by_time', 'source_control_failures_pkey', 'source_control_failures_by_time'
 ]);
 
 /** Read-only catalog facts about the named invalid indexes of schema si. */

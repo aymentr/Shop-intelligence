@@ -287,6 +287,8 @@ jobs:
         run: CI=true node tests/mutations/m4-p33-p2.mjs
       - name: Verification safety closure deliberate breaks (NM1-NM4, CX1-CX6; 0024/0025/roles.sql restored)
         run: CI=true node tests/mutations/m4-p33-p2-close.mjs
+      - name: Operational observability deliberate breaks (TX1-TX12, LX1; 0026 and the reader library restored)
+        run: CI=true node tests/mutations/m4-p33-p3.mjs
       - name: Database logs on failure
         if: failure()
         run: docker compose logs db

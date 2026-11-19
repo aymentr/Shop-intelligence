@@ -166,8 +166,8 @@ export const WAIT = `  WHILE pg_current_wal_flush_lsn() < target LOOP`;
 // instrumented copy and every mutant starts from these; a historical text is used only where a test says so
 // (tests/db/wal-boundary.mjs OLD_READ / OLD_CLAIM, R35-M). tests/db/gate-integrity.test.mjs guards this.
 const MIGDIR = new URL('../../db/migrations/', import.meta.url);
-export function latestDefinition(name, endMarker) {
-  const files = readdirSync(MIGDIR).filter(f => /^\d{4}_.*\.up\.sql$/.test(f)).sort().reverse();
+export function latestDefinition(name, endMarker, { before = null } = {}) {   // before: e.g. '0026' = the definition preceding 0026
+  const files = readdirSync(MIGDIR).filter(f => /^\d{4}_.*\.up\.sql$/.test(f) && (before === null || f < before)).sort().reverse();
   for (const f of files) {
     const t = readFileSync(new URL(f, MIGDIR), 'utf8');
     const m = new RegExp(`CREATE (OR REPLACE )?FUNCTION si\\.${name}\\(`).exec(t);

@@ -36,7 +36,7 @@ const MIG18 = readFileSync(new URL('../../db/migrations/0018_set_based_readabili
 const cut = (t, a, b) => { const s = t.indexOf(a); return t.slice(s, t.indexOf(b, s) + b.length); };
 const FN18 = cut(MIG18, 'CREATE OR REPLACE FUNCTION si.si_search_advertisers', 'END $search$;');
 const L = latestDefinition('si_search_advertisers', 'END $search$;');
-assert.equal(L.file, '0023_summary_backed_search.up.sql');
+assert.equal(L.file, '0026_operational_observability.up.sql');   // 0026: the 0023 text with telemetry lines added
 const FN23 = L.text;
 // The summary statement, verbatim from 0023, with its PL/pgSQL variables bound as parameters (EXPLAIN only).
 const STMT = (() => {

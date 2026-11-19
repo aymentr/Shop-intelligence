@@ -25,6 +25,9 @@
  *                                                     bounded summary verification sweep (si_monitor; docs §18; exit 2 if not clean)
  *   node dist/persistence/cli.js summaries status      content-free sweep / drift / eligibility per source (exit 2 if drift open)
  *   node dist/persistence/cli.js summaries clear-drift --source S --sweep N   owner recovery after a clean sweep
+ *   node dist/persistence/cli.js ops status [--window-s N]   content-free read paths, verification health, control latency, lock waits (si_monitor; docs §19)
+ *   node dist/persistence/cli.js ops alerts [--window-s N] [--max-clean-age-s N] [--control-budget-ms N] [--reader-p95-ms N] ...
+ *                                                     firing alerts as JSON (exit 2 if any); polled by an external scheduler
  *
  * Production mode (SI_PRODUCTION=1, or preflight --production) also requires SI_COLLECTOR_DATABASE_URL:
  * the gate checks a live collector session's effective logging settings and fails closed without it.
@@ -47,6 +50,7 @@ import { checkIndexReadiness, checkIndexReadinessPrecondition } from './readines
 import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
 import { assertProductionReady, ProductionGateRefused } from './production-readiness.js';
 import type { ReadinessScope } from './readiness.js';
+import { controlLatency, controlLockWaits, operationalAlerts, readPathStatus, verificationHealth } from './observability.js';
 import { clearDrift, SweepBatchFailed, verificationStatus as summaryVerificationStatus, verifySource } from './summary-verification.js';
 import { DEFAULT_PURGE_RUNS, overdueRetention, purgeDue, purgeFailures, RetentionFailed, retentionStatus } from './retention.js';
 import { DEFAULT_VERIFY_RUNS, verificationFailures, verificationStatus, VerificationFailed, verifyReceipts } from './verification.js';
@@ -115,6 +119,25 @@ async function summaries(client: pg.Client, sub: string | undefined): Promise<vo
   }
 }
 
+/** M4-P3.3 Phase 3 (docs §19): content-free operational observability (si_monitor). Delivers nothing anywhere. */
+async function ops(client: pg.Client, sub: string | undefined): Promise<void> {
+  const w = intArg('--window-s', 3600);
+  if (sub === 'status') {
+    console.log(JSON.stringify({ readPaths: await readPathStatus(client, w), verification: await verificationHealth(client, w),
+      controls: await controlLatency(client, intArg('--control-window-s', 86400), intArg('--control-budget-ms', 5000)),
+      lockWaits: await controlLockWaits(client) }));
+  } else if (sub === 'alerts') {
+    const a = await operationalAlerts(client, {
+      windowSeconds: w, maxCleanAgeSeconds: intArg('--max-clean-age-s', 86400), fallbackMinRequests: intArg('--fallback-min', 20),
+      fallbackRatio: Number(arg('--fallback-ratio') ?? 0.5), failureMax: intArg('--failure-max', 3), controlBudgetMs: intArg('--control-budget-ms', 5000),
+      controlWindowSeconds: intArg('--control-window-s', 86400), readerP95Ms: intArg('--reader-p95-ms', 400), readerMinRequests: intArg('--reader-min', 20) });
+    console.log(JSON.stringify(a));
+    if (a.length > 0) process.exitCode = 2;
+  } else {
+    throw new Error('usage: cli.js ops status | alerts [thresholds]');
+  }
+}
+
 /**
  * M4-P3.3-P1-OPS-01 (docs §17.5): the readiness scope of the production gate for this command. Only `retention purge`
  * ('purge') and the read-only status commands ('diagnostic') may tolerate UNRELATED invalid index artifacts (with a
@@ -124,7 +147,7 @@ function readinessScopeFor(command: string | undefined, sub: string | undefined)
   if (command === 'retention' && sub === 'purge') return 'purge';
   if ((command === 'retention' && (sub === 'status' || sub === 'overdue' || sub === 'failures')) ||
       (command === 'verification' && (sub === 'status' || sub === 'failures')) ||
-      (command === 'summaries' && sub === 'status') || command === 'status' || command === 'readiness') return 'diagnostic';
+      (command === 'summaries' && sub === 'status') || command === 'ops' || command === 'status' || command === 'readiness') return 'diagnostic';
   return 'strict';
 }
 
@@ -207,8 +230,10 @@ async function main(): Promise<void> {
       await verification(client, process.argv[3]);
     } else if (command === 'summaries') {
       await summaries(client, process.argv[3]);
+    } else if (command === 'ops') {
+      await ops(client, process.argv[3]);
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | readiness | build-index --version 22 [--lock-timeout-ms N] [--replace-invalid] | adopt --version 22 [--lock-timeout-ms N] | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures> | summaries <verify|status|clear-drift>');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | readiness | build-index --version 22 [--lock-timeout-ms N] [--replace-invalid] | adopt --version 22 [--lock-timeout-ms N] | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures> | summaries <verify|status|clear-drift> | ops <status|alerts>');
     }
   } finally {
     await client.end();

@@ -49,8 +49,8 @@ const CAP = 200000;
 let n = 0;
 test.before(async () => { const a = await connect(); try { await provisionReaderPrincipal(a, 'si_reader_alice', cfg.rolePassword); } finally { await a.end(); } });
 
-test('SS-0: the active search function is 0023 (summary path present, 0018 observation statement kept)', () => {
-  assert.equal(SEARCH_DEF.file, '0023_summary_backed_search.up.sql');
+test('SS-0: the active search function is 0026 (the 0023 text with telemetry lines added: summary path present, 0018 observation statement kept)', () => {
+  assert.equal(SEARCH_DEF.file, '0026_operational_observability.up.sql');
   for (const s of ['si.si_summary_coverage(p_source_id)', 'count(DISTINCT u.ad_id)::int AS distinct_ads',
                    'count(DISTINCT (c.network, c.native_ad_id))::int AS distinct_ads', "RAISE DEBUG 'SI_READ_PATH %'"]) assert.equal(SEARCH_FN.split(s).length, 2, s);
 });
