@@ -21,7 +21,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { latestDefinition } from './durability-fixtures.mjs';
-import { asOwner, connect, createSources, freshDatabase, recordRights, roles } from './helpers.mjs';
+import { asOwner, connect, createSources, freshDatabase, recordRights, roles, ownerRecovery } from './helpers.mjs';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { migrateUp } from '../../dist/persistence/migrate.js';
 
@@ -102,7 +102,7 @@ test('CV-1: 0021 eligibility == 0020 eligibility over randomized states (missing
   await isolated('one unsummarized run', async () => { await replica(c, 'DELETE FROM si.run_advertiser_summaries WHERE run_id = $1', [one]); await replica(c, 'DELETE FROM si.run_summary_status WHERE run_id = $1', [one]); },
     { eligible: false, reasons: ['INCOMPLETE'] }, backfill);
   await isolated('open drift', () => ownerQ(c, `INSERT INTO si.summary_events (source_id, kind, finding) VALUES ('cv-c', 'DRIFT_DETECTED', 'MISSING')`),
-    { eligible: false, reasons: ['DRIFT'] }, () => ownerQ(c, 'SELECT * FROM si.si_verify_summaries($1)', ['cv-c']));
+    { eligible: false, reasons: ['DRIFT'] }, () => ownerRecovery(c, 'cv-c'));                     // 0025: a clean sweep + authorized clearance
   await isolated('stale status of a purged run (not eligible: no effect)', async () => {
       await replica(c, `UPDATE si.collection_runs SET retention_state = 'PURGED', first_purged_at = clock_timestamp(), purged_at = clock_timestamp() WHERE run_id = $1`, [one]);
       await replica(c, `UPDATE si.run_summary_status SET normalizer = 'v0|stale' WHERE run_id = $1`, [one]); },
@@ -123,7 +123,7 @@ test('CV-1: 0021 eligibility == 0020 eligibility over randomized states (missing
       // R-40 runbook equivalent: rows of runs without a status are removed (superuser here), then backfill re-derives them
       await replica(c, `DELETE FROM si.run_advertiser_summaries x WHERE NOT EXISTS (SELECT 1 FROM si.run_summary_status s WHERE s.run_id = x.run_id)`);
       await ownerQ(c, 'SELECT * FROM si.si_backfill_summaries(5)'); });
-    else if (op === 7) await ownerQ(c, 'SELECT * FROM si.si_verify_summaries($1)', [r.s]);                                           // real detection / clearance
+    else if (op === 7) await ownerQ(c, 'SELECT * FROM si.si_verify_summaries($1)', [r.s]);                                           // real detection (0025: it never clears)
     await compare(`seed ${seed} trial ${i} op ${op}`);
   }
   await ownerQ(c, `INSERT INTO si.summary_events (source_id, kind, finding) VALUES ('cv-empty', 'DRIFT_DETECTED', 'ORPHAN_IDENTITY')`);   // drift without runs
@@ -328,6 +328,8 @@ test('TB-1: trusted-owner boundary — forged drift events and rewritten summari
   // Recovery from the authoritative observations, then a clean verification clears the drift.
   await ownerQ(c, 'SELECT si.si_rebuild_run_summaries($1)', [R1]);
   assert.deepEqual(await verifyAll(c), [], 'rebuilt: verification PASS');
+  assert.deepEqual(await coverage(c, s), { eligible: false, reasons: ['DRIFT'] }, '0025: a clean verification does not clear');
+  assert.equal(await ownerRecovery(c, s), 'COMPLETED_CLEAN');                   // the authorized recovery
   assert.deepEqual(await coverage(c, s), { eligible: true, reasons: [] });
   // TOCTOU: tampering after a clean verification is invisible until the next verification.
   await asOwner(c, async a => {

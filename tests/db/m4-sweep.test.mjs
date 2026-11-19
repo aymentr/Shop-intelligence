@@ -430,14 +430,14 @@ test('SW-14: drift clearance needs the owner AND a clean sweep started after the
   await assert.rejects(clearDrift(x.admin, s, c2.sweepId), /SI_SUMMARY_NO_DRIFT/);
 });
 
-test('SW-15: 0024 down restores the exact 0023 catalog; up re-applies identically', async t => {
+test('SW-15: 0025 and 0024 down restore the exact 0023 catalog; up re-applies identically', async t => {
   const x = await fresh(t);
   const v24 = await schemaFingerprint(x.admin);
   const ref = await freshDatabase(t, 'm4sw23', { migrate: false });
   const r = await roles(t, ref, ['admin']);
   await migrateUp(r.admin, { to: 23 });
-  assert.deepEqual(await migrateDown(x.admin, { to: 23, allowDestructive: true }), [24]);
+  assert.deepEqual(await migrateDown(x.admin, { to: 23, allowDestructive: true }), [25, 24]);
   assert.deepEqual(await schemaFingerprint(x.admin), await schemaFingerprint(r.admin));
-  assert.deepEqual(await migrateUp(x.admin), [24]);
+  assert.deepEqual(await migrateUp(x.admin), [24, 25]);
   assert.deepEqual(await schemaFingerprint(x.admin), v24);
 });

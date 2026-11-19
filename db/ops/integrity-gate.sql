@@ -106,13 +106,13 @@ functions(fn, sha, secdef, volatility, config) AS (VALUES
    'search_path=pg_catalog, pg_temp;enable_hashjoin=off;enable_nestloop=off;enable_sort=off'),                                          -- 0021
   ('si.si_summary_drift_open(text)', '247cf7e4cc1be0b5be8a0a109c8d87a13c503127ca6e7612a031b681035c7473', false, 's', 'search_path=pg_catalog, pg_temp'),
   ('si.si_normalizer_fingerprint()', 'd80912d37b80b501729c99117493cfd6c7a3b63f92de2e64773f963eacf30ec5', false, 's', 'search_path=pg_catalog, pg_temp'),
-  ('si.si_verify_summaries(text)', 'ce127dd0f45218049221e10a8a046f4d72874b4875b0e4e25f123e6428b2ac27', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.si_verify_summaries(text)', 'bbc8646946925ccc64b0c5ddccbea64613a3720642091b09e6854073591a0449', false, 'v', 'search_path=pg_catalog, pg_temp'),  -- 0025
   ('si.si_summary_content(uuid)', 'c29b9fedffaab13c00e8fccdab61a2e87d553e755ef6237e2a4ee407e8a4f262', false, 's', 'search_path=pg_catalog, pg_temp'),
   ('si.si_summary_stored(uuid)', 'e78650cd7781dbf418186968abe2c55b1a8b983259872e119d401f4ae83e80bd', false, 's', 'search_path=pg_catalog, pg_temp'),
   ('si.si_summary_digest(bytea[],text[],integer[],text[],text[])', 'b87304c62f00fca03f90de8911f10cf8ce28a95ee030e5bb2b404845cc66aea6', false, 'i', 'search_path=pg_catalog, pg_temp'),
   ('si.si_rebuild_run_summaries(uuid)', 'd12ac437a39183bf35d56edc718a1288da8d81cf66ac4f3b07f3c90e213e5690', false, 'v', 'search_path=pg_catalog, pg_temp'),
   -- 0024 (owner-only): the per-run verification, the state machine, the append-only guard and the drift clearance
-  ('si.si_summary_clear_drift(text,bigint)', 'e17d9715a9276a751e13a6c9552185ecad8b24f1128abfd1dc4e5c2b3f9949f5', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.si_summary_clear_drift(text,bigint)', 'b4c3601ea8c49b86af1544e8eb17b08b3682c5cb8e9c3bef343ff2e640b7f228', false, 'v', 'search_path=pg_catalog, pg_temp'),  -- 0025
   ('si.si_sweep_verify_run(uuid,text,integer)', 'b8c9f5150281f04269528a0c7dfb6c6a63b0c6358fc214e08945aa9cc4c8b49a', false, 'v', 'search_path=pg_catalog, pg_temp'),
   ('si.trg_summary_sweep_transition()', '34db09c595569823f306efae89442c03e9737623f43cbab3c65e27ac600d8f5d', false, 'v', 'search_path=pg_catalog, pg_temp'),
   ('si.trg_sweep_records_append_only()', 'b882ecd81310163e794ff5a9f87302c2eb906b96f283bfee530d9e50811dc241', false, 'v', 'search_path=pg_catalog, pg_temp')),

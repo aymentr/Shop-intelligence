@@ -33,7 +33,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { isDeepStrictEqual } from 'node:util';
-import { asOwner, cfg, connect, control, createSources, freshDatabase, recordRights, roles, settle } from './helpers.mjs';
+import { asOwner, cfg, connect, control, createSources, freshDatabase, recordRights, roles, settle, ownerRecovery } from './helpers.mjs';
 import { latestDefinition } from './durability-fixtures.mjs';
 import { PAUSE_SQL, armPause, awaitMarkedPause, observeCall, pauseMarker, releasePause } from './barriers.mjs';
 import { provisionReaderPrincipal } from '../../dist/persistence/bootstrap.js';
@@ -544,7 +544,7 @@ test('SS-7: malformed inputs are refused identically on both paths', async t => 
 });
 
 // ------------------------------------------------------------------------------------------------ SS-8 trusted-owner boundary
-test('SS-8: tampered summaries and a deleted identity are served until verification records drift (contract B); then the observation path is exact; rebuild restores the summary path', async t => {
+test('SS-8: tampered summaries and a deleted identity are served until verification records drift (contract B); then the observation path is exact; rebuild + the authorized recovery restore the summary path', async t => {
   const x = await fresh(t);
   const { s, runs } = await small(x);
   const alice = await reader(x);
@@ -559,6 +559,8 @@ test('SS-8: tampered summaries and a deleted identity are served until verificat
   await both(x, alice, s, R('north'), 'observations');
   for (const r of runs) await asOwner(x.admin, a => a.query('SELECT si.si_rebuild_run_summaries($1)', [r]));
   assert.deepEqual((await asOwner(x.admin, a => a.query('SELECT * FROM si.si_verify_summaries($1)', [s]))).rows, []);
+  await both(x, alice, s, R('north'), 'observations');                          // 0025: a clean full verification never clears
+  assert.equal(await ownerRecovery(x.admin, s), 'COMPLETED_CLEAN');
   await both(x, alice, s, R('north'), 'summary');
   console.log(`# SS-8 verification findings: ${JSON.stringify(findings)}`);
 });
@@ -597,4 +599,38 @@ test('SS-9: an 18,000-character normalized name repeated over 150 runs: the page
   const q = (await x.admin.query('SELECT left(si.si_normalize_advertiser($1), 3) AS q', [huge])).rows[0].q;
   for (const r of [R(q), R('synthetic', { limit: 5 }), R('a', { limit: 50 })]) for (const p of await pages(alice, s, r)) assert.deepEqual(p, { req: p.req, ...(await oracle(x, s, p.req)), path: 'summary' });
   assert.equal(await temp() - t0, 0, 'no temporary file on the summary path');
+});
+
+test('SS-8c (0025, RV-B1 closed): after a sweep records drift, rebuild + the LEGACY full verification no longer clears: no DRIFT_CLEARED, no clearance record, the observation path stays; only a clean sweep + authorized clearance restores it', async t => {
+  const x = await fresh(t);
+  const { s, runs } = await small(x);
+  const alice = await reader(x);
+  await replica(x, `UPDATE si.run_advertiser_summaries SET names = names || ARRAY['Forged Spelling'] WHERE run_id = $1`, [runs[0]]);   // TAMPERING
+  assert.equal((await verifySource(x.si_monitor, s, { budget: { maxRuns: 1, maxObservations: 500, maxIdentities: 1 } })).state, 'COMPLETED_DRIFT');
+  await asOwner(x.admin, a => a.query('SELECT si.si_rebuild_run_summaries($1)', [runs[0]]));
+  const f = await asOwner(x.admin, a => a.query('SELECT * FROM si.si_verify_summaries($1)', [s]));
+  assert.deepEqual(f.rows, [], 'the full verification still reports its (empty) findings');
+  const kinds = (await x.admin.query('SELECT kind FROM si.summary_events WHERE source_id = $1 ORDER BY event_id', [s])).rows.map(r => r.kind);
+  assert.ok(!kinds.includes('DRIFT_CLEARED'), `no auto-clear: ${kinds}`);
+  assert.equal((await x.admin.query('SELECT count(*)::int AS n FROM si.summary_drift_clearances WHERE source_id = $1', [s])).rows[0].n, 0);
+  await both(x, alice, s, R('north'), 'observations');
+  const c = await verifySource(x.si_monitor, s);
+  await clearDrift(x.admin, s, c.sweepId);
+  await both(x, alice, s, R('north'), 'summary');
+});
+
+test('SS-8d (0025, RV-B2 closed): the tamper reverted by the owner, no rebuild: the legacy verification finds nothing and still does not clear; detection by the legacy verifier is preserved', async t => {
+  const x = await fresh(t);
+  const { s, runs } = await small(x);
+  const alice = await reader(x);
+  const orig = (await x.admin.query('SELECT identity_id, network, names FROM si.run_advertiser_summaries WHERE run_id = $1', [runs[0]])).rows;
+  await replica(x, `UPDATE si.run_advertiser_summaries SET names = names || ARRAY['Forged Spelling'] WHERE run_id = $1`, [runs[0]]);   // TAMPERING
+  const found = (await asOwner(x.admin, a => a.query('SELECT * FROM si.si_verify_summaries($1)', [s]))).rows.map(r => r.finding).sort();
+  assert.ok(found.length > 0, 'the legacy verifier still detects and records drift');
+  await both(x, alice, s, R('north'), 'observations');
+  for (const o of orig) await replica(x, 'UPDATE si.run_advertiser_summaries SET names = $3 WHERE run_id = $4 AND identity_id = $1 AND network = $2', [o.identity_id, o.network, o.names, runs[0]]);
+  assert.deepEqual((await asOwner(x.admin, a => a.query('SELECT * FROM si.si_verify_summaries($1)', [s]))).rows, []);
+  const kinds = (await x.admin.query('SELECT kind FROM si.summary_events WHERE source_id = $1 ORDER BY event_id', [s])).rows.map(r => r.kind);
+  assert.deepEqual([...new Set(kinds)], ['DRIFT_DETECTED'], `events ${kinds}`);
+  await both(x, alice, s, R('north'), 'observations');
 });

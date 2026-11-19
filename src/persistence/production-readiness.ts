@@ -11,7 +11,7 @@
  * cannot complete all fail closed. The per-call check in completeRunWithEvidence stays in place.
  */
 import type { ClientBase } from 'pg';
-import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions, type PreconditionResult } from './preconditions.js';
+import { checkCollectorLogging, checkMonitorSessionBounds, checkOperationalPreconditions, checkProductionAdvisoryPermissions, type PreconditionResult } from './preconditions.js';
 import { checkIndexReadinessPrecondition, type ReadinessScope } from './readiness.js';
 
 export interface ProductionReadinessOptions {
@@ -48,6 +48,7 @@ export async function assertProductionReady(client: ClientBase, options: Product
   const checks = [
     ...await checkOperationalPreconditions(client),
     ...await checkProductionAdvisoryPermissions(client),
+    ...await checkMonitorSessionBounds(client),                       // M4-P3.3-P2-CLOSE-01: idle / lock bounds of si_monitor
     ...await collectorChecks(client, options.collector)
   ];
   // M4-P3.3 Phase 1 (R-45): from schema version 22 on, the 0022 index must pass db/ops/readiness.sql.

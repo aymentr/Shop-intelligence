@@ -101,8 +101,9 @@ SI_DATABASE_URL=<any login>         node dist/persistence/cli.js readiness      
 ```
 
 Summary verification (0024, M4-P3.3 Phase 2, docs §18): bounded, resumable sweeps by `si_monitor`, one REPEATABLE READ
-batch at a time, no source lock; a finding records drift (summary-backed reads fall back exactly); only the owner clears
-drift, after a clean sweep:
+batch at a time, no source lock; a finding records drift (summary-backed reads fall back exactly); nothing clears drift
+automatically (0025: not the legacy full verification either). Only the owner clears it, with a COMPLETED_CLEAN sweep
+of the source under the current fingerprint that covers every run and identity inside its boundary (docs §18.1, §18.7):
 
 ```bash
 SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js summaries verify --source S   # exit 2 unless COMPLETED_CLEAN

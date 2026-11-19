@@ -40,6 +40,33 @@ export async function checkOperationalPreconditions(client: ClientBase): Promise
 }
 
 /**
+ * M4-P3.3-P2-CLOSE-01 (docs §18.1): bounds of the verification login. A sweep start and a batch that records drift hold the
+ * FK KEY SHARE on a source row; an emergency control (FOR UPDATE) waits for it. The EFFECTIVE role configuration of
+ * si_monitor for this database (database-specific role setting, else the role setting) must set
+ * idle_in_transaction_session_timeout and lock_timeout to a value in (0, 5 s], inside the 5 s SUSPEND budget (M3-T14).
+ * A missing setting means the server default (0 = unbounded) and fails closed. Catalog-only: no si_monitor session needed.
+ */
+export const MONITOR_BOUND_MAX_MS = 5000;
+export async function checkMonitorSessionBounds(client: ClientBase): Promise<PreconditionResult[]> {
+  const r = await client.query<{ name: string; value: string | null; ms: string | null }>(
+    `WITH cfg AS (
+       SELECT split_part(c, '=', 1) AS name, substr(c, strpos(c, '=') + 1) AS value, d.setdatabase <> 0 AS db_specific
+         FROM pg_catalog.pg_db_role_setting d CROSS JOIN LATERAL unnest(d.setconfig) c
+        WHERE d.setrole = (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'si_monitor')
+          AND d.setdatabase IN (0, (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())))
+     SELECT n.name, e.value,
+            CASE WHEN e.value ~ '^[0-9]+(ms|s|min)?$' THEN (extract(epoch FROM (CASE WHEN e.value ~ '^[0-9]+$' THEN e.value || 'ms' ELSE e.value END)::interval) * 1000)::bigint::text END AS ms
+       FROM (VALUES ('idle_in_transaction_session_timeout'), ('lock_timeout')) n(name)
+       LEFT JOIN LATERAL (SELECT c.value FROM cfg c WHERE c.name = n.name ORDER BY c.db_specific DESC LIMIT 1) e ON true
+      ORDER BY 1`);
+  return r.rows.map(row => {
+    const ms = row.ms === null ? NaN : Number(row.ms);
+    return { name: `si_monitor_${row.name}`, ok: Number.isFinite(ms) && ms > 0 && ms <= MONITOR_BOUND_MAX_MS,
+             actual: row.value ?? 'unset (server default)', expected: `(0, ${MONITOR_BOUND_MAX_MS} ms]` };
+  });
+}
+
+/**
  * Collector logging safety (Milestone 3, M3-P2B). Must run in a real si_collector session: role
  * settings apply at login, so only the session that will carry an evidence payload can show
  * what the server will log for it. Evidence payloads are sent only when every check passes.

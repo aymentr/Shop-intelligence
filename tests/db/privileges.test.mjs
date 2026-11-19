@@ -266,7 +266,7 @@ test('SD2/G3: role attributes and per-role session settings', async () => {
     'log_parameter_max_length=0', 'log_parameter_max_length_on_error=0', 'statement_timeout=30s']);
   assert.deepEqual(settings('si_rights_admin'), ['idle_in_transaction_session_timeout=10s', 'lock_timeout=30s']);
   assert.deepEqual(settings('si_retention'), ['lock_timeout=30s', 'statement_timeout=120s']);
-  assert.deepEqual(settings('si_monitor'), ['statement_timeout=30s']);
+  assert.deepEqual(settings('si_monitor'), ['idle_in_transaction_session_timeout=2s', 'lock_timeout=2s', 'statement_timeout=30s']);   // 0025 closure
   assert.equal((await c.si_collector.query('SHOW statement_timeout')).rows[0].statement_timeout, '30s', 'settings apply on login');
 });
 

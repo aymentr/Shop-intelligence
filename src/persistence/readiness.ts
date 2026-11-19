@@ -75,7 +75,7 @@ export type ToleratedArtifact = { name: string; table: string; reason: string };
 export type ReadinessPreconditionResult = PreconditionResult & { warnings?: string[] };
 
 /**
- * The indexes the migrations (0001-0024) and the adoption log create in schema si. An invalid index with one of these
+ * The indexes the migrations (0001-0025) and the adoption log create in schema si. An invalid index with one of these
  * names is never tolerated. tests/db/m4-ops.test.mjs (OPS-0) requires this list to equal the migrated catalog.
  */
 export const SCHEMA_INDEXES: ReadonlySet<string> = new Set([

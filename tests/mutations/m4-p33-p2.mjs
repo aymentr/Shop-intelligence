@@ -12,7 +12,9 @@ if (process.env.SI_PRODUCTION === '1') throw new Error('m4-p33-p2 refuses produc
 if (!['127.0.0.1', 'localhost', '::1'].includes(process.env.SI_TEST_PGHOST ?? '127.0.0.1')) throw new Error('loopback PostgreSQL test host required');
 
 const F = 'db/migrations/0024_batched_summary_verification.up.sql';
-const original = readFileSync(F);
+// M4-P3.3-P2-CLOSE-01: 0025 replaces si_summary_clear_drift, so its mutants (VX7, VX8) target the live definition in 0025.
+const F25 = 'db/migrations/0025_verification_safety_closure.up.sql';
+const originals = new Map([F, F25].map(f => [f, readFileSync(f)]));
 const sha = b => createHash('sha256').update(b).digest('hex').slice(0, 12);
 const D = id => new RegExp(`^not ok \\d+ - ${id}:`, 'm');
 const M = [
@@ -28,10 +30,10 @@ const M = [
     anchor: '  IF fp IS DISTINCT FROM w.normalizer THEN\n    stale := true;', to: '  IF false THEN\n    stale := true;' },
   { id: 'VX6', why: 'run findings are not recorded as drift', detector: D('SW-2'),
     anchor: "          INSERT INTO si.summary_events (source_id, run_id, kind, finding) SELECT w.source_id, x.run_id, 'DRIFT_DETECTED', k FROM unnest(f) k;", to: '          NULL;' },
-  { id: 'VX7', why: 'clearance ignores drift and rebuilds after the sweep started', detector: D('SW-14'),
+  { id: 'VX7', file: F25, why: 'clearance ignores drift and rebuilds after the sweep started', detector: D('SW-14'),
     anchor: '  IF EXISTS (SELECT 1 FROM si.summary_events e WHERE e.source_id = p_source_id AND e.event_id > w.start_event_id',
     to: '  IF false AND EXISTS (SELECT 1 FROM si.summary_events e WHERE e.source_id = p_source_id AND e.event_id > w.start_event_id' },
-  { id: 'VX8', why: 'clearance does not require a COMPLETED_CLEAN sweep', detector: D('SW-14'),
+  { id: 'VX8', file: F25, why: 'clearance does not require a COMPLETED_CLEAN sweep', detector: D('SW-14'),
     anchor: "  IF NOT FOUND OR w.state <> 'COMPLETED_CLEAN' THEN", to: '  IF NOT FOUND THEN' },
   { id: 'VX9', why: 'a busy sweep row is waited for instead of refused (NOWAIT)', detector: D('SW-10'),
     anchor: 'FOR NO KEY UPDATE NOWAIT;   -- 55P03: another verifier', to: 'FOR NO KEY UPDATE;   -- 55P03: another verifier' },
@@ -54,7 +56,7 @@ const M = [
     anchor: '     OR EXISTS (SELECT * FROM si.si_summary_stored(p_run_id) EXCEPT ALL SELECT * FROM unnest(content)) THEN', to: '     THEN' },
 ];
 const ONLY = (process.env.SI_MUT_ONLY ?? '').split(',').filter(Boolean);
-const restore = () => { writeFileSync(F, original); if (!readFileSync(F).equals(original)) throw new Error('FATAL: not restored'); };
+const restore = () => { for (const [f, b] of originals) { writeFileSync(f, b); if (!readFileSync(f).equals(b)) throw new Error(`FATAL: ${f} not restored`); } };
 const suite = () => {
   const r = spawnSync(process.execPath, ['tests/db/run.mjs', 'm4-sweep'], { encoding: 'utf8', timeout: 3600000, maxBuffer: 64 * 1024 * 1024 });
   return { r, out: (r.stdout ?? '') + '\n' + (r.stderr ?? '') };
@@ -62,16 +64,16 @@ const suite = () => {
 const outcomes = [];
 try {
   for (const m of M.filter(z => !ONLY.length || ONLY.includes(z.id))) {
-    const src = original.toString('utf8');
+    const file = m.file ?? F, src = originals.get(file).toString('utf8');
     if (src.split(m.anchor).length !== 2) throw new Error(`${m.id}: expected exactly one anchor`);
     try {
-      writeFileSync(F, src.replace(m.anchor, () => m.to), 'utf8');
+      writeFileSync(file, src.replace(m.anchor, () => m.to), 'utf8');
       const { r, out } = suite();
       const detected = m.detector.test(out), assertion = /AssertionError|ERR_ASSERTION/.test(out);
       const cls = r.error || r.signal || r.status === null ? 'INCONCLUSIVE' : r.status === 0 ? 'SURVIVED' : detected && assertion ? 'KILLED' : 'INCONCLUSIVE';
       console.log(`${m.id} ${m.why}: ${cls}; failing tests: ${JSON.stringify([...out.matchAll(/^not ok \d+ - (.{0,60})/gm)].map(z => z[1]))}`);
       outcomes.push({ id: m.id, cls });
-    } finally { restore(); console.log(`restored byte-for-byte: ${F.split('/').pop()} ${sha(original)}`); }
+    } finally { restore(); console.log(`restored byte-for-byte: ${file.split('/').pop()} ${sha(originals.get(file))}`); }
   }
   const green = suite().r.status === 0;
   console.log('restored baseline green:', green);

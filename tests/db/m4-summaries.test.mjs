@@ -28,7 +28,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { latestDefinition } from './durability-fixtures.mjs';
-import { asOwner, cfg, connect, control, createSources, freshDatabase, lift, recordRights, roles } from './helpers.mjs';
+import { asOwner, cfg, connect, control, createSources, freshDatabase, lift, recordRights, roles, ownerRecovery } from './helpers.mjs';
 import { provisionReaderPrincipal } from '../../dist/persistence/bootstrap.js';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { grantReader, revokeReader } from '../../dist/persistence/reader.js';
@@ -295,7 +295,9 @@ test('SUM-6: privileged corruption is found and blocks coverage; rebuild require
   await asOwner(c, a => a.query(`SELECT si.si_rebuild_run_summaries($1)`, [R]));
   assert.deepEqual(await coverage(c, s), { eligible: false, reasons: ['DRIFT'] }, 'still blocked until a clean verification');
   assert.deepEqual(await verify(c, s), [], 'the rebuilt run matches its (corrupted) evidence');
-  assert.deepEqual(await coverage(c, s), { eligible: true, reasons: [] }, 'cleared');
+  assert.deepEqual(await coverage(c, s), { eligible: false, reasons: ['DRIFT'] }, '0025: a clean full verification never clears');
+  assert.equal(await ownerRecovery(c, s), 'COMPLETED_CLEAN');                   // clean sweep + si_summary_clear_drift
+  assert.deepEqual(await coverage(c, s), { eligible: true, reasons: [] }, 'cleared by the authorized recovery');
   const ev = (await c.query(`SELECT kind, finding FROM si.summary_events ORDER BY event_id`)).rows.map(r => `${r.kind}${r.finding ? ':' + r.finding : ''}`);
   assert.deepEqual(ev, ['DRIFT_DETECTED:CONTENT_MISMATCH', 'DRIFT_DETECTED:STATUS_MISMATCH', 'REBUILT', 'DRIFT_CLEARED'], 'the record is append-only and complete');
   assert.deepEqual(await stored(c, s), await expected(c, s));

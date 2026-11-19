@@ -102,7 +102,7 @@ test('OPS-0: SCHEMA_INDEXES equals the migrated catalog (plus the adoption log);
   await buildIndexConcurrently(mig, { version: 22 }); await adoptMigration(mig, { version: 22 }); await migrateUp(mig);
   const names = (await admin.query(`SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
                                      WHERE c.relnamespace = 'si'::regnamespace ORDER BY 1`)).rows.map(r => r.relname);
-  assert.deepEqual(names, [...SCHEMA_INDEXES].sort(), 'every schema index of 0001-0024 and of the adoption log, and nothing else');
+  assert.deepEqual(names, [...SCHEMA_INDEXES].sort(), 'every schema index of 0001-0025 and of the adoption log, and nothing else');
   const vol = (await admin.query(`SELECT p.proname, p.provolatile FROM pg_proc p WHERE p.pronamespace = 'si'::regnamespace
       AND p.proname IN ('si_retention_status', 'si_purge_failures', 'si_verification_status', 'si_verification_failures') ORDER BY 1`)).rows;
   assert.deepEqual(vol.map(r => `${r.proname}:${r.provolatile}`),

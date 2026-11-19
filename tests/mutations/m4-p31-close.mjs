@@ -15,7 +15,9 @@ if (process.env.SI_PRODUCTION === '1') throw new Error('m4-p31-close refuses pro
 if (!['127.0.0.1', 'localhost', '::1'].includes(process.env.SI_TEST_PGHOST ?? '127.0.0.1')) throw new Error('loopback PostgreSQL test host required');
 
 const F20 = 'db/migrations/0020_advertiser_summaries.up.sql', F21 = 'db/migrations/0021_summary_coverage_cost.up.sql';
-const originals = new Map([F20, F21].map(f => [f, readFileSync(f)]));
+// M4-P3.3-P2-CLOSE-01: 0025 replaces si_verify_summaries, so its mutants (MX4, MX12) target the live definition in 0025.
+const F25 = 'db/migrations/0025_verification_safety_closure.up.sql';
+const originals = new Map([F20, F21, F25].map(f => [f, readFileSync(f)]));
 const sha256 = b => createHash('sha256').update(b).digest('hex');
 const SUM = 'm4-summaries', CLOSE = 'm4-summaries-close', GATE = 'm4-integrity-gate';
 const M = [
@@ -28,7 +30,7 @@ const M = [
   { id: 'MX3', file: F21, why: 'eligibility ignores open drift',
     anchor: "         CASE WHEN si.si_summary_drift_open(p_source_id) THEN 'DRIFT' END,", to: "         CASE WHEN false THEN 'DRIFT' END,",
     tests: [CLOSE], detector: /^not ok \d+ - CV-1:/m },
-  { id: 'MX4', file: F20, why: 'verification compares in one direction only',
+  { id: 'MX4', file: F25, why: 'verification compares in one direction only',
     anchor: '\n              OR EXISTS (SELECT * FROM si.si_summary_stored(s.run_id) EXCEPT ALL SELECT * FROM si.si_summary_content(s.run_id)))', to: ')',
     tests: [CLOSE], detector: /^not ok \d+ - CC-MX4:/m },
   { id: 'MX5', file: F20, why: 'the commit-time summary check never fires',
@@ -51,15 +53,14 @@ const M = [
     tests: [SUM], detector: /^not ok \d+ - SUM-3:/m },
   { id: 'MX11', file: F20, why: 'ad_ids not sorted ascending',
     anchor: 'array_agg(q.ad_id ORDER BY q.ad_id)', to: 'array_agg(q.ad_id ORDER BY q.ad_id DESC)', tests: [SUM], detector: /^not ok \d+ - SUM-1:/m },
-  { id: 'MX12', file: F20, why: 'verification no longer reports orphan identities',
+  { id: 'MX12', file: F25, why: 'verification no longer reports orphan identities',
     anchor: '       WHERE i.source_id = p_source_id AND NOT EXISTS (SELECT 1 FROM si.run_advertiser_summaries x WHERE x.identity_id = i.identity_id)', to: '       WHERE false',
     tests: [CLOSE], detector: /^not ok \d+ - CC-MX12:/m },
   { id: 'MX13', file: F20, why: 'the commit-time check ignores the observation count',
     anchor: '                    AND s.observation_count = (SELECT count(*) FROM si.observations o WHERE o.run_id = NEW.run_id)\n', to: '',
     tests: [CLOSE], detector: /^not ok \d+ - CC-MX13:/m },
-  { id: 'MX14', file: F20, why: 'a clean verification never clears drift',
-    anchor: "  ELSIF si.si_summary_drift_open(p_source_id) THEN\n    INSERT INTO si.summary_events (source_id, kind) VALUES (p_source_id, 'DRIFT_CLEARED');", to: '  ELSIF false THEN\n    NULL;',
-    tests: [SUM], detector: /^not ok \d+ - SUM-6:/m },
+  // MX14 ('a clean verification never clears drift') is RETIRED by 0025: that is now the specified behaviour; its inverse
+  // (the legacy auto-clear restored) is CX1 in tests/mutations/m4-p33-p2-close.mjs, killed by CL-9.
   { id: 'MX15', file: F20, why: 'rebuild is allowed without recorded drift',
     anchor: "  IF NOT si.si_summary_drift_open(src) THEN\n    RAISE EXCEPTION 'SI_SUMMARY_NO_DRIFT", to: "  IF false THEN\n    RAISE EXCEPTION 'SI_SUMMARY_NO_DRIFT",
     tests: [SUM], detector: /^not ok \d+ - SUM-6:/m },

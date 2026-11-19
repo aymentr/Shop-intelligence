@@ -103,6 +103,26 @@ export async function asOwner(client, fn) {
   }
 }
 
+/**
+ * M4-P3.3-P2-CLOSE-01 (0025): the authorized drift recovery, run by the owner: a complete batched verification sweep of
+ * the source (each batch one REPEATABLE READ transaction), then si_summary_clear_drift with that sweep. Returns the sweep's
+ * final state; clears only if it is COMPLETED_CLEAN (otherwise the clearance refusal is thrown).
+ */
+export async function ownerRecovery(client, source) {
+  const st = await asOwner(client, async a => (await a.query('SELECT * FROM si.si_summary_sweep_start($1)', [source])).rows[0]);
+  let state = st.state, seq = 0;
+  while (state === 'IN_PROGRESS') {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    try {
+      await client.query('SET LOCAL ROLE si_owner');
+      state = (await client.query('SELECT * FROM si.si_summary_sweep_batch($1, $2, 200, 20000, 5000)', [st.sweep_id, ++seq])).rows[0].state;
+      await client.query('COMMIT');
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); throw e; }
+  }
+  await asOwner(client, a => a.query('SELECT si.si_summary_clear_drift($1, $2)', [source, st.sweep_id]));
+  return state;
+}
+
 /** Expects a query to fail; returns the error (asserting SQLSTATE and/or message when given). */
 export async function rejects(assert, promise, { code, message } = {}) {
   let err;

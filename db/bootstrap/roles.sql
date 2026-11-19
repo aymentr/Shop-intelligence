@@ -73,6 +73,11 @@ ALTER ROLE si_rights_admin SET idle_in_transaction_session_timeout = '10s';
 ALTER ROLE si_retention    SET lock_timeout = '30s';
 ALTER ROLE si_retention    SET statement_timeout = '120s';
 ALTER ROLE si_monitor      SET statement_timeout = '30s';
+-- M4-P3.3-P2-CLOSE-01 (docs §18.1): a verification transaction may hold the FK KEY SHARE on a source row (sweep start,
+-- a batch that records drift), which an emergency control's FOR UPDATE must wait for. The library never idles inside a
+-- transaction; an abandoned or misbehaving session is terminated after 2 s idle, inside the 5 s SUSPEND budget (M3-T14).
+ALTER ROLE si_monitor      SET idle_in_transaction_session_timeout = '2s';
+ALTER ROLE si_monitor      SET lock_timeout = '2s';
 ALTER ROLE si_migrator     SET lock_timeout = '30s';
 
 -- Normalize si_reader membership (M3-P3C): only dedicated reader principals (si_reader_<name>

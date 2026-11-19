@@ -1,7 +1,8 @@
 -- B-002 M4-P3.1-CLOSE-01 (condition C3): mandatory summary verification (docs §15.8). Not a migration.
 -- Recomputes every summarized run of every source from its authoritative observations (si_verify_summaries) and lists
 -- every finding. PASS = zero rows. Run as si_owner, READ WRITE (a finding records DRIFT_DETECTED, which makes the source
--- ineligible for summary-backed reads; a clean verification of a source with open drift records DRIFT_CLEARED):
+-- ineligible for summary-backed reads; since migration 0025 a clean verification records NOTHING: open drift is cleared
+-- only by the authorized recovery, a COMPLETED_CLEAN sweep and si_summary_clear_drift, docs §18.1):
 --   psql -X -v ON_ERROR_STOP=1 -At -c 'SET ROLE si_owner' -f db/ops/verify-summaries.sql
 -- Required: at deployment verification, in DR-1 after a restore, after any privileged (owner or superuser) operation on
 -- summary or evidence tables, and on a schedule. The owner is TRUSTED (contract B): eligibility (si_summary_coverage)
