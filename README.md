@@ -100,6 +100,16 @@ SI_DATABASE_URL=<si_migrator login> node dist/persistence/cli.js adopt --version
 SI_DATABASE_URL=<any login>         node dist/persistence/cli.js readiness      # exit 1 with every failure code
 ```
 
+Summary verification (0024, M4-P3.3 Phase 2, docs §18): bounded, resumable sweeps by `si_monitor`, one REPEATABLE READ
+batch at a time, no source lock; a finding records drift (summary-backed reads fall back exactly); only the owner clears
+drift, after a clean sweep:
+
+```bash
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js summaries verify --source S   # exit 2 unless COMPLETED_CLEAN
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js summaries status              # exit 2 while any drift is open
+SI_DATABASE_URL=<si_migrator login> node dist/persistence/cli.js summaries clear-drift --source S --sweep N
+```
+
 Internal retrieval (0008): a dedicated principal (`si_reader_<name>`, provisioned with
 `provisionReaderPrincipal`) with a per-source grant (`si_grant_reader`, by `si_rights_admin`) can read
 bounded pages of VALID, currently authorized synthetic evidence through `readEvidence`

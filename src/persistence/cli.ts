@@ -21,6 +21,10 @@
  *   node dist/persistence/cli.js verification run [--limit N]   one bounded receipt-verification batch (si_monitor)
  *   node dist/persistence/cli.js verification status            pending / VALID / INVALID / UNVERIFIABLE, lag, xid age
  *   node dist/persistence/cli.js verification failures [--limit N]   recorded verification failures (codes only)
+ *   node dist/persistence/cli.js summaries verify --source S [--max-batches N] [--max-runs N] [--max-observations N]
+ *                                                     bounded summary verification sweep (si_monitor; docs §18; exit 2 if not clean)
+ *   node dist/persistence/cli.js summaries status      content-free sweep / drift / eligibility per source (exit 2 if drift open)
+ *   node dist/persistence/cli.js summaries clear-drift --source S --sweep N   owner recovery after a clean sweep
  *
  * Production mode (SI_PRODUCTION=1, or preflight --production) also requires SI_COLLECTOR_DATABASE_URL:
  * the gate checks a live collector session's effective logging settings and fails closed without it.
@@ -43,6 +47,7 @@ import { checkIndexReadiness, checkIndexReadinessPrecondition } from './readines
 import { checkCollectorLogging, checkOperationalPreconditions, checkProductionAdvisoryPermissions } from './preconditions.js';
 import { assertProductionReady, ProductionGateRefused } from './production-readiness.js';
 import type { ReadinessScope } from './readiness.js';
+import { clearDrift, SweepBatchFailed, verificationStatus as summaryVerificationStatus, verifySource } from './summary-verification.js';
 import { DEFAULT_PURGE_RUNS, overdueRetention, purgeDue, purgeFailures, RetentionFailed, retentionStatus } from './retention.js';
 import { DEFAULT_VERIFY_RUNS, verificationFailures, verificationStatus, VerificationFailed, verifyReceipts } from './verification.js';
 
@@ -86,6 +91,30 @@ async function verification(client: pg.Client, sub: string | undefined): Promise
   }
 }
 
+/** M4-P3.3 Phase 2 (docs §18): batched summary verification (si_monitor) and the owner's drift clearance. */
+async function summaries(client: pg.Client, sub: string | undefined): Promise<void> {
+  if (sub === 'verify') {
+    const source = arg('--source');
+    if (!source) throw new Error('usage: cli.js summaries verify --source S [--max-batches N] [--max-runs N] [--max-observations N] [--max-identities N]');
+    const r = await verifySource(client, source, { maxBatches: intArg('--max-batches', 100000),
+      budget: { maxRuns: intArg('--max-runs', 50), maxObservations: Number(arg('--max-observations') ?? 5000), maxIdentities: intArg('--max-identities', 1000) } });
+    const sum = (k: 'runs' | 'observations' | 'identities' | 'findings' | 'unverifiable') => r.batches.reduce((a, b) => a + b[k], 0);
+    console.log(JSON.stringify({ sweepId: r.sweepId, state: r.state, batches: r.batches.length, runs: sum('runs'), observations: sum('observations'),
+      identities: sum('identities'), findings: sum('findings'), unverifiable: sum('unverifiable'), retriedFailures: r.failures.map(f => f.code) }));
+    if (r.state === 'COMPLETED_DRIFT' || r.state === 'INCOMPLETE' || r.state === 'STALE') process.exitCode = 2;
+  } else if (sub === 'status') {
+    const st = await summaryVerificationStatus(client);
+    console.log(JSON.stringify(st));
+    if (st.some(s => s.driftOpen)) process.exitCode = 2;
+  } else if (sub === 'clear-drift') {
+    const source = arg('--source'), sweep = Number(arg('--sweep'));
+    if (!source || !Number.isInteger(sweep)) throw new Error('usage: cli.js summaries clear-drift --source S --sweep N');
+    console.log(JSON.stringify({ clearedEvent: await clearDrift(client, source, sweep) }));
+  } else {
+    throw new Error('usage: cli.js summaries verify --source S [...] | status | clear-drift --source S --sweep N');
+  }
+}
+
 /**
  * M4-P3.3-P1-OPS-01 (docs §17.5): the readiness scope of the production gate for this command. Only `retention purge`
  * ('purge') and the read-only status commands ('diagnostic') may tolerate UNRELATED invalid index artifacts (with a
@@ -95,7 +124,7 @@ function readinessScopeFor(command: string | undefined, sub: string | undefined)
   if (command === 'retention' && sub === 'purge') return 'purge';
   if ((command === 'retention' && (sub === 'status' || sub === 'overdue' || sub === 'failures')) ||
       (command === 'verification' && (sub === 'status' || sub === 'failures')) ||
-      command === 'status' || command === 'readiness') return 'diagnostic';
+      (command === 'summaries' && sub === 'status') || command === 'status' || command === 'readiness') return 'diagnostic';
   return 'strict';
 }
 
@@ -176,8 +205,10 @@ async function main(): Promise<void> {
       await retention(client, process.argv[3]);
     } else if (command === 'verification') {
       await verification(client, process.argv[3]);
+    } else if (command === 'summaries') {
+      await summaries(client, process.argv[3]);
     } else {
-      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | readiness | build-index --version 22 [--lock-timeout-ms N] [--replace-invalid] | adopt --version 22 [--lock-timeout-ms N] | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures>');
+      throw new Error('usage: cli.js bootstrap | up [--to N] | down --to N --allow-destructive | status | readiness | build-index --version 22 [--lock-timeout-ms N] [--replace-invalid] | adopt --version 22 [--lock-timeout-ms N] | preflight [--production] [--collector] | retention <purge|status|overdue|failures> | verification <run|status|failures> | summaries <verify|status|clear-drift>');
     }
   } finally {
     await client.end();
@@ -188,6 +219,11 @@ main().catch(err => {
   if (err instanceof RetentionFailed) {
     // Fixed fields only: never a PostgreSQL message, detail or evidence value.
     console.error(`RETENTION_FAILED code=${err.code} sqlstate=${err.sqlstate ?? 'none'} recorded=${err.recorded}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (err instanceof SweepBatchFailed) {
+    console.error(`SUMMARY_VERIFICATION_FAILED code=${err.code} sqlstate=${err.sqlstate ?? 'none'} recorded=${err.recorded}`);
     process.exitCode = 1;
     return;
   }

@@ -18,7 +18,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { asOwner, cfg, connect, createSources, freshDatabase, recordRights, roles } from './helpers.mjs';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { SCHEMA_INDEXES } from '../../dist/persistence/readiness.js';
-import { adoptMigration, buildIndexConcurrently, migrateUp } from '../../dist/persistence/migrate.js';
+import { adoptMigration, buildIndexConcurrently, loadMigrations, migrateUp } from '../../dist/persistence/migrate.js';
 
 const CLI = fileURLToPath(new URL('../../dist/persistence/cli.js', import.meta.url));
 const HARDENING = readFileSync(new URL('../../db/bootstrap/optional/advisory-lock-hardening.sql', import.meta.url), 'utf8');
@@ -143,7 +143,7 @@ test('OPS-2: one unrelated NOT READY artifact: purge and diagnostics proceed wit
     refusedStrict(r, /index_readiness_observations_by_ad_fk=INVALID_INDEX_ARTIFACT:ops_scratch/);
     assert.deepEqual(r.warns, [], 'no tolerance outside purge and diagnostics');
   }
-  assert.equal(Number((await x.admin.query('SELECT max(version) AS v FROM si.schema_migrations')).rows[0].v), 23, 'down was not dispatched');
+  assert.equal(Number((await x.admin.query('SELECT max(version) AS v FROM si.schema_migrations')).rows[0].v), loadMigrations().at(-1).version, 'down was not dispatched');
 });
 
 test('OPS-3: several tolerable artifacts (not ready, and a REAL REINDEX CONCURRENTLY leftover with an identical twin): purge correct, one warning each', async t => {

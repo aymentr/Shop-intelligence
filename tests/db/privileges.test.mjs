@@ -51,12 +51,15 @@ const EXPECTED_EXECUTE = {
   si_read_evidence: ['si_reader'], si_begin_read: ['si_reader'],                                      // 0009 (committed read intent)
   si_read_source_status: ['si_reader'],                                                                 // 0011 (content-free source status)
   si_read_source_availability: ['si_reader'],                                                           // 0012 (content-free source availability)
-  si_search_advertisers: ['si_reader'], si_advertiser_history: ['si_reader']                             // 0014 (server-side intelligence)
+  si_search_advertisers: ['si_reader'], si_advertiser_history: ['si_reader'],                            // 0014 (server-side intelligence)
+  si_summary_sweep_start: ['si_monitor'], si_summary_sweep_batch: ['si_monitor'],                       // 0024 (batched summary verification)
+  si_summary_sweep_record_failure: ['si_monitor'], si_summary_sweep_expire: ['si_monitor'], si_summary_verification_status: ['si_monitor']
 };
 const EXPECTED_DEFINER = ['si_advertiser_history', 'si_begin_read', 'si_begin_run', 'si_begin_run_scoped', 'si_complete_run', 'si_fail_run', 'si_grant_reader', 'si_heartbeat_run', 'si_purge_due',
                           'si_purge_failures', 'si_read_evidence', 'si_read_source_availability', 'si_read_source_status', 'si_reap_expired_runs', 'si_record_purge_failure', 'si_record_rights_version',
                           'si_record_source_control', 'si_record_verification_failure', 'si_retention_status', 'si_revoke_reader', 'si_search_advertisers',
-                          'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_open_run', 'trg_observation_purge_check',
+                          'si_summary_sweep_batch', 'si_summary_sweep_expire', 'si_summary_sweep_record_failure', 'si_summary_sweep_start',
+                          'si_summary_verification_status', 'si_verification_failures', 'si_verification_status', 'si_verify_receipts', 'trg_ad_has_observation', 'trg_observation_open_run', 'trg_observation_purge_check',
                           'trg_observation_run_completed', 'trg_purge_log_check', 'trg_receipts_run_completed', 'trg_run_errors_count',
                           'trg_runs_publish_check', 'trg_runs_purge_check', 'trg_runs_purge_summaries', 'trg_runs_summary_check'];
 const EXPECTED_VOLATILITY = {
@@ -112,6 +115,9 @@ const EXPECTED_VOLATILITY = {
   si_normalizer_fingerprint: 's', si_summary_drift_open: 's', trg_summary_guard: 'v', trg_observation_open_run: 'v',
   si_summary_content: 's', si_summary_digest: 'i', si_summary_stored: 's', si_summarize_run: 'v', trg_runs_summary_check: 'v',
   trg_runs_purge_summaries: 'v', si_backfill_summaries: 'v', si_verify_summaries: 'v', si_rebuild_run_summaries: 'v', si_summary_coverage: 's',
+  trg_sweep_records_append_only: 'v', trg_summary_sweep_transition: 'v', si_sweep_verify_run: 'v', si_summary_sweep_start: 'v',     // 0024
+  si_summary_sweep_batch: 'v', si_summary_sweep_record_failure: 'v', si_summary_sweep_expire: 'v', si_summary_verification_status: 's',
+  si_summary_clear_drift: 'v',
 };
 // 0015 (D3): resource bounds pinned on the two server-side reader functions; 0016 (N1b): plan_cache_mode pinned too.
 const PINNED_INTELLIGENCE = ['search_path=pg_catalog, pg_temp', 'lock_timeout=2s', ...'work_mem=4MB|hash_mem_multiplier=2|max_parallel_workers_per_gather=0|jit=off|temp_file_limit=256MB|plan_cache_mode=force_custom_plan'.split('|')];

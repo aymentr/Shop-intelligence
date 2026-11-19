@@ -77,7 +77,20 @@ immutability(tgname, relname, sha) AS (VALUES
   ('trg_summary_events_append_only', 'summary_events', '7dba6a962453dafc0dd7826ea7334561c6b3125dc8d3eb76bf220b6ece1afcf9'),
   ('trg_summary_events_no_truncate', 'summary_events', '065453bc510cd3b9cad6d6872bce46358d626f4d215150928e8a826c3edd6f41'),
   ('trg_runs_summary_check', 'collection_runs', 'd50cd0b75b4eb946de32b77584ea4c4d2ca3a5a0ea1d4adec0bdb1c0a6c65906'),
-  ('trg_runs_purge_summaries', 'collection_runs', '1ded5ed27f3ee08e0abd2ffe5306482ee2b130750087889663eb5d98a302929d')),
+  ('trg_runs_purge_summaries', 'collection_runs', '1ded5ed27f3ee08e0abd2ffe5306482ee2b130750087889663eb5d98a302929d'),
+  -- 0024: verification records are append-only; the sweep state machine
+  ('trg_drift_clearances_append_only', 'summary_drift_clearances', '0714e616e5fd698d6fa6ac75430f43ffebe5379b7dc7bb8a301d63f7d3168126'),
+  ('trg_drift_clearances_no_truncate', 'summary_drift_clearances', 'c2f2c7deb0c965a7155cc8791f6f712c1ff5f3643e3a8afa932ccffe8fbcf55e'),
+  ('trg_summary_sweep_transition', 'summary_sweeps', '035820378a6db94d3f80d2a947204ba82c4419b6b0cf3b316ae773dc3eb96692'),
+  ('trg_sweep_batches_append_only', 'summary_sweep_batches', '53f0ae3ff6978523b526e433e1ebd45d1e88f35f737dd7f0ea1b4ebf29f41ec0'),
+  ('trg_sweep_batches_no_truncate', 'summary_sweep_batches', '839d8b2d1b1ecb19899453257ffb22cd5710fc49af9169c2baecab67d293dd76'),
+  ('trg_sweep_failures_append_only', 'summary_sweep_failures', '81fa96b6e2a5cc49c1d551db2245d028a2718e37166213aaae3c8bb6896cd6fb'),
+  ('trg_sweep_failures_no_truncate', 'summary_sweep_failures', 'f3e8a3d7aec6532a494048f24817efa786700146ee5670971117233527393ff3'),
+  ('trg_sweep_identities_append_only', 'summary_sweep_identities', '76e8a11c8dfdd2ab9e37b25dabb1a0ae442e5d41e6ee832aac163c440da2fbd6'),
+  ('trg_sweep_identities_no_truncate', 'summary_sweep_identities', '5ceda0cd80d126d91eb44ae59de6b818ce6a936726365bbf624c36212285eae5'),
+  ('trg_sweep_runs_append_only', 'summary_sweep_runs', 'cc94467ea5e5cb0f3940b33f9b0f1ae488357ddedf4dfeef14c88d94472955d0'),
+  ('trg_sweep_runs_no_truncate', 'summary_sweep_runs', 'c40eb06c4c6bd5d98ae1a68163b702c56cc50871a788f4938b52704a72b6748c'),
+  ('trg_sweeps_no_truncate', 'summary_sweeps', '9168a1f2478bcc085d8eb0b670a8dc4233ae117bea9b263e65d8e5543b27f62e')),
 -- Exact bodies (SHA-256 of prosrc) and attributes of the security-critical functions: every immutability/lifecycle
 -- trigger function, the eligibility function and everything it and verification evaluate. Owner-only (no grant).
 functions(fn, sha, secdef, volatility, config) AS (VALUES
@@ -97,7 +110,12 @@ functions(fn, sha, secdef, volatility, config) AS (VALUES
   ('si.si_summary_content(uuid)', 'c29b9fedffaab13c00e8fccdab61a2e87d553e755ef6237e2a4ee407e8a4f262', false, 's', 'search_path=pg_catalog, pg_temp'),
   ('si.si_summary_stored(uuid)', 'e78650cd7781dbf418186968abe2c55b1a8b983259872e119d401f4ae83e80bd', false, 's', 'search_path=pg_catalog, pg_temp'),
   ('si.si_summary_digest(bytea[],text[],integer[],text[],text[])', 'b87304c62f00fca03f90de8911f10cf8ce28a95ee030e5bb2b404845cc66aea6', false, 'i', 'search_path=pg_catalog, pg_temp'),
-  ('si.si_rebuild_run_summaries(uuid)', 'd12ac437a39183bf35d56edc718a1288da8d81cf66ac4f3b07f3c90e213e5690', false, 'v', 'search_path=pg_catalog, pg_temp')),
+  ('si.si_rebuild_run_summaries(uuid)', 'd12ac437a39183bf35d56edc718a1288da8d81cf66ac4f3b07f3c90e213e5690', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  -- 0024 (owner-only): the per-run verification, the state machine, the append-only guard and the drift clearance
+  ('si.si_summary_clear_drift(text,bigint)', 'e17d9715a9276a751e13a6c9552185ecad8b24f1128abfd1dc4e5c2b3f9949f5', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.si_sweep_verify_run(uuid,text,integer)', 'b8c9f5150281f04269528a0c7dfb6c6a63b0c6358fc214e08945aa9cc4c8b49a', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.trg_summary_sweep_transition()', '34db09c595569823f306efae89442c03e9737623f43cbab3c65e27ac600d8f5d', false, 'v', 'search_path=pg_catalog, pg_temp'),
+  ('si.trg_sweep_records_append_only()', 'b882ecd81310163e794ff5a9f87302c2eb906b96f283bfee530d9e50811dc241', false, 'v', 'search_path=pg_catalog, pg_temp')),
 fn AS (
   SELECT f.*, p.oid, p.prosecdef, p.provolatile::text AS provolatile, array_to_string(p.proconfig, ';') AS proconfig,
          encode(sha256(convert_to(p.prosrc, 'UTF8')), 'hex') AS actual_sha, pg_get_userbyid(p.proowner) AS owner,
@@ -110,7 +128,10 @@ tables(relname, acl) AS (VALUES
   ('observations', '{si_owner=arwdDxt/si_owner}'), ('ads', '{si_owner=arwdDxt/si_owner}'),
   ('collection_runs', '{si_owner=arwdDxt/si_owner,si_collector=r/si_owner,si_rights_admin=r/si_owner,si_retention=r/si_owner}'),
   ('advertiser_identities', '{si_owner=arwdDxt/si_owner}'), ('run_advertiser_summaries', '{si_owner=arwdDxt/si_owner}'),
-  ('run_summary_status', '{si_owner=arwdDxt/si_owner}'), ('summary_events', '{si_owner=arwdDxt/si_owner}'))
+  ('run_summary_status', '{si_owner=arwdDxt/si_owner}'), ('summary_events', '{si_owner=arwdDxt/si_owner}'),
+  ('summary_sweeps', '{si_owner=arwdDxt/si_owner}'), ('summary_sweep_batches', '{si_owner=arwdDxt/si_owner}'),            -- 0024
+  ('summary_sweep_runs', '{si_owner=arwdDxt/si_owner}'), ('summary_sweep_identities', '{si_owner=arwdDxt/si_owner}'),
+  ('summary_sweep_failures', '{si_owner=arwdDxt/si_owner}'), ('summary_drift_clearances', '{si_owner=arwdDxt/si_owner}'))
 SELECT 'FK_MISSING' AS check, conname AS detail FROM fk WHERE oid IS NULL
 UNION ALL
 SELECT 'FK_NOT_FOREIGN_KEY', conname FROM fk WHERE oid IS NOT NULL AND contype <> 'f'

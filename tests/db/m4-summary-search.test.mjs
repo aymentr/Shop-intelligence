@@ -40,6 +40,7 @@ import { provisionReaderPrincipal } from '../../dist/persistence/bootstrap.js';
 import { fixtureSha256, requestSha256 } from '../../dist/persistence/request-hash.js';
 import { grantReader, revokeReader, beginRead } from '../../dist/persistence/reader.js';
 import * as INTEL from '../../dist/persistence/intelligence.js';
+import { clearDrift, verifySource } from '../../dist/persistence/summary-verification.js';
 
 const SEARCH_DEF = latestDefinition('si_search_advertisers', 'END $search$;');
 const SEARCH_FN = SEARCH_DEF.text;
@@ -560,6 +561,26 @@ test('SS-8: tampered summaries and a deleted identity are served until verificat
   assert.deepEqual((await asOwner(x.admin, a => a.query('SELECT * FROM si.si_verify_summaries($1)', [s]))).rows, []);
   await both(x, alice, s, R('north'), 'summary');
   console.log(`# SS-8 verification findings: ${JSON.stringify(findings)}`);
+});
+
+test('SS-8b (0024): a bounded verification sweep (si_monitor) records the drift: the observation path answers exactly; rebuild and a clean sweep do NOT restore the summary path until the owner clears with that sweep', async t => {
+  const x = await fresh(t);
+  const { s, runs } = await small(x);
+  const alice = await reader(x);
+  await replica(x, `UPDATE si.run_advertiser_summaries SET names = names || ARRAY['Forged Spelling'] WHERE run_id = $1`, [runs[0]]);   // TAMPERING
+  const served = await search(alice, s, R('north'));
+  assert.equal(served.path, 'summary', 'served until a verification records drift (contract B, unchanged)');
+  const d = await verifySource(x.si_monitor, s, { budget: { maxRuns: 1, maxObservations: 500, maxIdentities: 1 } });
+  assert.equal(d.state, 'COMPLETED_DRIFT');
+  await both(x, alice, s, R('north'), 'observations');
+  for (const r of runs) await asOwner(x.admin, a => a.query('SELECT si.si_rebuild_run_summaries($1)', [r]));
+  await both(x, alice, s, R('north'), 'observations');                          // rebuilt, but the drift is still open
+  const c = await verifySource(x.si_monitor, s);
+  assert.equal(c.state, 'COMPLETED_CLEAN');
+  await both(x, alice, s, R('north'), 'observations');                          // a clean sweep never clears by itself
+  await assert.rejects(x.si_monitor.query('SELECT si.si_summary_clear_drift($1, $2)', [s, c.sweepId]), e => e.code === '42501');
+  await clearDrift(x.admin, s, c.sweepId);                                       // the owner's authorized recovery
+  await both(x, alice, s, R('north'), 'summary');
 });
 
 // ------------------------------------------------------------------------------------------------ SS-9 long names, memory

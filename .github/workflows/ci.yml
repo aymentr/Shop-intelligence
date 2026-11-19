@@ -265,3 +265,30 @@ jobs:
       - name: Stop database
         if: always()
         run: docker compose down -v
+
+  summary-verification:
+    # M4-P3.3 Phase 2 (migration 0024): bounded summary verification sweeps measured against the legacy one-transaction
+    # verification (400 runs x 500 observations; emergency controls throughout), and the deliberate breaks VX1-VX16.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Start PostgreSQL 16 (localhost only)
+        run: docker compose up -d --wait db
+      - run: npm ci
+      - run: npm run build
+      - name: Sweep cost and emergency-control latency (bounded batches; no source row lock; control wait p95 < 1 s asserted)
+        run: SI_SWEEP_RUNS=400 SI_SWEEP_OBS=500 node tests/db/run.mjs tests/slow/m4-sweep-bench.test.mjs
+      - name: Batched-verification deliberate breaks (VX1-VX16; migration file restored)
+        run: CI=true node tests/mutations/m4-p33-p2.mjs
+      - name: Database logs on failure
+        if: failure()
+        run: docker compose logs db
+      - name: Stop database
+        if: always()
+        run: docker compose down -v
+

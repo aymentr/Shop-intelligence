@@ -2044,3 +2044,149 @@ si.<name>`). Emergency source controls remain available throughout.
   outside SQL.
 - The adoption log is owner-controlled (contract B), like `si.schema_migrations`.
 
+
+## 18. M4-P3.3 Phase 2: bounded, resumable, auditable summary verification (migration 0024)
+
+**Status:** implemented on `claude/b002-m4-p3-3-p2-implement-01` from `9c7c5f2`; pending acceptance. Synthetic only.
+Migrations 0001–0023 are unchanged. 0024 adds tables, two indexes, triggers and functions. It changes no existing object:
+- `si_verify_summaries` and `verify-summaries.sql` (0020) stay as they are: the owner's one-snapshot full verification;
+- the 0020 guards, the 0021 coverage function, the 0023 reader and every existing grant are untouched.
+
+### 18.1 Contract
+
+| Item | Contract |
+|---|---|
+| Unit | One run. Its content is derived once (`si_summary_content`) and compared with the stored rows and the status, as multisets in both directions, with the 0020 findings: MISSING, CONTENT_MISMATCH, STATUS_MISMATCH. Then the dictionary, identity by identity: ORPHAN_IDENTITY, IDENTITY_MISMATCH. On every corruption, a sweep's findings equal the legacy verification's (SW-2). |
+| Work bounds | Per batch: `max_runs` 1–200 (default 50), `max_observations` 500–20,000 (default 5,000), `max_identities` 1–5,000 (default 1,000). A run's size is measured by a bounded probe (`LIMIT max+1`, counted as work); a run that does not fit the remaining budget is deferred to the next batch. |
+| Why run-level is sufficient | The schema bounds every run to 500 observations (`ordinal BETWEEN 0 AND 499`, `PRIMARY KEY (run_id, ordinal)`; even replica-mode writes obey them). The minimum budget is 500, so every run that can exist fits one batch (SW-4a). A larger run can only exist after DDL (dropping that CHECK). It is recorded `UNVERIFIABLE_OVERSIZED` after a probe of at most budget+1 rows, never verified partially and never skipped silently; the sweep ends INCOMPLETE (SW-4b). Observation-level chunking was not introduced: the stored summaries are per-run arrays, so a chunk could not be checked in O(chunk) work. |
+| Transaction | One REPEATABLE READ transaction per batch (the function refuses any other isolation), bounded by `statement_timeout` (client default 5 s) and `lock_timeout` 1 s. |
+| Locks | **No source lock.** The batch locks only its sweep row (`FOR NO KEY UPDATE NOWAIT`; a concurrent batch gets BUSY at once). SUSPEND, LIFT, TERMINATE_RETENTION, purge and publication never wait for a clean batch (SW-7, SW-8). A batch that **records drift** takes the FK's KEY SHARE on the source row for its `summary_events` insert until it commits; a control then waits for that commit only (SW-8). |
+| Sweep identity and scope | At most one IN_PROGRESS sweep per source (partial unique index). The scope is fixed at start and immutable (trigger): normalizer fingerprint, run boundary = the greatest `(finished_at, run_id)` of the source's COMPLETED RETAINED/EMPTY runs, identity boundary = the greatest identity id, the source's last event id, and the scope counts. |
+| Cursor and restart | Phases RUNS, RUN_GAPS, IDENTITIES, IDENTITY_GAPS, DONE. Each batch's seq must be `batches + 1`. Resubmitting the last committed seq replays its stored result and verifies nothing again; covers a lost response and duplicates (SW-9). Any other seq is refused (SEQUENCE). A crashed batch rolls back entirely, and the next verifier resumes at `batches + 1` from the database (SW-9). |
+| Completeness | The gap phases verify every in-scope run or identity this sweep has not recorded: a late commit below the cursor (SW-6), or a cursor moved by tampering (SW-11). A run purged before its batch leaves the scope; purge is the legitimate lifecycle (SW-7). |
+| What COMPLETED_CLEAN proves | Each in-scope run still retained when its batch ran, and each in-scope identity, matched the authoritative observations **in that batch's snapshot**, with the sweep's fingerprint. It does **not** prove one atomic state across batches. It says nothing about runs after the boundary (their summaries are derived in their publication transaction and are in scope for the next sweep), nor about changes after a batch committed (time of check / time of use, as §15.8). |
+| Fingerprint | A batch under another fingerprint marks the sweep STALE (FINGERPRINT_CHANGED), with no finding (SW-3). A run whose status has another fingerprint is UNVERIFIABLE_STALE_STATUS; coverage already reports it INCOMPLETE, and the sweep ends INCOMPLETE, never CLEAN. |
+| Drift | Every finding records `DRIFT_DETECTED` in the batch's own transaction, so the 0021/0023 guard refuses the summary path from the next statement on, and the reader answers exactly from observations (SS-8b). **A sweep never records DRIFT_CLEARED** (SW-2, SW-14). |
+| Recovery | Owner only: `si_rebuild_run_summaries` while drift is open (0020), then a NEW sweep, then `si_summary_clear_drift(source, sweep)`. Clearance requires that sweep to be COMPLETED_CLEAN, with no DRIFT_DETECTED or REBUILT event of the source after its start. It locks the source row FOR UPDATE, so no finding can commit between its check and the `DRIFT_CLEARED` event. It records `summary_drift_clearances` (event, sweep, actor). The legacy full verification keeps its 0020 behaviour (it clears on a clean single-snapshot pass) and remains the owner's maintenance tool. |
+| Roles | `si_monitor` may EXECUTE only `si_summary_sweep_start`, `si_summary_sweep_batch`, `si_summary_sweep_record_failure`, `si_summary_sweep_expire` and `si_summary_verification_status` (SECURITY DEFINER, pinned search_path). It has no privilege on any table: summaries, observations, sweep records, drift log. It cannot call the legacy verification, rebuild, content functions or clearance, cannot SET ROLE, and cannot run DDL (SW-13, privileges SD1). The verifier is not a read path: it returns content-free counts only and grants no readability. |
+| Audit | Append-only (trigger) records: `summary_sweep_batches` (seq, phase, outcome, cursor, work, budget, actor, time), `summary_sweep_runs` and `summary_sweep_identities` (per-item outcome), `summary_sweep_failures` (TIMEOUT, BUSY, SERIALIZATION, ISOLATION, SEQUENCE, CLOSED, CONNECTION or ERROR, with SQLSTATE, recorded in a separate transaction) and `summary_drift_clearances`. `summary_sweeps` changes only through the state machine (§18.2). Nothing stored or returned contains a name, URL, query term or ad content; every value is an id, a code, a count or a time. |
+| Trust boundary | Contract B is unchanged: the owner can rewrite summaries and their verification records together. Independent assurance still needs externally controlled evidence, e.g. the sweep results exported to a system the owner does not control, or an independent re-verification from a restored dump. |
+
+### 18.2 State machine
+
+```
+            (no row) NOT_STARTED
+                 | si_summary_sweep_start (scope fixed)
+                 v
+           IN_PROGRESS --batch--> IN_PROGRESS   phases RUNS -> RUN_GAPS -> IDENTITIES -> IDENTITY_GAPS -> DONE
+             |     |                              (each batch: one committed record; seq = batches + 1; replay of seq)
+             |     +--fingerprint changed / idle > p_idle (start or si_summary_sweep_expire)--> STALE (final)
+             +--phase DONE--> COMPLETED_DRIFT (any finding) | INCOMPLETE (unverifiable run, no finding) | COMPLETED_CLEAN (final)
+   COMPLETED_CLEAN + owner si_summary_clear_drift (no drift/rebuild after start) --> DRIFT_CLEARED event
+```
+
+Enforcement:
+- CHECKs: one state per phase, completion time, stale reason, and CLEAN ⇒ no finding and nothing unverifiable.
+- The transition trigger: the scope is immutable, a final state is final, counters only grow, and each advance is exactly
+  one batch whose stored cursor, phase, state and work it must equal. A cursor moved without a batch is refused (SW-11).
+- A sweep is never deleted, and the records cannot be truncated.
+
+### 18.3 Tests and deliberate breaks
+
+`tests/db/m4-sweep.test.mjs`:
+
+| Test | What it covers |
+|---|---|
+| SW-1 | correct summaries |
+| SW-2 | every corruption class (count, membership, an ad moved, missing row, extra row, missing status, forged digest, rewritten evidence, orphan identity, key/name mismatch), compared with the legacy findings; durable drift; ineligibility; no automatic clearing |
+| SW-3 | stale status; a fingerprint change mid-sweep |
+| SW-4a, SW-4b | the largest legal run; an oversized run |
+| SW-5 | many small runs and the observation budget |
+| SW-6 | publication during a sweep, and a late commit |
+| SW-7 | purge during an open batch |
+| SW-8 | emergency controls during clean and drift-recording batches |
+| SW-9 | timeout, crash, restart, duplicate and lost response |
+| SW-10 | a conflicting verifier; READ COMMITTED refused |
+| SW-11 | cursor corruption |
+| SW-12 | partial, stale and abandoned sweeps |
+| SW-13 | least privilege |
+| SW-14 | clearance rules |
+| SW-15 | 0024 down restores the exact 0023 catalog |
+
+Also `tests/db/m4-summary-search.test.mjs` SS-8b: through the real reader, the sweep's drift makes the observation path answer exactly. Rebuild and a clean sweep do not restore the summary path; only the owner's clearance does.
+
+`tests/mutations/m4-p33-p2.mjs`, each mutant killed by its named detector:
+
+| Mutant | Removed check | Detector |
+|---|---|---|
+| VX1 | observation budget | SW-5 |
+| VX2 | oversized refusal | SW-4b |
+| VX3 | run gap phase | SW-6 |
+| VX4 | replay of a resubmitted batch | SW-9 |
+| VX5 | fingerprint staleness | SW-3 |
+| VX6 | drift recording | SW-2 |
+| VX7 | clearance supersession check | SW-14 |
+| VX8 | clearance needs CLEAN | SW-14 |
+| VX9 | NOWAIT | SW-10 |
+| VX10 | the batch-match transition | SW-11 |
+| VX11 | REPEATABLE READ | SW-10 |
+| VX12 | a source lock reintroduced | SW-7 |
+| VX13 | orphan check | SW-2 |
+| VX14 | stale status counted verified | SW-3 |
+| VX15 | status digest | SW-2 |
+| VX16 | one-direction comparison | SW-2 |
+
+### 18.4 Operations
+
+```bash
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js summaries verify --source S [--max-batches N] [--max-runs N] [--max-observations N]
+SI_DATABASE_URL=<si_monitor login> node dist/persistence/cli.js summaries status      # content-free; exit 2 while any drift is open
+SI_DATABASE_URL=<si_migrator login> node dist/persistence/cli.js summaries clear-drift --source S --sweep N   # owner recovery
+```
+
+- **`verify` exit code:** exits 2 unless the sweep ends COMPLETED_CLEAN.
+- **`status` content:** per source:
+  - the latest sweep's state, phase, progress and failures;
+  - the last clean completion time;
+  - open drift and summary eligibility.
+
+  That eligibility field gives operators the fallback signal R-48 lacked.
+- **Production gate:** under `SI_PRODUCTION=1`, `summaries status` is a read-only diagnostic (scope `diagnostic`, §17.5); `verify` and `clear-drift` are strict.
+- **Not scheduled:** nothing is scheduled. A sweep schedule and a maximum age of the last clean sweep are deployment decisions, as for `verify-summaries.sql` (§15.8).
+- **The two indexes 0024 creates:** `collection_runs_sweep_order` and `advertiser_identities_sweep_order`, the cursor orders, without which a sweep would cost O(n²). They are built non-concurrently on tables much smaller than si.observations. On a large populated database the build blocks writes to those tables for its duration, the same R-42 concern that §17.2 addresses for 0022.
+
+### 18.5 Performance (`tests/slow/m4-sweep-bench.test.mjs`; local PostgreSQL 16.15 container, tmpfs, fsync off, synthetic)
+
+One source with 400 runs × 500 observations (200,000), published through `si_complete_run`. Budget: 50 runs, 5,000
+observations, 1,000 identities. SUSPEND and LIFT were issued every ~50 ms throughout.
+
+| | Bounded sweep (0024) | Legacy `si_verify_summaries` (0020) |
+|---|---|---|
+| Duration | 4.0 s in 46 batches | 6.7 s in one transaction |
+| Batch latency | p50 91 / p95 129 / max 134 ms | — |
+| Observations per batch | max 5,000 (= budget) | 200,000 |
+| Source row lock held | none (FOR UPDATE NOWAIT on the source row succeeds mid-batch) | FOR SHARE for the whole run |
+| Emergency-control wait | p50 1.8 / p95 3.2 / max 6.0 ms (n = 150) | max **6,664 ms** (the control waits for the whole verification) |
+| Buffer reads / hits | 5,482 / 61,186 | — |
+| WAL | 0.48 MB | — |
+| Verification records | 448 kB (≈ 1.1 kB per run per sweep) | — |
+
+The records grow with every sweep, at about 1.1 kB per verified run. Pruning old terminal sweeps is not implemented; a retention rule is
+a deployment decision. tmpfs with fsync disabled is not representative production storage, and no production-scale
+claim is made from these numbers.
+
+**At 1,000,000 observations** (2,000 runs × 500, same budget and controls; the second regression run):
+
+| | Bounded sweep (0024) | Legacy `si_verify_summaries` (0020) |
+|---|---|---|
+| Duration | 19.3 s in 206 batches | 33.9 s in one transaction |
+| Batch latency | p50 93 / p95 123 / max 146 ms | — |
+| Observations per batch | max 5,000 (= budget) | 1,000,000 |
+| Source row lock held | none | FOR SHARE for the whole run |
+| Emergency-control wait | p50 1.6 / p95 2.5 / max 6.2 ms (n = 720); 0 refused | max **30,002 ms**; 1 of 7 controls **refused by `lock_timeout`** |
+| Buffer reads / hits | 66,313 / 452,396 | — |
+| WAL | 1.18 MB | — |
+| Verification records | 720 kB (≈ 369 B per run; per-sweep overhead amortised) | — |
+
+Batch latency does not grow with source size: each batch costs the same whatever the total. The legacy verification blocks emergency
+controls for the length of the source. At this size a control is refused outright, which is the hazard this phase removes.
