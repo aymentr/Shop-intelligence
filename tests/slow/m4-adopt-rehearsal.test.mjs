@@ -3,7 +3,7 @@
 // at version 21. While one writer inserts continuously (one row per transaction, lock_timeout 5 s):
 //   1. a first CREATE INDEX CONCURRENTLY is cancelled mid-scan (failure), leaving an invalid index;
 //   2. build-index --replace-invalid drops exactly that index and rebuilds it (measured);
-//   3. adopt records 0022; `up` applies 0023; readiness passes.
+//   3. adopt records 0022; `up` applies 0023 and 0024; readiness passes.
 // Reported: build time, writer latency p50 / p95 / max and lock-wait samples, index size, WAL written during the build.
 // With SI_ADOPT_PLAIN=1 (default) the same is measured for 0022's own non-concurrent build in a second database.
 // Asserted (CI): the procedure converges; during the concurrent build the writer is never in a lock wait and no insert
@@ -100,7 +100,7 @@ test(`REH: populated adoption of 0022 at ${ROWS} observations (failure, retry, a
   const t3 = performance.now(); const a = await adoptMigration(mig2, { version: 22 }); const adoptMs = performance.now() - t3;
   const t4 = performance.now(); const up = await migrateUp(mig2); const upMs = performance.now() - t4;
   console.log(`# REH ${ROWS} adopt ${a.state} in ${adoptMs.toFixed(0)} ms; up ${JSON.stringify(up)} in ${upMs.toFixed(0)} ms`);
-  assert.equal(a.state, 'ADOPTED'); assert.deepEqual(up, [23]);
+  assert.equal(a.state, 'ADOPTED'); assert.deepEqual(up, [23, 24]);
   assert.deepEqual(await checkIndexReadiness(x.admin), []);
   // Comparison: 0022's own non-concurrent build under the same writer.
   if (PLAIN) {
